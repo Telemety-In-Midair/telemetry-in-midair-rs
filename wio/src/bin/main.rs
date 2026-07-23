@@ -259,6 +259,9 @@ mod app {
         let mut next_gps_log = platform::millis().wrapping_add(5_000);
 
         status_println!(esp, "wio v{} up, node {}", FIRMWARE_VERSION, cfg.address);
+        // Report the config we came up on, so an ESP already connected to a
+        // central can serve it without waiting for a CFG_READ round-trip.
+        esp.send(msg::CONFIG, &cfg.encode());
 
         loop {
             let now = platform::millis();
@@ -340,12 +343,19 @@ mod app {
                                     stored
                                 );
                                 esp.send_ack(cmd::CFG_END, 0);
+                                // Report the new config so a connected app's
+                                // view updates without a fresh read.
+                                esp.send(msg::CONFIG, &cfg.encode());
                             }
                             Err(_) => esp.send_nak(cmd::CFG_END, link::err::BAD_CONFIG),
                         },
                         CfgEvent::Ack(seq) => esp.send_ack(cmd::CFG_END, seq),
                         CfgEvent::Error(e) => esp.send_nak(cmd::CFG_END, e),
                     },
+                    cmd::CFG_READ => {
+                        // Read-back: the config blob is the reply, not an ack.
+                        esp.send(msg::CONFIG, &cfg.encode());
+                    }
                     cmd::FW_BEGIN => match fw.begin(esp.payload()) {
                         FwEvent::Ack(seq) => {
                             status_println!(esp, "fw update: receiving image");
