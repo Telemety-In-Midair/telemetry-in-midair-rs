@@ -42,6 +42,11 @@ pub mod cmd {
     pub const CFG_DATA: u8 = 0x11;
     /// `[crc32 u32le]` - end of config; WIO verifies, parses and applies.
     pub const CFG_END: u8 = 0x12;
+    /// No payload. Ask the WIO to report its current radio configuration; it
+    /// answers with [`super::msg::CONFIG`] (there is no ACK - the config blob
+    /// is the reply). Sent when the ESP wants the value fresh, e.g. on a BLE
+    /// connect or when the link first comes up.
+    pub const CFG_READ: u8 = 0x13;
 
     // Firmware update (written into the WIO DFU partition; the swap
     // bootloader installs it on the reboot that follows FW_END).
@@ -78,6 +83,14 @@ pub mod msg {
     /// prints it to its console and notifies it over BLE (no ACK). Payload
     /// is at most [`super::LOG_MAX`] bytes.
     pub const LOG: u8 = 0x44;
+
+    /// [`crate::radiocfg::RadioConfig::encode`] blob - the WIO's current radio
+    /// configuration. The ESP caches it and serves it on the BLE radio-config
+    /// characteristic ([`crate::ble::RADIO_CONFIG_UUID`]) without parsing it.
+    /// Sent unprompted at boot and after a new config is applied, and in
+    /// reply to [`super::cmd::CFG_READ`], so the ESP re-learns it whether the
+    /// change was local to the WIO or the ESP restarted under a running WIO.
+    pub const CONFIG: u8 = 0x45;
 }
 
 /// Host <-> ESP32-C6 commands carried over the ESP's USB Serial/JTAG port,

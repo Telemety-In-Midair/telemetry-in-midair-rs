@@ -75,6 +75,38 @@ impl Role {
     pub fn repeats(self) -> bool {
         matches!(self, Role::Repeater)
     }
+
+    /// Compact value used in the [`RadioConfig`] read-back blob.
+    pub fn to_wire(self) -> u8 {
+        match self {
+            Role::Leaf => 0,
+            Role::Repeater => 1,
+            Role::TxOnly => 2,
+            Role::RxOnly => 3,
+        }
+    }
+
+    /// Inverse of [`to_wire`](Self::to_wire); `None` for an unknown value.
+    pub fn from_wire(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => Role::Leaf,
+            1 => Role::Repeater,
+            2 => Role::TxOnly,
+            3 => Role::RxOnly,
+            _ => return None,
+        })
+    }
+
+    /// The `role` config-file spelling, so a reader can render it back into
+    /// TOML that the parser accepts unchanged.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Role::Leaf => "leaf",
+            Role::Repeater => "repeater",
+            Role::TxOnly => "tx_only",
+            Role::RxOnly => "rx_only",
+        }
+    }
 }
 
 /// Supply voltage the radio drives the TCXO at (`SetTcxoMode` trim field).
@@ -110,6 +142,36 @@ impl TcxoVolts {
             TcxoVolts::V3_3 => 0x7,
         }
     }
+
+    /// Inverse of [`trim`](Self::trim); `None` for an unknown value. Doubles as
+    /// the read-back blob decoder, since the blob carries the trim value.
+    pub fn from_trim(v: u8) -> Option<Self> {
+        Some(match v {
+            0x0 => TcxoVolts::V1_6,
+            0x1 => TcxoVolts::V1_7,
+            0x2 => TcxoVolts::V1_8,
+            0x3 => TcxoVolts::V2_2,
+            0x4 => TcxoVolts::V2_4,
+            0x5 => TcxoVolts::V2_7,
+            0x6 => TcxoVolts::V3_0,
+            0x7 => TcxoVolts::V3_3,
+            _ => return None,
+        })
+    }
+
+    /// The `tcxo_volts` config-file spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TcxoVolts::V1_6 => "1.6",
+            TcxoVolts::V1_7 => "1.7",
+            TcxoVolts::V1_8 => "1.8",
+            TcxoVolts::V2_2 => "2.2",
+            TcxoVolts::V2_4 => "2.4",
+            TcxoVolts::V2_7 => "2.7",
+            TcxoVolts::V3_0 => "3.0",
+            TcxoVolts::V3_3 => "3.3",
+        }
+    }
 }
 
 /// GPS receiver power mode (u-blox M10 `CFG-PM-OPERATEMODE`).
@@ -131,6 +193,26 @@ impl PowerMode {
             PowerMode::Full => 0,
             PowerMode::PsmOnOff => 1,
             PowerMode::PsmCyclic => 2,
+        }
+    }
+
+    /// Inverse of [`operate_mode`](Self::operate_mode); `None` for an unknown
+    /// value. Also the read-back blob decoder.
+    pub fn from_operate_mode(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => PowerMode::Full,
+            1 => PowerMode::PsmOnOff,
+            2 => PowerMode::PsmCyclic,
+            _ => return None,
+        })
+    }
+
+    /// The `power_mode` config-file spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PowerMode::Full => "full",
+            PowerMode::PsmOnOff => "psmoo",
+            PowerMode::PsmCyclic => "psmct",
         }
     }
 }
@@ -164,6 +246,36 @@ impl DynModel {
             DynModel::Airborne1g => 6,
             DynModel::Airborne2g => 7,
             DynModel::Airborne4g => 8,
+        }
+    }
+
+    /// Inverse of [`dynmodel`](Self::dynmodel); `None` for an unknown value.
+    /// Also the read-back blob decoder. Note 1 is unused by the u-blox map.
+    pub fn from_dynmodel(v: u8) -> Option<Self> {
+        Some(match v {
+            0 => DynModel::Portable,
+            2 => DynModel::Stationary,
+            3 => DynModel::Pedestrian,
+            4 => DynModel::Automotive,
+            5 => DynModel::Sea,
+            6 => DynModel::Airborne1g,
+            7 => DynModel::Airborne2g,
+            8 => DynModel::Airborne4g,
+            _ => return None,
+        })
+    }
+
+    /// The `dynamic_model` config-file spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DynModel::Portable => "portable",
+            DynModel::Stationary => "stationary",
+            DynModel::Pedestrian => "pedestrian",
+            DynModel::Automotive => "automotive",
+            DynModel::Sea => "sea",
+            DynModel::Airborne1g => "airborne1g",
+            DynModel::Airborne2g => "airborne2g",
+            DynModel::Airborne4g => "airborne4g",
         }
     }
 }
@@ -390,6 +502,144 @@ impl RadioConfig {
 /// transmission of the same frame on a shared channel, so the useful range
 /// is small and the limit exists to keep a typo from flooding the band.
 pub const MAX_HOPS_LIMIT: u8 = 8;
+
+// -- Read-back blob ---------------------------------------------------------
+//
+// A fixed, versioned binary snapshot of a [`RadioConfig`], so a board can
+// report the settings it is actually running - which it otherwise never
+// does: the config only ever travels *to* the board. The WIO encodes its
+// live config, the ESP relays the bytes over BLE
+// ([`crate::ble::RADIO_CONFIG_UUID`]) without parsing them, and the app
+// decodes them here (the same crate both firmwares and the app build
+// against, so there is one schema, not a copy per consumer).
+//
+// This is not the config file: it is a snapshot of the parsed result, so it
+// reflects defaults and clamping and is available even on a board running
+// with no stored file at all.
+
+/// Wire length of the [`RadioConfig`] read-back blob.
+pub const RADIO_CONFIG_LEN: usize = 28;
+
+/// Layout version in byte 0, so an app meeting a newer firmware can reject
+/// the blob rather than misread it.
+pub const RADIO_CONFIG_VERSION: u8 = 1;
+
+// byte 1 (misc bools)
+const RCFG_RX_BOOST: u8 = 1 << 0;
+const RCFG_SD_ENABLED: u8 = 1 << 1;
+const RCFG_VERBOSE: u8 = 1 << 2;
+const RCFG_DCDC: u8 = 1 << 3;
+// byte 2 (GPS constellations)
+const RCFG_GPS: u8 = 1 << 0;
+const RCFG_GLONASS: u8 = 1 << 1;
+const RCFG_GALILEO: u8 = 1 << 2;
+const RCFG_BEIDOU: u8 = 1 << 3;
+const RCFG_QZSS: u8 = 1 << 4;
+const RCFG_SBAS: u8 = 1 << 5;
+
+impl RadioConfig {
+    /// Encode the config as the fixed [`RADIO_CONFIG_LEN`]-byte read-back
+    /// blob (little-endian).
+    pub fn encode(&self) -> [u8; RADIO_CONFIG_LEN] {
+        let mut b = [0u8; RADIO_CONFIG_LEN];
+        b[0] = RADIO_CONFIG_VERSION;
+        let mut flags = 0u8;
+        if self.rx_boost {
+            flags |= RCFG_RX_BOOST;
+        }
+        if self.sd_enabled {
+            flags |= RCFG_SD_ENABLED;
+        }
+        if self.verbose {
+            flags |= RCFG_VERBOSE;
+        }
+        if self.dcdc_enabled {
+            flags |= RCFG_DCDC;
+        }
+        b[1] = flags;
+        let mut g = 0u8;
+        if self.gps.gps_enabled {
+            g |= RCFG_GPS;
+        }
+        if self.gps.glonass_enabled {
+            g |= RCFG_GLONASS;
+        }
+        if self.gps.galileo_enabled {
+            g |= RCFG_GALILEO;
+        }
+        if self.gps.beidou_enabled {
+            g |= RCFG_BEIDOU;
+        }
+        if self.gps.qzss_enabled {
+            g |= RCFG_QZSS;
+        }
+        if self.gps.sbas_enabled {
+            g |= RCFG_SBAS;
+        }
+        b[2] = g;
+        b[3] = self.role.to_wire();
+        b[4..8].copy_from_slice(&self.frequency_hz.to_le_bytes());
+        b[8] = self.spreading_factor;
+        b[9..11].copy_from_slice(&self.bandwidth_khz.to_le_bytes());
+        b[11] = self.coding_rate;
+        b[12] = self.power_dbm as u8;
+        b[13] = self.address;
+        b[14] = self.max_hops;
+        b[15..17].copy_from_slice(&self.dedup_ttl_s.to_le_bytes());
+        b[17..19].copy_from_slice(&self.beacon_interval_s.to_le_bytes());
+        b[19] = self.beacon_fields;
+        b[20] = self.tcxo_volts.trim();
+        b[21..23].copy_from_slice(&self.tcxo_startup_ms.to_le_bytes());
+        b[23] = self.gps.power_mode.operate_mode();
+        b[24..26].copy_from_slice(&self.gps.meas_rate_ms.to_le_bytes());
+        b[26] = self.gps.dyn_model.dynmodel();
+        // b[27] reserved, kept zero.
+        b
+    }
+
+    /// Decode a read-back blob. `None` for a short buffer, an unknown layout
+    /// version, or an enum byte this build does not recognize - the caller
+    /// then keeps its own values rather than acting on a half-read config.
+    /// Trailing bytes are tolerated so a future layout can only grow.
+    pub fn decode(b: &[u8]) -> Option<Self> {
+        if b.len() < RADIO_CONFIG_LEN || b[0] != RADIO_CONFIG_VERSION {
+            return None;
+        }
+        let flags = b[1];
+        let g = b[2];
+        let u16at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+        Some(Self {
+            frequency_hz: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            spreading_factor: b[8],
+            bandwidth_khz: u16at(9),
+            coding_rate: b[11],
+            power_dbm: b[12] as i8,
+            rx_boost: flags & RCFG_RX_BOOST != 0,
+            address: b[13],
+            role: Role::from_wire(b[3])?,
+            max_hops: b[14],
+            dedup_ttl_s: u16at(15),
+            beacon_interval_s: u16at(17),
+            beacon_fields: b[19],
+            sd_enabled: flags & RCFG_SD_ENABLED != 0,
+            verbose: flags & RCFG_VERBOSE != 0,
+            dcdc_enabled: flags & RCFG_DCDC != 0,
+            tcxo_volts: TcxoVolts::from_trim(b[20])?,
+            tcxo_startup_ms: u16at(21),
+            gps: GpsConfig {
+                gps_enabled: g & RCFG_GPS != 0,
+                glonass_enabled: g & RCFG_GLONASS != 0,
+                galileo_enabled: g & RCFG_GALILEO != 0,
+                beidou_enabled: g & RCFG_BEIDOU != 0,
+                qzss_enabled: g & RCFG_QZSS != 0,
+                sbas_enabled: g & RCFG_SBAS != 0,
+                power_mode: PowerMode::from_operate_mode(b[23])?,
+                meas_rate_ms: u16at(24),
+                dyn_model: DynModel::from_dynmodel(b[26])?,
+            },
+        })
+    }
+}
 
 /// Config parse/validation errors. The u32 is the offending line number
 /// (1-based) where one applies.
@@ -945,5 +1195,106 @@ mod tests {
         assert_eq!(parse_bytes(&[0xFF, 0xFE]), Err(ConfigError::Utf8));
         // Unknown keys pass through untouched.
         assert!(parse("future_knob = 42").is_ok());
+    }
+
+    #[test]
+    fn radio_config_blob_roundtrips() {
+        // A config that differs from the defaults in every field type: an
+        // integer, a signed value, each enum, the field mask and bools on
+        // both flag bytes, so a swapped byte cannot pass unnoticed.
+        let cfg = RadioConfig {
+            frequency_hz: 868_100_000,
+            spreading_factor: 12,
+            bandwidth_khz: 250,
+            coding_rate: 8,
+            power_dbm: -9,
+            rx_boost: false,
+            address: 200,
+            role: Role::Repeater,
+            max_hops: 3,
+            dedup_ttl_s: 120,
+            beacon_interval_s: 30,
+            beacon_fields: crate::lora::FIELD_LAT | crate::lora::FIELD_LON | crate::lora::FIELD_ALT,
+            sd_enabled: false,
+            verbose: false,
+            dcdc_enabled: false,
+            tcxo_volts: TcxoVolts::V3_3,
+            tcxo_startup_ms: 250,
+            gps: GpsConfig {
+                gps_enabled: true,
+                glonass_enabled: true,
+                galileo_enabled: false,
+                beidou_enabled: false,
+                qzss_enabled: true,
+                sbas_enabled: false,
+                power_mode: PowerMode::PsmCyclic,
+                meas_rate_ms: 500,
+                dyn_model: DynModel::Airborne4g,
+            },
+        };
+        let bytes = cfg.encode();
+        assert_eq!(bytes.len(), RADIO_CONFIG_LEN);
+        assert_eq!(bytes[0], RADIO_CONFIG_VERSION);
+        assert_eq!(RadioConfig::decode(&bytes), Some(cfg));
+    }
+
+    #[test]
+    fn radio_config_blob_defaults_roundtrip() {
+        let cfg = RadioConfig::default();
+        assert_eq!(RadioConfig::decode(&cfg.encode()), Some(cfg));
+    }
+
+    #[test]
+    fn radio_config_blob_rejects_short_and_wrong_version() {
+        let good = RadioConfig::default().encode();
+        assert_eq!(RadioConfig::decode(&good[..RADIO_CONFIG_LEN - 1]), None);
+        let mut bad = good;
+        bad[0] = RADIO_CONFIG_VERSION + 1;
+        assert_eq!(RadioConfig::decode(&bad), None);
+    }
+
+    /// A longer buffer must still decode: a future layout can only grow, and
+    /// byte 0 is what gates compatibility.
+    #[test]
+    fn radio_config_blob_tolerates_trailing_bytes() {
+        let good = RadioConfig::default().encode();
+        let mut longer = [0u8; RADIO_CONFIG_LEN + 4];
+        longer[..RADIO_CONFIG_LEN].copy_from_slice(&good);
+        assert!(RadioConfig::decode(&longer).is_some());
+    }
+
+    /// The blob has to survive both transports it rides: one UART link frame
+    /// (see [`crate::link::MAX_PAYLOAD`]) and a single BLE read.
+    #[test]
+    fn radio_config_blob_fits_its_transports() {
+        assert!(RADIO_CONFIG_LEN <= crate::link::MAX_PAYLOAD);
+        assert!(RADIO_CONFIG_LEN <= 244); // conservative ATT_MTU-3 floor
+    }
+
+    /// Every enum's string form has to parse back to the same variant, since
+    /// that round-trip is what lets a reader render the blob into TOML the
+    /// firmware then accepts.
+    #[test]
+    fn enum_strings_parse_back() {
+        for role in [Role::Leaf, Role::Repeater, Role::TxOnly, Role::RxOnly] {
+            assert_eq!(Role::from_wire(role.to_wire()), Some(role));
+            let toml = format!("role = \"{}\"", role.as_str());
+            assert_eq!(parse(&toml).unwrap().role, role);
+        }
+        for v in [TcxoVolts::V1_6, TcxoVolts::V1_8, TcxoVolts::V3_3] {
+            assert_eq!(TcxoVolts::from_trim(v.trim()), Some(v));
+            let toml = format!("tcxo_volts = \"{}\"", v.as_str());
+            assert_eq!(parse(&toml).unwrap().tcxo_volts, v);
+        }
+        for pm in [PowerMode::Full, PowerMode::PsmOnOff, PowerMode::PsmCyclic] {
+            assert_eq!(PowerMode::from_operate_mode(pm.operate_mode()), Some(pm));
+            let toml = format!("power_mode = \"{}\"", pm.as_str());
+            assert_eq!(parse(&toml).unwrap().gps.power_mode, pm);
+        }
+        for dm in [DynModel::Portable, DynModel::Sea, DynModel::Airborne4g] {
+            assert_eq!(DynModel::from_dynmodel(dm.dynmodel()), Some(dm));
+            let toml = format!("dynamic_model = \"{}\"", dm.as_str());
+            assert_eq!(parse(&toml).unwrap().gps.dyn_model, dm);
+        }
     }
 }

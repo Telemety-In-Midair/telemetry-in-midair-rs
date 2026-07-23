@@ -41,6 +41,23 @@ pub const REMOTE_LEN: usize = 1 + 2 + gps_proto::packet::POSITION_PACKET_LEN;
 pub const SETTINGS_UUID: &str = "c3a10009-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 pub const SETTINGS_UUID_U128: u128 = 0xc3a10009_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 
+/// The WIO-E5's current radio configuration (the `RADIO.CFG` settings) as one
+/// [`crate::radiocfg::RadioConfig`] read-back blob, read + notify.
+///
+/// The config only ever travels *to* the board, so this is the sole way to
+/// learn what a board is actually running - an app can populate its radio
+/// editor from the board instead of a local file it has to hope matches. The
+/// ESP never parses the config; it relays a snapshot the WIO encodes and
+/// sends over the link ([`crate::link::msg::CONFIG`]), refreshed on connect,
+/// on the link coming up, and whenever a new config is applied.
+///
+/// The value is [`crate::radiocfg::RADIO_CONFIG_LEN`] bytes. It reads back as
+/// all-zero (layout version 0, which decodes to `None`) until the board has
+/// reported one - which, if the GPS/LoRa rail is off, may not happen until a
+/// connect powers the WIO.
+pub const RADIO_CONFIG_UUID: &str = "c3a1000a-9f6e-4b2c-8f5a-2e32c3b1e5d0";
+pub const RADIO_CONFIG_UUID_U128: u128 = 0xc3a1000a_9f6e_4b2c_8f5a_2e32c3b1e5d0;
+
 /// Wire length of [`Settings`].
 pub const SETTINGS_LEN: usize = 16;
 /// Layout version in byte 0, so an app meeting a newer firmware can
@@ -216,6 +233,7 @@ mod tests {
         assert_eq!(to_u128(super::REMOTE_UUID), super::REMOTE_UUID_U128);
         assert_eq!(to_u128(super::LOG_UUID), super::LOG_UUID_U128);
         assert_eq!(to_u128(super::SETTINGS_UUID), super::SETTINGS_UUID_U128);
+        assert_eq!(to_u128(super::RADIO_CONFIG_UUID), super::RADIO_CONFIG_UUID_U128);
         // Same service as the C3 beacon, different characteristic ids.
         assert!(str_eq(
             gps_proto::packet::SERVICE_UUID,
