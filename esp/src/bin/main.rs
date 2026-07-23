@@ -61,6 +61,7 @@ use esp_radio::ble::controller::BleConnector;
 use gps_proto::packet::{self, PositionPacket};
 use midair_proto::ble;
 use midair_proto::link::{self, cmd, msg, FrameBuf, FrameParser, Telemetry};
+use midair_proto::radiocfg;
 use trouble_host::prelude::*;
 
 extern crate alloc;
@@ -191,6 +192,22 @@ static TELEM_STATE: Mutex<CriticalSectionRawMutex, Cell<Telemetry>> = Mutex::new
 /// resets.
 static NOTIFY_INTERVAL_MS: Mutex<CriticalSectionRawMutex, Cell<u32>> =
     Mutex::new(Cell::new(packet::UPDATE_INTERVAL_DEFAULT_MS));
+
+/// Latest radio-config snapshot from the WIO ([`radiocfg::RadioConfig`] wire
+/// form), served on the radio-config characteristic. The ESP never parses it
+/// - it relays the bytes the WIO sends. Zeroed (layout version 0) until the
+/// WIO first reports one, which the characteristic and its readers treat as
+/// "not known yet" rather than a real config.
+static RADIO_CONFIG_STATE: Mutex<CriticalSectionRawMutex, Cell<[u8; radiocfg::RADIO_CONFIG_LEN]>> =
+    Mutex::new(Cell::new([0; radiocfg::RADIO_CONFIG_LEN]));
+
+/// Set once the WIO has reported its config at least once.
+static RADIO_CONFIG_KNOWN: AtomicBool = AtomicBool::new(false);
+
+/// Pulsed when a fresh config arrives, so the connected session republishes
+/// the characteristic (a mid-session change - the app pushing a new config -
+/// is reflected without waiting for a reconnect).
+static RADIO_CONFIG_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// `Instant::as_millis` deadline until which the WIO's radio is busy;
 /// 0 = not busy. The BLE notifier defers its ticks while this is set.
@@ -661,6 +678,10 @@ async fn heartbeat_task() {
             announced = Some(up);
             if up {
                 println!("wio link up");
+                // Learn the config the WIO is running now the link is up, so
+                // it is cached before any central connects - covers the ESP
+                // having restarted under a WIO that was already running.
+                queue_frame(cmd::CFG_READ, &[]);
             } else {
                 println!("wio link down (no heartbeat ack)");
             }
@@ -751,6 +772,18 @@ fn handle_link_frame(cmd_id: u8, payload: &[u8]) {
             let n = payload.len().min(link::LOG_MAX);
             if line.extend_from_slice(&payload[..n]).is_ok() {
                 let _ = LOG_CHANNEL.try_send(line);
+            }
+        }
+        msg::CONFIG => {
+            // The WIO's current radio config, relayed verbatim to the BLE
+            // characteristic. Cache it and wake the session to republish.
+            if payload.len() >= radiocfg::RADIO_CONFIG_LEN {
+                let mut b = [0u8; radiocfg::RADIO_CONFIG_LEN];
+                b.copy_from_slice(&payload[..radiocfg::RADIO_CONFIG_LEN]);
+                RADIO_CONFIG_STATE.lock(|c| c.set(b));
+                RADIO_CONFIG_KNOWN.store(true, PersistOrdering::Relaxed);
+                RADIO_CONFIG_SIGNAL.signal(());
+                vprintln!("wio config: {} bytes", payload.len());
             }
         }
         link::resp::ACK => {
@@ -930,6 +963,11 @@ struct GpsService {
     /// on connect instead of assuming defaults.
     #[characteristic(uuid = ble::SETTINGS_UUID_U128, read, notify)]
     settings: [u8; ble::SETTINGS_LEN],
+    /// The WIO's current radio configuration (RADIO.CFG settings), so an app
+    /// can populate its radio editor from the board rather than a local file.
+    /// All-zero until the WIO reports one (see [`RADIO_CONFIG_STATE`]).
+    #[characteristic(uuid = ble::RADIO_CONFIG_UUID_U128, read, notify)]
+    radio_config: [u8; radiocfg::RADIO_CONFIG_LEN],
 }
 
 // Default app descriptor required by the esp-idf 2nd-stage bootloader.
@@ -1233,6 +1271,20 @@ async fn publish_settings<P: PacketPool>(server: &Server<'_>, conn: &GattConnect
     let _ = server.gps.settings.notify(conn, &value).await;
 }
 
+/// Refresh the radio-config characteristic and notify the central. A no-op
+/// until the WIO has reported a config, so the characteristic never carries
+/// the all-zero placeholder as if it were a real config.
+async fn publish_radio_config<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>) {
+    if !RADIO_CONFIG_KNOWN.load(PersistOrdering::Relaxed) {
+        return;
+    }
+    let value = RADIO_CONFIG_STATE.lock(|c| c.get());
+    if server.gps.radio_config.set(server, &value).is_err() {
+        return;
+    }
+    let _ = server.gps.radio_config.notify(conn, &value).await;
+}
+
 /// One in-flight bulk transfer (TOML config or WIO firmware).
 struct BulkState {
     kind: u8,
@@ -1248,9 +1300,20 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
     // live events, not a stale backlog.
     while LOG_CHANNEL.try_receive().is_ok() {}
 
+    // Ask the WIO for a fresh config snapshot while it is reachable. If the
+    // rail is off, a connect is about to raise it (see `serve_task`) and the
+    // WIO's boot-time report arrives on its own, so skip the doomed request.
+    // Clear any change signalled while disconnected; the publish below covers
+    // whatever is cached now.
+    RADIO_CONFIG_SIGNAL.reset();
+    if RAIL_ON.load(PersistOrdering::Relaxed) {
+        queue_frame(cmd::CFG_READ, &[]);
+    }
+
     // The device may have changed things since the last session (a clamped
     // interval, settings restored from flash), so publish before serving.
     publish_settings(server, conn).await;
+    publish_radio_config(server, conn).await;
 
     let events = async {
         let mut bulk: Option<BulkState> = None;
@@ -1337,9 +1400,19 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
         }
     };
 
+    // Republish the radio config whenever a fresh one arrives (the app
+    // pushing a new config, or the WIO reporting after a connect powered it).
+    // Never ends the session on its own, like the logger arm.
+    let config_pub = async {
+        loop {
+            RADIO_CONFIG_SIGNAL.wait().await;
+            publish_radio_config(server, conn).await;
+        }
+    };
+
     // Any arm ending (disconnect / position-notify failure) ends the
     // session.
-    select3(events, notifier, logger).await;
+    select(select3(events, notifier, logger), config_pub).await;
 }
 
 /// Apply a config write and build the ack to send back.
