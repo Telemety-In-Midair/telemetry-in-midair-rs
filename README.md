@@ -61,9 +61,12 @@ pixi run wio-config --address 3 --dry-run --save ../RADIO.CFG   # card file
 ```
 
 A push replaces the whole config: keys absent from what is sent revert to
-their defaults rather than keeping the board's current values, and there is
-no way to read a config back off a board. Start from a file holding your
-settings (`--file`) if the board is not on stock ones.
+their defaults rather than keeping the board's current values. The
+`wio-config` tool cannot read a config back off a board, so start from a
+file holding your settings (`--file`) if the board is not on stock ones.
+Over BLE the board *does* report its current config (see below), so the
+gps-gui-rs app can read it back - its Radio page has a "Load from board"
+that fills the editor from the board itself.
 
 A pushed config is stored twice - `RADIO.CFG` on the card and a backup page
 in the WIO's internal flash - so it survives a power cycle on a board with
@@ -186,8 +189,9 @@ Same service UUID as the ESP32-C3 beacon, so gps-gui-rs discovers it
 unchanged (device name `GPS-C6`). On top of the gps-proto position /
 config / ack characteristics the C6 adds telemetry (LoRa RSSI/SNR,
 counters, SD + fix flags), the last remote node position, a status/log
-characteristic (notify + read), and a bulk write characteristic for TOML
-config and WIO firmware images.
+characteristic (notify + read), the WIO's current radio config (read +
+notify), and a bulk write characteristic for TOML config and WIO firmware
+images.
 
 ## Status updates
 
@@ -217,6 +221,17 @@ device's current power/sleep configuration as one 16-byte blob
 connect rather than assuming defaults. It is republished after every
 config write - including values the device changed itself, such as a
 clamped interval.
+
+The radio-config characteristic (`c3a1000a-...`, read + notify) does the
+same for the WIO's radio configuration - the `RADIO.CFG` settings as a
+28-byte `midair_proto::radiocfg::RadioConfig` snapshot. Otherwise the
+config only ever travels *to* the board, so this is the one way to see
+what a board is running. The ESP does not parse it: the WIO encodes its
+live config and sends it over the link (`msg::CONFIG`) - at boot, after
+every apply, and on request - and the ESP relays the bytes, refreshing on
+connect and when the link comes up. It reads back all-zero (which decodes
+to nothing) until the WIO has reported one, so with the GPS/LoRa rail off
+it stays empty until a connect powers the WIO.
 
 Config command ids (config characteristic, `[id, len, value]`):
 
