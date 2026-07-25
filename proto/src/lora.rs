@@ -1,6 +1,6 @@
 //! The LoRa over-air frame and the payload formats it carries.
 //!
-//! Every transmission is a broadcast: one 3-byte header followed by an
+//! Every transmission is a message: one 3-byte header followed by an
 //! application payload. There is no addressing beyond the originator and
 //! no routing state - a node either repeats a frame or it does not, which
 //! is all a leaf/repeater topology needs.
@@ -88,7 +88,7 @@ impl<'a> Frame<'a> {
     }
 }
 
-/// Position broadcast: `[POSITION tag] [field mask] [selected fields]`.
+/// Position transmission: `[POSITION tag] [field mask] [selected fields]`.
 ///
 /// The sender picks which fields to spend air time on (see
 /// `RadioConfig::beacon_fields`) and stamps its choice into the mask, so the
@@ -116,7 +116,7 @@ pub const FIELDS_ALL: u8 =
 /// Position and nothing else - the default beacon payload.
 pub const FIELDS_DEFAULT: u8 = FIELD_LAT | FIELD_LON;
 
-/// Fields without which a position broadcast is not one.
+/// Fields without which a position transmission is not one.
 pub const FIELDS_REQUIRED: u8 = FIELD_LAT | FIELD_LON;
 
 /// Longest encoded position message: tag + mask + every field.
@@ -154,7 +154,7 @@ pub const fn position_msg_len(mask: u8) -> usize {
     2 + fields_len(mask)
 }
 
-/// Encode a position broadcast carrying the fields in `mask`, returning the
+/// Encode a position transmission carrying the fields in `mask`, returning the
 /// buffer and the used length. Bits outside [`FIELDS_ALL`] are ignored.
 pub fn encode_position(p: &PositionPacket, mask: u8) -> ([u8; POSITION_MSG_MAX], usize) {
     let mask = mask & FIELDS_ALL;
@@ -190,7 +190,7 @@ pub fn encode_position(p: &PositionPacket, mask: u8) -> ([u8; POSITION_MSG_MAX],
     (b, n)
 }
 
-/// Decode a position broadcast, or `None` if the payload is something else
+/// Decode a position transmission, or `None` if the payload is something else
 /// or is shorter than its own mask claims.
 ///
 /// Fields the sender left out come back zeroed. [`FLAG_FIX`] is always set:

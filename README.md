@@ -2,7 +2,7 @@
 [Kicad Board](https://github.com/tmpk13/telemetry-in-midair) https://github.com/tmpk13/telemetry-in-midair
 
 GPS tracker board firmware: a WIO-E5 (STM32WLE5) reads a MAX-M10 GPS,
-broadcasts positions over 915 MHz LoRa and logs to SD, while an ESP32-C6
+transmits positions over 915 MHz LoRa and logs to SD, while an ESP32-C6
 serves everything over BLE to the gps-gui-rs app and manages power. See
 `PLAN.md` for the intent.
 
@@ -90,8 +90,8 @@ SD copy. All keys are optional; defaults in parentheses:
 ```toml
 [radio]
 frequency_hz = 915000000   # (915 MHz)
-spreading_factor = 7       # 5-12 (7)
-bandwidth_khz = 125        # 62|125|250|500 (125)
+spreading_factor = 9       # 5-12 (9)
+bandwidth_khz = 62         # 62|125|250|500 (62)
 coding_rate = 5            # 4/5..4/8 (5)
 power_dbm = 22             # -9..22 (22)
 rx_boost = false           # boosted RX gain (false)
@@ -105,7 +105,7 @@ role = "leaf"              # leaf | repeater (leaf)
 max_hops = 1               # retransmissions allowed, 0-8 (1)
 
 [beacon]
-interval_s = 10            # position broadcast period, 0 = off (10)
+interval_s = 20            # position broadcast period, 0 = off (20)
 fields = "lat,lon"         # what each broadcast carries (lat,lon); also
                            #   altitude|speed|course|sats|time
 

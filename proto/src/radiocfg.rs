@@ -366,17 +366,17 @@ pub struct RadioConfig {
     /// by two paths from being handled twice and a repeater pair from
     /// bouncing one between themselves.
     ///
-    /// Ids wrap every 256 broadcasts, so this has to stay well under the time
+    /// Ids wrap every 256 transmissions, so this has to stay well under the time
     /// that takes at the beacon interval in use, or a node's own sequence
     /// would eventually collide with its remembered history and be suppressed
-    /// as a duplicate. At the 10 s default interval that wrap is ~43 min.
+    /// as a duplicate. At the 20 s default interval that wrap is ~85 min.
     pub dedup_ttl_s: u16,
-    /// Position broadcast interval in seconds (0 disables the beacon).
+    /// Position transmission interval in seconds (0 disables the beacon).
     pub beacon_interval_s: u16,
     /// Which [`PositionPacket`](gps_proto::packet::PositionPacket) fields the
     /// beacon puts on the air, as a mask of the `FIELD_*` bits in
     /// [`crate::lora`]. Every extra field is airtime paid on every
-    /// broadcast, so the default carries position and nothing else.
+    /// transmission, so the default carries position and nothing else.
     ///
     /// The mask travels in the frame, so nodes disagreeing about it is fine:
     /// a receiver decodes whatever the sender chose to include.
@@ -418,8 +418,12 @@ impl Default for RadioConfig {
     fn default() -> Self {
         Self {
             frequency_hz: 915_000_000,
-            spreading_factor: 7,
-            bandwidth_khz: 125,
+            // SF9 at BW62.5 kHz, CR 4/5: the longest-range modulation whose
+            // beacon still fits a 2% channel duty cycle at the 20 s interval
+            // below (about 330 ms on air, under the 400 ms that 2% of 20 s -
+            // and the 902-928 MHz dwell ceiling - allows).
+            spreading_factor: 9,
+            bandwidth_khz: 62,
             coding_rate: 5,
             power_dbm: 22,
             // Off, matching the chip's power-up state: enabling it costs
@@ -434,10 +438,13 @@ impl Default for RadioConfig {
             // fleet works without reconfiguring the nodes already deployed.
             max_hops: 1,
             dedup_ttl_s: 3,
-            beacon_interval_s: 10,
+            // 20 s: long enough that one beacon lands in a 20 s window, so the
+            // dwell budget is the full 400 ms rather than 2% of a shorter
+            // period - which is what lets the default modulation reach for SF9.
+            beacon_interval_s: 20,
             // Position only. Everything else a fix produces is written to
             // the SD log, where a byte costs nothing, rather than spent on
-            // air time that has to be paid on every single broadcast.
+            // air time that has to be paid on every single transmission.
             beacon_fields: crate::lora::FIELDS_DEFAULT,
             sd_enabled: true,
             // The console is free when nothing is reading it, so the
@@ -489,12 +496,68 @@ impl RadioConfig {
     /// Upper bound of the random delay a repeater waits before forwarding
     /// a frame (ms).
     ///
-    /// Two repeaters that hear the same broadcast would otherwise answer it
+    /// Two repeaters that hear the same transmission would otherwise answer it
     /// at the same instant and collide every time, so the wait has to span
     /// enough air time for one of them to win outright - hence scaling with
     /// the modulation rather than a fixed number of milliseconds.
     pub fn repeat_jitter_ms(&self) -> u32 {
         100 * self.airtime_scale()
+    }
+
+    /// Exact LoRa time-on-air for a PHY payload of `payload_len` bytes, in
+    /// microseconds.
+    ///
+    /// This is the Semtech time-on-air formula, evaluated with the fixed PHY
+    /// parameters the firmware always transmits under (see the WIO radio
+    /// setup): an 8-symbol preamble, an explicit header, and the hardware CRC
+    /// on. Low-data-rate optimization tracks [`ldro`](Self::ldro).
+    ///
+    /// Unlike [`airtime_scale`](Self::airtime_scale) - a coarse ratio used for
+    /// timeouts - this is the real airtime, for reporting to a user. The four
+    /// legal bandwidths all divide 1 MHz evenly, so the symbol time is a whole
+    /// number of microseconds and the whole calculation stays in integer math:
+    /// no float, so it is usable on the no_std targets too.
+    pub fn time_on_air_us(&self, payload_len: usize) -> u32 {
+        let sf = self.spreading_factor.clamp(5, 12) as u32;
+        // Bandwidth in Hz; 62 is the config's shorthand for 62.5 kHz.
+        let bw_hz = if self.bandwidth_khz == 62 {
+            62_500
+        } else {
+            self.bandwidth_khz as u32 * 1_000
+        };
+        // 1_000_000 / bw_hz is exact for every legal bandwidth (16, 8, 4 or 2),
+        // so the symbol time comes out an exact microsecond count.
+        let t_sym_us = (1u32 << sf) * (1_000_000 / bw_hz);
+
+        // Preamble is (n + 4.25) symbols with n = 8. 4.25 = 17/4, so scale the
+        // symbol count by 4 and divide once to keep the quarter-symbol exact.
+        let t_preamble_us = (4 * 8 + 17) * t_sym_us / 4;
+
+        // Payload symbol count. `cr` is coding_rate's 1..4 offset over 4, `de`
+        // the low-data-rate flag, the header is explicit (IH = 0) and the CRC
+        // is on (the +16 term). The bracket can only go non-positive for a
+        // payload far shorter than any real frame, and then no symbols are
+        // added beyond the fixed 8.
+        let cr = self.coding_rate.clamp(5, 8) as u32 - 4;
+        let de = self.ldro() as i32;
+        let num = 8 * payload_len as i32 - 4 * sf as i32 + 28 + 16;
+        let den = 4 * (sf as i32 - 2 * de); // sf >= 5 and de <= 1, so den >= 12
+        let payload_syms = if num <= 0 {
+            8
+        } else {
+            8 + ((num + den - 1) / den) as u32 * (cr + 4)
+        };
+        let t_payload_us = payload_syms * t_sym_us;
+
+        t_preamble_us + t_payload_us
+    }
+
+    /// Time-on-air of one beacon transmission at the current settings, in
+    /// microseconds: the frame header plus whichever position fields
+    /// [`beacon_fields`](Self::beacon_fields) selects.
+    pub fn beacon_airtime_us(&self) -> u32 {
+        let payload = crate::lora::HEADER_LEN + crate::lora::position_msg_len(self.beacon_fields);
+        self.time_on_air_us(payload)
     }
 }
 
@@ -1050,7 +1113,13 @@ mod tests {
 
     #[test]
     fn ldro_and_timeouts_scale() {
-        let mut cfg = RadioConfig::default();
+        // SF7/BW125 is the scale's own reference point, so pin it here rather
+        // than lean on the default (which is a slower modulation).
+        let mut cfg = RadioConfig {
+            spreading_factor: 7,
+            bandwidth_khz: 125,
+            ..RadioConfig::default()
+        };
         assert!(!cfg.ldro());
         assert_eq!(cfg.airtime_scale(), 1);
 
@@ -1069,6 +1138,52 @@ mod tests {
         assert!(cfg.ldro());
         cfg.spreading_factor = 10;
         assert!(!cfg.ldro());
+    }
+
+    /// Time-on-air against values worked out by hand from the Semtech formula,
+    /// so a change to the arithmetic that shifts the result is caught. The
+    /// default beacon is the 46.3 ms figure the docs quote.
+    #[test]
+    fn time_on_air_matches_hand_calc() {
+        // SF7, BW125, CR 4/5, with a header (3) + position lat/lon (10) =
+        // 13-byte PHY payload: the 46.3 ms figure the docs quote.
+        let mut cfg = RadioConfig {
+            spreading_factor: 7,
+            bandwidth_khz: 125,
+            ..RadioConfig::default()
+        };
+        assert_eq!(cfg.time_on_air_us(13), 46_336);
+        assert_eq!(cfg.beacon_airtime_us(), 46_336);
+
+        // The shipped default (SF9/BW62.5) beacon: ~330 ms, under the 400 ms a
+        // 2% duty cycle allows at the 20 s interval.
+        assert_eq!(RadioConfig::default().beacon_airtime_us(), 329_728);
+
+        // Slowest modulation the parser accepts, largest frame the firmware
+        // sends: SF12 / BW62.5 / CR 4/8 with LDRO on, 35 bytes -> ~5 s.
+        cfg.spreading_factor = 12;
+        cfg.bandwidth_khz = 62;
+        cfg.coding_rate = 8;
+        assert!(cfg.ldro());
+        assert_eq!(cfg.time_on_air_us(crate::lora::FRAME_MAX), 4_997_120);
+
+        // Same frame at BW125 is exactly half the symbol time, so ~2.5 s.
+        cfg.bandwidth_khz = 125;
+        assert_eq!(cfg.time_on_air_us(crate::lora::FRAME_MAX), 2_498_560);
+    }
+
+    /// A longer beacon payload costs more airtime, and airtime climbs steeply
+    /// with the spreading factor - the two levers a range-vs-limit trade pulls.
+    #[test]
+    fn beacon_airtime_grows_with_fields_and_sf() {
+        let base = RadioConfig::default();
+        let mut richer = base;
+        richer.beacon_fields = lora::FIELDS_ALL;
+        assert!(richer.beacon_airtime_us() > base.beacon_airtime_us());
+
+        let mut slower = base;
+        slower.spreading_factor = 10;
+        assert!(slower.beacon_airtime_us() > base.beacon_airtime_us());
     }
 
     #[test]
@@ -1097,7 +1212,7 @@ mod tests {
     fn beacon_fields_reject_nonsense() {
         // Unknown field name.
         assert_eq!(parse("fields = \"lat,lon,heading\""), Err(ConfigError::BadValue(1)));
-        // A broadcast without a position is not a position broadcast.
+        // A transmission without a position is not a position transmission.
         assert_eq!(parse("fields = \"altitude\""), Err(ConfigError::OutOfRange(1)));
         assert_eq!(parse("fields = \"lat\""), Err(ConfigError::OutOfRange(1)));
         assert_eq!(parse("fields = \"\""), Err(ConfigError::BadValue(1)));

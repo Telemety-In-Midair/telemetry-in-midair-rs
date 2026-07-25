@@ -38,10 +38,10 @@
 frequency_hz = 915000000
 frequency_hz_description = "RF center frequency in Hz. Valid 150000000-960000000."
 
-spreading_factor = 7
+spreading_factor = 9
 spreading_factor_description = "LoRa spreading factor, 5-12. Higher gives longer range at a lower data rate."
 
-bandwidth_khz = 125
+bandwidth_khz = 62
 bandwidth_khz_description = "LoRa bandwidth in kHz: 62, 125, 250 or 500 (62 means 62.5). Narrower gives longer range at a lower data rate."
 
 coding_rate = 5
@@ -57,8 +57,8 @@ rx_boost_description = "Boosted receiver gain: roughly +2 dB of sensitivity for 
 # preference. The defaults are the Wio-E5's own hardware; change them only
 # for a different module, where a wrong value means a radio that does not
 # start rather than one that performs badly.
-dcdc_enabled = true
-dcdc_enabled_description = "Use the internal DC-DC (SMPS) WIO-E5 supports this."
+# dcdc_enabled = true
+# dcdc_enabled_description = "Use the internal DC-DC (SMPS) WIO-E5 supports this."
 
 # tcxo_volts = "1.8"
 # tcxo_volts_description = "Supply the radio drives the TCXO at. Wio-E5 uses a 1.8V part."
@@ -84,9 +84,12 @@ role_type = "enum:leaf,repeater,tx_only,rx_only"
 max_hops = 1
 max_hops_description = "Retransmissions allowed for a broadcast this node sends, 0-8. 0 means no repeater forwards it."
 
+dedup_ttl_s = 3
+dedup_ttl_s_description = "How long a broadcast is remembered so a repeat of it is dropped rather than delivered or forwarded again, 1-3600 s. Keep it well under the time the beacon runs through 256 ids (about 85 min at the 20 s default), or a node starts suppressing its own later broadcasts as duplicates."
+
 # -- Beacon -------------------------------------------------------------
 [beacon]
-interval_s = 10
+interval_s = 20
 interval_s_description = "Position broadcast period in seconds, 0-3600. 0 disables the beacon, as does a role of rx_only."
 
 fields = "lat,lon"

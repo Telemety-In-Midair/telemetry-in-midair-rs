@@ -241,7 +241,7 @@ impl<R: PacketRadio> Node<R> {
                 return None;
             }
         };
-        // Our own broadcast, forwarded back to us by a repeater.
+        // Our own transmission, forwarded back to us by a repeater.
         //
         // Only a node that transmits can hear itself. One that does not has
         // nothing of its own on the air, so a frame carrying its address

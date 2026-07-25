@@ -20,7 +20,7 @@ The ESP32C6 blinks D2 very quickly on firmware upload to the WIO. Blinks on slee
 
 The SD card is optional to run. The ESP will cache the latest data (LORA RSSI/GPS coords/time). This data will be sent once ble is connected.
 
-All LoRa traffic is broadcast. A node is a leaf by default and hears every
+All LoRa traffic is transmission. A node is a leaf by default and hears every
 other node in direct range; one configured as a repeater retransmits what
 it hears, extending coverage past a single radio horizon.
 

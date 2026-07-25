@@ -452,7 +452,7 @@ impl PacketRadio for Sx1262Driver {
 
         // Re-enter continuous RX immediately: the node is deaf while it
         // transmits, so every millisecond spent out of RX after TxDone is
-        // another chance to miss someone else's broadcast. A transmit-only
+        // another chance to miss someone else's transmission. A transmit-only
         // node has nothing to miss and drops back to standby instead.
         if self.listen {
             if self.radio.set_rx(RX_CONTINUOUS).is_ok() {
