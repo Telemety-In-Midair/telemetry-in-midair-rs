@@ -199,6 +199,12 @@ that buys spreading factor, and spreading factor is the largest range knob
 here (SF7 to SF12 is roughly 12 dB), so the framing is kept small to leave
 room for a slow preset.
 
+Nodes transmit on the private LoRa sync word (0x1424), not the public
+LoRaWAN one, so a receiver does not lock onto LoRaWAN preambles it can never
+decode. It is not configurable, and nodes on different sync words cannot
+hear each other at all - firmware from before this change will not link with
+firmware after it.
+
 `rx_boost` is the one link-budget key that is not symmetric: it buys
 roughly +2 dB of sensitivity on the node it is set on, and does nothing
 for what that node transmits. Range is set by the worse of the two

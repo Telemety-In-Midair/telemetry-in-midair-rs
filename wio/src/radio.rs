@@ -373,8 +373,16 @@ impl Sx1262Driver {
             .set_lora_packet_params(&packet_params(RX_MAX_PAYLOAD))
             .expect("set_lora_packet_params");
 
+        // Private (0x1424), not the public LoRaWAN word: on the public one
+        // the receiver locks onto every LoRaWAN preamble in earshot, and the
+        // time it spends failing to decode a frame that was never ours is
+        // time it is not hearing the network. It also inflates the CRC-error
+        // count the status line asks an operator to read as signal quality.
+        //
+        // Nodes on different sync words cannot hear each other at all, so
+        // this is a flag day: a fleet has to be reflashed together.
         self.radio
-            .set_lora_sync_word(LoRaSyncWord::Public)
+            .set_lora_sync_word(LoRaSyncWord::Private)
             .expect("set_lora_sync_word");
 
         self.radio
