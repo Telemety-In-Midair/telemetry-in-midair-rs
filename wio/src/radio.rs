@@ -200,6 +200,11 @@ impl Sx1262Driver {
 
         // DC-DC roughly halves RX/TX current, but only works on a board
         // with the SMPS inductor fitted, so it stays configurable.
+        //
+        // Clock detection has to be enabled before the SMPS is, not after,
+        // so it is written unconditionally here rather than alongside the
+        // mode below - it costs nothing on a board running the LDO.
+        self.radio.set_smps_clock_det_en(true).ok();
         self.radio
             .set_regulator_mode(if cfg.dcdc_enabled {
                 RegMode::Smps
@@ -229,6 +234,15 @@ impl Sx1262Driver {
                     .set_timeout(Timeout::from_millis_sat(cfg.tcxo_startup_ms as u32)),
             )
             .expect("set_tcxo_mode");
+
+        // Recalibrate every block now that there is a 32 MHz clock. The
+        // automatic calibration at power-up ran before the TCXO was enabled,
+        // so the RC64k, RC13M, PLL, ADC and image results it produced were
+        // all derived from a clock that was not running - which shows up as
+        // frequency error and lost sensitivity rather than as a failure.
+        // 0x7F selects every block.
+        self.radio.calibrate(0x7F).expect("calibrate");
+        self.wait_on_busy();
 
         let band = if cfg.frequency_hz >= 900_000_000 {
             CalibrateImage::ISM_902_928
