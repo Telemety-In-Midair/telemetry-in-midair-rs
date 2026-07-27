@@ -34,8 +34,8 @@ use stm32wlxx_hal::spi::{SgMiso, SgMosi};
 use stm32wlxx_hal::subghz::{
     CalibrateImage, CfgIrq, CodingRate, FallbackMode, HeaderType, Irq, LoRaBandwidth,
     LoRaModParams, LoRaPacketParams, LoRaSyncWord, Ocp, PMode, PaConfig, PaSel, PacketType,
-    RampTime, RegMode, RfFreq, SleepCfg, SpreadingFactor, StandbyClk, SubGhz, TcxoMode, TcxoTrim,
-    Timeout, TxParams,
+    RampTime, RegMode, RfFreq, SleepCfg, SpreadingFactor, StandbyClk, StatusMode, SubGhz, TcxoMode,
+    TcxoTrim, Timeout, TxParams,
 };
 
 /// Errors from the SubGHz radio.
@@ -112,6 +112,14 @@ const RX_CONTINUOUS: Timeout = Timeout::from_raw(0x00FF_FFFF);
 /// Every transmit has to narrow it to the size of the frame being sent, so
 /// receiving means putting it back.
 const RX_MAX_PAYLOAD: u8 = 255;
+
+/// SMPS control 0. Bit 6 enables clock detection, which has to be on before
+/// the SMPS is selected; every other bit belongs to the regulator and must
+/// be preserved.
+const REG_SMPS_C0: u16 = 0x0916;
+
+/// [`REG_SMPS_C0`] clock-detection enable.
+const SMPS_CLK_DET_EN: u8 = 1 << 6;
 
 /// TX clamp configuration. Bits 4:1 all set improves the PA's tolerance of
 /// an antenna mismatch (SX1261/2 datasheet, "Better resistance of the
@@ -234,7 +242,12 @@ impl Sx1262Driver {
         // Clock detection has to be enabled before the SMPS is, not after,
         // so it is written unconditionally here rather than alongside the
         // mode below - it costs nothing on a board running the LDO.
-        self.radio.set_smps_clock_det_en(true).ok();
+        //
+        // Read-modify-write, not the HAL's `set_smps_clock_det_en`: that
+        // setter writes the whole register, so it enables clock detection by
+        // clearing every other bit of the regulator's configuration.
+        let smps = self.read_reg(REG_SMPS_C0);
+        self.write_reg(REG_SMPS_C0, smps | SMPS_CLK_DET_EN);
         self.radio
             .set_regulator_mode(if cfg.dcdc_enabled {
                 RegMode::Smps
@@ -439,6 +452,26 @@ impl Sx1262Driver {
                 false
             }
         }
+    }
+
+    /// The radio's current mode and any latched operational error.
+    ///
+    /// Packet counters cannot show a radio that is sitting somewhere it
+    /// should not be. A node beaconing every 20 s spends almost all of its
+    /// time in `rx`, so anything else on a periodic status line - `tx` in
+    /// particular - is a radio burning current between transmissions rather
+    /// than listening.
+    pub fn health(&mut self) -> (&'static str, u16) {
+        let mode = match self.radio.status().map(|s| s.mode()) {
+            Ok(Ok(StatusMode::StandbyRc)) => "standby",
+            Ok(Ok(StatusMode::StandbyHse)) => "standby-hse",
+            Ok(Ok(StatusMode::Fs)) => "fs",
+            Ok(Ok(StatusMode::Rx)) => "rx",
+            Ok(Ok(StatusMode::Tx)) => "tx",
+            _ => "?",
+        };
+        let err = self.radio.op_error().map(|(_, e)| e).unwrap_or(0);
+        (mode, err)
     }
 
     /// SNR of the last received packet in centibels (dB * 100).

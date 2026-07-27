@@ -623,9 +623,12 @@ mod app {
                 // cumulative since boot.
                 if cfg.verbose {
                     let d = node.rx_drops();
+                    let (mode, op_err) = node.radio_mut().health();
                     status_println!(
                         esp,
-                        "rx {} ok; dropped crc {} dup {} echo {} malformed {} oversize {}",
+                        "radio {} err {:04x}; rx {} ok; dropped crc {} dup {} echo {} malformed {} oversize {}",
+                        mode,
+                        op_err,
                         rx_count,
                         node.radio().rx_crc_errors(),
                         d.duplicate,
