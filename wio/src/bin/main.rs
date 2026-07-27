@@ -2,8 +2,9 @@
 //!
 //! - Reads the MAX-M10 GPS on USART1 (PB6 TX / PB7 RX, EXTINT on PB10).
 //! - Broadcasts positions over 915 MHz LoRa and blinks D6 (PA9) on RX,
-//!   D5 (PA10) on TX. Nodes are leaves by default and hear each other
-//!   directly; one configured as a repeater extends that range.
+//!   D5 (PA10) on TX. The module's antenna switch is driven from PA4/PA5.
+//!   Nodes are leaves by default and hear each other directly; one
+//!   configured as a repeater extends that range.
 //! - Logs own and remote positions to a FAT SD card (SPI1 + PA0 CS).
 //! - Talks to the ESP32-C6 on USART2 (PA2 TX / PA3 RX): positions and
 //!   status out; sleep/config/firmware commands in. Radio-busy flags run
@@ -43,7 +44,7 @@ mod app {
     use wio_e5_gps::gps::Gps;
     use wio_e5_gps::leds::Leds;
     use wio_e5_gps::platform::{self, SYSCLK_HZ};
-    use wio_e5_gps::radio::Sx1262Driver;
+    use wio_e5_gps::radio::{RfSwitch, Sx1262Driver};
     use wio_e5_gps::sdcard::SdCard;
     use wio_e5_gps::sdlog::SdLog;
     use wio_e5_gps::watchdog;
@@ -156,9 +157,10 @@ mod app {
             sdlog.disable(platform::millis());
         }
 
-        // SubGHz radio (integrated SX1262).
+        // SubGHz radio (integrated SX1262) and the module's antenna switch.
         let sg = SubGhz::new(dp.SPI3, &mut rcc);
-        let mut radio = Sx1262Driver::new(sg);
+        let rf_switch = cortex_m::interrupt::free(|cs| RfSwitch::new(gpioa.a4, gpioa.a5, cs));
+        let mut radio = Sx1262Driver::new(sg, rf_switch);
         radio.init(&cfg);
         radio.print_diagnostics();
         watchdog::feed(&iwdg);

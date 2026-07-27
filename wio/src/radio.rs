@@ -28,6 +28,8 @@ pub trait PacketRadio {
     fn max_packet_len(&self) -> usize;
 }
 
+use cortex_m::interrupt::CriticalSection;
+use stm32wlxx_hal::gpio::{pins, Output, OutputArgs, PinState, Speed};
 use stm32wlxx_hal::spi::{SgMiso, SgMosi};
 use stm32wlxx_hal::subghz::{
     CalibrateImage, CfgIrq, CodingRate, FallbackMode, HeaderType, Irq, LoRaBandwidth,
@@ -41,6 +43,58 @@ use stm32wlxx_hal::subghz::{
 pub enum Sx1262Error {
     Radio,
     Timeout,
+}
+
+/// Which way the module's antenna switch is pointed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RfPath {
+    /// Antenna isolated from both the PA and the receiver.
+    Off,
+    /// Antenna to the receiver.
+    Rx,
+    /// Antenna to the high-power PA, the only transmit output this board
+    /// uses ([`PaSel::Hp`] below).
+    TxHp,
+}
+
+/// The module's antenna switch, on PA4 (control 1) and PA5 (control 2).
+///
+/// The radio die has no bonded DIO2, so there is no `SetDio2AsRfSwitchCtrl`
+/// to hand the job to the radio the way a discrete SX1262 would: the path
+/// has to be selected from the MCU before every transmit and every receive.
+/// Both lines low isolates the antenna, which is where the switch belongs
+/// whenever the radio is neither transmitting nor listening.
+///
+/// The control lines are static logic levels next to an RF path, so they are
+/// driven at the slowest edge rate the GPIO offers.
+pub struct RfSwitch {
+    ctrl1: Output<pins::A4>,
+    ctrl2: Output<pins::A5>,
+}
+
+impl RfSwitch {
+    /// Take the two control pins, leaving the switch isolated.
+    pub fn new(a4: pins::A4, a5: pins::A5, cs: &CriticalSection) -> Self {
+        const ARGS: OutputArgs = OutputArgs {
+            speed: Speed::Low,
+            level: PinState::Low,
+            ..OutputArgs::new()
+        };
+        Self {
+            ctrl1: Output::new(a4, &ARGS, cs),
+            ctrl2: Output::new(a5, &ARGS, cs),
+        }
+    }
+
+    fn set(&mut self, path: RfPath) {
+        let (c1, c2) = match path {
+            RfPath::Off => (PinState::Low, PinState::Low),
+            RfPath::Rx => (PinState::High, PinState::Low),
+            RfPath::TxHp => (PinState::Low, PinState::High),
+        };
+        self.ctrl1.set_level(c1);
+        self.ctrl2.set_level(c2);
+    }
 }
 
 /// SetRx timeout value that selects continuous RX. On the SX126x the SetRx
@@ -57,6 +111,7 @@ const RX_CONTINUOUS: Timeout = Timeout::from_raw(0x00FF_FFFF);
 /// handles the internal SPI3 interface, BUSY signal, and DIO lines.
 pub struct Sx1262Driver {
     radio: SubGhz<SgMiso, SgMosi>,
+    rf_switch: RfSwitch,
     rx_active: bool,
     /// Whether the receiver is used at all. False on a transmit-only node,
     /// which idles in standby instead of continuous RX - that idle current
@@ -77,9 +132,10 @@ pub struct Sx1262Driver {
 
 impl Sx1262Driver {
     /// Create a new SubGHz radio driver. Call [`init`](Self::init) before use.
-    pub fn new(radio: SubGhz<SgMiso, SgMosi>) -> Self {
+    pub fn new(radio: SubGhz<SgMiso, SgMosi>, rf_switch: RfSwitch) -> Self {
         Self {
             radio,
+            rf_switch,
             rx_active: false,
             listen: true,
             last_snr_cb: 0,
@@ -113,6 +169,10 @@ impl Sx1262Driver {
         self.tx_poll_timeout_ms = cfg.tx_poll_timeout_ms();
         self.tx_chip_timeout_ms = cfg.tx_chip_timeout_ms();
 
+        // Nothing is on the air during configuration, and a live antenna
+        // path while the PA and receiver are being reconfigured is a path
+        // nobody is driving deliberately.
+        self.rf_switch.set(RfPath::Off);
         self.radio.set_standby(StandbyClk::Rc).expect("set_standby");
 
         // DC-DC roughly halves RX/TX current, but only works on a board
@@ -295,6 +355,7 @@ impl Sx1262Driver {
     /// Put the radio into standby (used for the soft-sleep state).
     pub fn standby(&mut self) {
         self.rx_active = false;
+        self.rf_switch.set(RfPath::Off);
         self.radio.set_standby(StandbyClk::Rc).ok();
         self.wait_on_busy();
     }
@@ -336,6 +397,7 @@ impl PacketRadio for Sx1262Driver {
 
         // Enter continuous RX if not already listening.
         if !self.rx_active {
+            self.rf_switch.set(RfPath::Rx);
             self.radio
                 .set_rx(RX_CONTINUOUS)
                 .map_err(|_| Sx1262Error::Radio)?;
@@ -396,6 +458,7 @@ impl PacketRadio for Sx1262Driver {
     fn send(&mut self, data: &[u8]) -> Result<(), Self::Error> {
         self.rx_active = false;
 
+        self.rf_switch.set(RfPath::Off);
         self.radio
             .set_standby(StandbyClk::Rc)
             .map_err(|_| Sx1262Error::Radio)?;
@@ -420,6 +483,10 @@ impl PacketRadio for Sx1262Driver {
             )
             .map_err(|_| Sx1262Error::Radio)?;
 
+        // Point the antenna at the PA before the ramp starts, never after:
+        // a PA ramping into an isolated switch is the transmission that goes
+        // nowhere.
+        self.rf_switch.set(RfPath::TxHp);
         self.radio
             .set_tx(Timeout::from_millis_sat(self.tx_chip_timeout_ms))
             .map_err(|_| Sx1262Error::Radio)?;
@@ -455,11 +522,13 @@ impl PacketRadio for Sx1262Driver {
         // another chance to miss someone else's transmission. A transmit-only
         // node has nothing to miss and drops back to standby instead.
         if self.listen {
+            self.rf_switch.set(RfPath::Rx);
             if self.radio.set_rx(RX_CONTINUOUS).is_ok() {
                 self.wait_on_busy();
                 self.rx_active = true;
             }
         } else {
+            self.rf_switch.set(RfPath::Off);
             self.radio.set_standby(StandbyClk::Rc).ok();
             self.wait_on_busy();
         }

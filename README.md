@@ -401,8 +401,15 @@ past the console text. Only one transfer (BLE or USB) runs at a time.
 | PB4 | SD CITO |
 | PB5 | SD COTI |
 | PA0 | SD CS |
+| PA4 | RF switch control 1 (module-internal) |
+| PA5 | RF switch control 2 (module-internal) |
 | PA9 | LED D6 |
 | PA10 | LED D5 |
+
+The antenna switch is inside the module and has to be driven by the MCU:
+the radio die has no bonded DIO2, so there is no `SetDio2AsRfSwitchCtrl` to
+hand the job to the radio. Both lines low isolates the antenna; control 1
+high selects the receiver, control 2 high the high-power PA.
 
 *Reset (RST) pad on back*
 
