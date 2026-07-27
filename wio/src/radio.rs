@@ -113,6 +113,16 @@ const RX_CONTINUOUS: Timeout = Timeout::from_raw(0x00FF_FFFF);
 /// receiving means putting it back.
 const RX_MAX_PAYLOAD: u8 = 255;
 
+/// TX clamp configuration. Bits 4:1 all set improves the PA's tolerance of
+/// an antenna mismatch (SX1261/2 datasheet, "Better resistance of the
+/// SX1262 Tx to antenna mismatch").
+const REG_TX_CLAMP: u16 = 0x08D8;
+
+/// TX modulation configuration. Bit 2 must be cleared for a 500 kHz LoRa
+/// bandwidth and set for every other bandwidth (SX1261/2 datasheet,
+/// "Modulation quality with 500 kHz LoRa bandwidth").
+const REG_TX_MODULATION: u16 = 0x0889;
+
 /// Image calibration bounds for operation at `freq_hz`.
 ///
 /// Image rejection is calibrated for a band, and calibrating for a band the
@@ -295,6 +305,13 @@ impl Sx1262Driver {
             )
             .expect("set_tx_params");
 
+        // Applied after the PA is configured, since configuring it is what
+        // this compensates for. The board's antenna is a connector and a
+        // short wire, so the mismatch this guards the PA against is the
+        // normal case rather than a fault.
+        let clamp = self.read_reg(REG_TX_CLAMP);
+        self.write_reg(REG_TX_CLAMP, clamp | 0x1E);
+
         // Receive-side counterpart to the TX power above. The RxGain
         // register is not covered by warm-start retention, so it has to be
         // rewritten on every entry to this function rather than set once -
@@ -339,6 +356,18 @@ impl Sx1262Driver {
                     .set_ldro_en(cfg.ldro()),
             )
             .expect("set_lora_mod_params");
+
+        // Bandwidth-dependent, and the modulation params are what carry the
+        // bandwidth, so this follows them. Only 500 kHz wants the bit clear;
+        // every other bandwidth wants it set, which is also the reset value,
+        // so this only ever undoes itself after a config push moved off 500.
+        let txmod = self.read_reg(REG_TX_MODULATION);
+        let txmod = if cfg.bandwidth_khz == 500 {
+            txmod & !0x04
+        } else {
+            txmod | 0x04
+        };
+        self.write_reg(REG_TX_MODULATION, txmod);
 
         self.radio
             .set_lora_packet_params(&packet_params(RX_MAX_PAYLOAD))
@@ -458,6 +487,53 @@ impl Sx1262Driver {
         self.wait_on_busy();
         self.rx_active = true;
         Ok(())
+    }
+
+    /// Run one raw SUBGHZSPI transaction, replacing `buf` with what the
+    /// radio shifted back.
+    ///
+    /// `stm32wlxx-hal` keeps its register table private and covers only the
+    /// registers it has methods for, so the two errata workarounds below have
+    /// no route through it. This is the same transaction the HAL performs for
+    /// its own register access: wait out BUSY, pull NSS low, shift the bytes,
+    /// release NSS. SPI3 belongs to the `SubGhz` this method takes `&mut
+    /// self` on, and every radio call in this firmware runs from one task, so
+    /// the access is exclusive.
+    fn subghz_xfer(&mut self, buf: &mut [u8]) {
+        // SUBGHZSPI data register. Byte-wide accesses: the peripheral is in
+        // 8-bit frame mode, and a 32-bit write would shift out four bytes.
+        const SPI3_DR: *mut u8 = 0x5801_000C as *mut u8;
+
+        self.wait_on_busy();
+        unsafe {
+            let pwr = &*stm32wlxx_hal::pac::PWR::PTR;
+            let spi = &*stm32wlxx_hal::pac::SPI3::PTR;
+            pwr.subghzspicr.write(|w| w.nss().clear_bit());
+            for byte in buf.iter_mut() {
+                while spi.sr.read().ftlvl().is_full() {}
+                core::ptr::write_volatile(SPI3_DR, *byte);
+                while spi.sr.read().frlvl().is_empty() {}
+                *byte = core::ptr::read_volatile(SPI3_DR);
+            }
+            pwr.subghzspicr.write(|w| w.nss().set_bit());
+        }
+        self.wait_on_busy();
+    }
+
+    /// Read one SubGHz configuration register.
+    fn read_reg(&mut self, addr: u16) -> u8 {
+        // ReadRegister (0x1D): opcode, big-endian address, one byte during
+        // which the radio returns its status, then the register value.
+        let mut buf = [0x1D, (addr >> 8) as u8, addr as u8, 0x00, 0x00];
+        self.subghz_xfer(&mut buf);
+        buf[4]
+    }
+
+    /// Write one SubGHz configuration register.
+    fn write_reg(&mut self, addr: u16, value: u8) {
+        // WriteRegister (0x0D): opcode, big-endian address, value.
+        let mut buf = [0x0D, (addr >> 8) as u8, addr as u8, value];
+        self.subghz_xfer(&mut buf);
     }
 
     /// Poll the RFBUSYS bit to wait for the radio to be ready.
