@@ -105,6 +105,29 @@ impl RfSwitch {
 /// mode would leave a node that rarely transmits deaf after its first packet.
 const RX_CONTINUOUS: Timeout = Timeout::from_raw(0x00FF_FFFF);
 
+/// Payload length written into the packet params before receiving.
+///
+/// With an explicit header this field is not the length of anything - the
+/// header carries that - it is the largest payload the receiver will accept.
+/// Every transmit has to narrow it to the size of the frame being sent, so
+/// receiving means putting it back.
+const RX_MAX_PAYLOAD: u8 = 255;
+
+/// The LoRa packet params this firmware always uses, for a payload of
+/// `payload_len` bytes: an 8-symbol preamble, an explicit header, the
+/// hardware CRC on, and no IQ inversion.
+///
+/// [`RadioConfig::time_on_air_us`](midair_proto::radiocfg::RadioConfig::time_on_air_us)
+/// computes air time from these same fixed choices, so the two have to agree.
+fn packet_params(payload_len: u8) -> LoRaPacketParams {
+    LoRaPacketParams::new()
+        .set_preamble_len(8)
+        .set_header_type(HeaderType::Variable)
+        .set_payload_len(payload_len)
+        .set_crc_en(true)
+        .set_invert_iq(false)
+}
+
 /// SubGHz radio driver that implements [`PacketRadio`].
 ///
 /// On the STM32WLE5 the SX1262 is integrated - the [`SubGhz`] peripheral
@@ -289,14 +312,7 @@ impl Sx1262Driver {
             .expect("set_lora_mod_params");
 
         self.radio
-            .set_lora_packet_params(
-                &LoRaPacketParams::new()
-                    .set_preamble_len(8)
-                    .set_header_type(HeaderType::Variable)
-                    .set_payload_len(255)
-                    .set_crc_en(true)
-                    .set_invert_iq(false),
-            )
+            .set_lora_packet_params(&packet_params(RX_MAX_PAYLOAD))
             .expect("set_lora_packet_params");
 
         self.radio
@@ -369,6 +385,40 @@ impl Sx1262Driver {
         }
     }
 
+    /// Arm continuous receive, restoring the maximum acceptable payload
+    /// length first.
+    ///
+    /// That restore is the whole reason this is a function rather than a
+    /// `set_rx` call at each site: a transmit leaves the packet params
+    /// carrying the length of the frame it just sent, and re-entering
+    /// receive with that still in place caps the receiver at the size of
+    /// this node's own last transmission. After a 7-byte no-fix ping that
+    /// is shorter than every position frame on the network, so a node that
+    /// lost its fix would also go deaf to everyone else's.
+    ///
+    /// Packet params are configuration, so the radio is put back in standby
+    /// to take them - the caller may be re-arming from continuous RX after
+    /// dropping an oversize packet.
+    fn enter_rx(&mut self) -> Result<(), Sx1262Error> {
+        self.rf_switch.set(RfPath::Off);
+        self.radio
+            .set_standby(StandbyClk::Rc)
+            .map_err(|_| Sx1262Error::Radio)?;
+        self.wait_on_busy();
+
+        self.radio
+            .set_lora_packet_params(&packet_params(RX_MAX_PAYLOAD))
+            .map_err(|_| Sx1262Error::Radio)?;
+
+        self.rf_switch.set(RfPath::Rx);
+        self.radio
+            .set_rx(RX_CONTINUOUS)
+            .map_err(|_| Sx1262Error::Radio)?;
+        self.wait_on_busy();
+        self.rx_active = true;
+        Ok(())
+    }
+
     /// Poll the RFBUSYS bit to wait for the radio to be ready.
     ///
     /// The SX126x silently ignores SPI commands sent while BUSY is high, so
@@ -397,12 +447,7 @@ impl PacketRadio for Sx1262Driver {
 
         // Enter continuous RX if not already listening.
         if !self.rx_active {
-            self.rf_switch.set(RfPath::Rx);
-            self.radio
-                .set_rx(RX_CONTINUOUS)
-                .map_err(|_| Sx1262Error::Radio)?;
-            self.wait_on_busy();
-            self.rx_active = true;
+            self.enter_rx()?;
         }
 
         let (_, irq) = self.radio.irq_status().map_err(|_| Sx1262Error::Radio)?;
@@ -471,16 +516,10 @@ impl PacketRadio for Sx1262Driver {
             .map_err(|_| Sx1262Error::Radio)?;
 
         // Packet params must carry the actual payload length and the full
-        // LoRa parameter set, or TxDone never fires.
+        // LoRa parameter set, or TxDone never fires. `enter_rx` puts the
+        // length back afterwards.
         self.radio
-            .set_lora_packet_params(
-                &LoRaPacketParams::new()
-                    .set_preamble_len(8)
-                    .set_header_type(HeaderType::Variable)
-                    .set_payload_len(data.len() as u8)
-                    .set_crc_en(true)
-                    .set_invert_iq(false),
-            )
+            .set_lora_packet_params(&packet_params(data.len() as u8))
             .map_err(|_| Sx1262Error::Radio)?;
 
         // Point the antenna at the PA before the ramp starts, never after:
@@ -522,11 +561,7 @@ impl PacketRadio for Sx1262Driver {
         // another chance to miss someone else's transmission. A transmit-only
         // node has nothing to miss and drops back to standby instead.
         if self.listen {
-            self.rf_switch.set(RfPath::Rx);
-            if self.radio.set_rx(RX_CONTINUOUS).is_ok() {
-                self.wait_on_busy();
-                self.rx_active = true;
-            }
+            let _ = self.enter_rx();
         } else {
             self.rf_switch.set(RfPath::Off);
             self.radio.set_standby(StandbyClk::Rc).ok();
