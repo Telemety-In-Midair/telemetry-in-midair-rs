@@ -113,6 +113,26 @@ const RX_CONTINUOUS: Timeout = Timeout::from_raw(0x00FF_FFFF);
 /// receiving means putting it back.
 const RX_MAX_PAYLOAD: u8 = 255;
 
+/// Image calibration bounds for operation at `freq_hz`.
+///
+/// Image rejection is calibrated for a band, and calibrating for a band the
+/// radio is not operating in throws away the rejection - which is
+/// sensitivity, and so range. The config accepts anything from 150 to 960
+/// MHz, well past the ISM bands the datasheet tabulates, so a frequency
+/// outside all of them gets the 4 MHz-aligned window that brackets it rather
+/// than the nearest named band.
+fn image_band(freq_hz: u32) -> CalibrateImage {
+    match freq_hz / 1_000_000 {
+        902..=928 => CalibrateImage::ISM_902_928,
+        863..=870 => CalibrateImage::ISM_863_870,
+        779..=787 => CalibrateImage::ISM_779_787,
+        470..=510 => CalibrateImage::ISM_470_510,
+        430..=440 => CalibrateImage::ISM_430_440,
+        // `from_freq` takes MHz bounds on a 4 MHz grid, low first.
+        mhz => CalibrateImage::from_freq((mhz / 4 * 4) as u16, (mhz / 4 * 4 + 4) as u16),
+    }
+}
+
 /// The LoRa packet params this firmware always uses, for a payload of
 /// `payload_len` bytes: an 8-symbol preamble, an explicit header, the
 /// hardware CRC on, and no IQ inversion.
@@ -244,14 +264,9 @@ impl Sx1262Driver {
         self.radio.calibrate(0x7F).expect("calibrate");
         self.wait_on_busy();
 
-        let band = if cfg.frequency_hz >= 900_000_000 {
-            CalibrateImage::ISM_902_928
-        } else if cfg.frequency_hz >= 860_000_000 {
-            CalibrateImage::ISM_863_870
-        } else {
-            CalibrateImage::ISM_430_440
-        };
-        self.radio.calibrate_image(band).expect("calibrate_image");
+        self.radio
+            .calibrate_image(image_band(cfg.frequency_hz))
+            .expect("calibrate_image");
 
         self.radio
             .set_packet_type(PacketType::LoRa)
