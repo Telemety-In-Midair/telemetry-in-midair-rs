@@ -34,8 +34,8 @@ const NMEA_MAX: usize = 82;
 const DRAIN_BUDGET: usize = 512;
 
 /// Largest UBX payload this driver builds. The CFG-VALSET frame it emits
-/// (4-byte header + nine key/value pairs) is well under this.
-const UBX_MAX_PAYLOAD: usize = 64;
+/// (4-byte header + fifteen key/value pairs) is well under this.
+const UBX_MAX_PAYLOAD: usize = 128;
 
 // UBX-CFG-VALSET configuration keys (u-blox M10, protocol 34.x). The high
 // nibble region encodes the value size: 0x10.. = L (1 byte), 0x20.. = U1/E1
@@ -50,6 +50,18 @@ const CFG_PM_OPERATEMODE: u32 = 0x20D0_0001;
 const CFG_RATE_MEAS: u32 = 0x3021_0001;
 const CFG_NAVSPG_DYNMODEL: u32 = 0x2011_0021;
 
+// CFG-MSGOUT-NMEA_ID_*_UART1: per-sentence output rate in navigation
+// epochs, 0 to turn the sentence off.
+const CFG_MSGOUT_RMC: u32 = 0x2091_00AC;
+const CFG_MSGOUT_GGA: u32 = 0x2091_00BB;
+const CFG_MSGOUT_GLL: u32 = 0x2091_00CA;
+const CFG_MSGOUT_GSA: u32 = 0x2091_00C0;
+const CFG_MSGOUT_GSV: u32 = 0x2091_00C5;
+const CFG_MSGOUT_VTG: u32 = 0x2091_00B1;
+
+/// How long [`Gps::configure`] waits for the module to acknowledge.
+const ACK_TIMEOUT_MS: u32 = 250;
+
 pub struct Gps {
     uart: Uart1<pins::B7, pins::B6>,
     extint: Output<pins::B10>,
@@ -62,6 +74,10 @@ pub struct Gps {
     updated: bool,
     /// Whether the module was put into backup mode.
     pub sleeping: bool,
+    /// Whether the module acknowledged the last [`configure`](Self::configure).
+    /// False after a push that landed before the module had finished
+    /// starting, which is the usual outcome at boot.
+    pub configured: bool,
     /// Total bytes read from USART1 since boot (saturating). Presence check:
     /// 0 means nothing on the wire (unpowered / miswired / RX pin).
     rx_bytes: u32,
@@ -97,6 +113,7 @@ impl Gps {
             packet: PositionPacket::default(),
             updated: false,
             sleeping: false,
+            configured: false,
             rx_bytes: 0,
             rx_sentences: 0,
         }
@@ -276,9 +293,14 @@ impl Gps {
     /// WIO controls the module's power rail, so it re-runs at every boot;
     /// the RAM layer is enough and avoids wearing battery-backed storage.
     /// No-op while the module is in backup mode.
-    pub fn configure(&mut self, cfg: &GpsConfig) {
+    ///
+    /// Returns whether the module acknowledged. A rejected frame - an
+    /// unsupported key, or a constellation set the receiver cannot track
+    /// concurrently - otherwise leaves it quietly running its old settings
+    /// while the firmware reports the ones it asked for.
+    pub fn configure(&mut self, cfg: &GpsConfig) -> bool {
         if self.sleeping {
-            return;
+            return false;
         }
         // VALSET payload: version(0), layers(bit0 = RAM), reserved[2], then
         // key/value pairs. Value width is encoded in the key id (bits 30:28:
@@ -306,7 +328,66 @@ impl Gps {
         put(CFG_RATE_MEAS, &cfg.meas_rate_ms.to_le_bytes());
         // CFG-NAVSPG-DYNMODEL (E1, 1 byte).
         put(CFG_NAVSPG_DYNMODEL, &[cfg.dyn_model.dynmodel()]);
+        // NMEA output (U1, 1 byte each): keep the two sentences this
+        // firmware reads and silence the four the module also sends by
+        // default. At 9600 baud there are 960 bytes a second to spend, and
+        // with several constellations enabled GSV alone can exceed that in
+        // one epoch - which pushes RMC and GGA behind sentences nothing
+        // parses, and shows up as the USART overruns `poll` treats as
+        // routine rather than as anything obviously wrong.
+        put(CFG_MSGOUT_RMC, &[1]);
+        put(CFG_MSGOUT_GGA, &[1]);
+        put(CFG_MSGOUT_GLL, &[0]);
+        put(CFG_MSGOUT_GSA, &[0]);
+        put(CFG_MSGOUT_GSV, &[0]);
+        put(CFG_MSGOUT_VTG, &[0]);
         self.ubx(0x06, 0x8A, &p[..n]);
+        self.configured = self.wait_ack(0x06, 0x8A);
+        self.configured
+    }
+
+    /// Wait for the module to acknowledge the message `class`/`id`.
+    ///
+    /// The receiver keeps emitting NMEA while it answers, so this scans the
+    /// byte stream for a UBX-ACK frame rather than expecting the reply to
+    /// arrive on its own. Bytes consumed here are bytes the NMEA parser does
+    /// not see, which costs at most one epoch of position.
+    fn wait_ack(&mut self, class: u8, id: u8) -> bool {
+        // B5 62 05 <01 ack | 00 nak> 02 00 <class> <id>, then the checksum.
+        const ACK: usize = 3;
+        let expected: [u8; 8] = [0xB5, 0x62, 0x05, 0x01, 0x02, 0x00, class, id];
+        let mut matched = 0usize;
+
+        let start = crate::platform::millis();
+        while crate::platform::millis().wrapping_sub(start) < ACK_TIMEOUT_MS {
+            let byte = match self.uart.read() {
+                Ok(b) => b,
+                Err(nb::Error::WouldBlock) => continue,
+                Err(nb::Error::Other(_)) => {
+                    self.clear_errors();
+                    matched = 0;
+                    continue;
+                }
+            };
+            self.rx_bytes = self.rx_bytes.saturating_add(1);
+            // The ack/nak byte is the one position where both values are a
+            // valid frame; a NAK is an answer, so stop on it either way.
+            if matched == ACK && byte == 0x00 {
+                crate::debug_println!("gps: config rejected (NAK)");
+                return false;
+            }
+            if byte == expected[matched] {
+                matched += 1;
+                if matched == expected.len() {
+                    return true;
+                }
+            } else {
+                // A mismatch can itself be the start of the next frame.
+                matched = (byte == expected[0]) as usize;
+            }
+        }
+        crate::debug_println!("gps: no ack for config");
+        false
     }
 
     /// Put the module into backup mode (UBX-RXM-PMREQ, indefinite, wake

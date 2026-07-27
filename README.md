@@ -208,6 +208,14 @@ boot and again whenever a new config is applied (constellation, power and
 model changes take effect live). Defaults match the M10 factory set, so an
 absent section is a no-op.
 
+The same frame turns off the NMEA sentences the firmware does not read (GLL,
+GSA, GSV, VTG), leaving RMC and GGA. The link to the module is 9600 baud, or
+960 bytes a second, and GSV alone can exceed that in one epoch once several
+constellations are enabled - which delays the two sentences that carry the
+fix behind sentences nothing parses. The module acknowledges the frame, and a
+push that lands before it has finished starting is retried on its first
+sentence.
+
 ## BLE
 
 Same service UUID as the ESP32-C3 beacon, so gps-gui-rs discovers it

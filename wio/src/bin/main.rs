@@ -179,7 +179,9 @@ mod app {
 
         // The rail was just powered; the module is at factory 9600, matching
         // gps::BAUD, so push the configured GNSS/power settings now.
-        gps.configure(&cfg.gps);
+        if !gps.configure(&cfg.gps) {
+            rprintln!("gps: settings not acknowledged (module absent or rejected)");
+        }
 
         let node = Node::new(radio, &cfg);
         rprintln!(
@@ -322,8 +324,11 @@ mod app {
                                 node.radio_mut().init(cfg);
                                 node.reconfigure(cfg);
                                 if regps && !gps.sleeping {
-                                    gps.configure(&cfg.gps);
-                                    status_println!(esp, "gps reconfigured");
+                                    if gps.configure(&cfg.gps) {
+                                        status_println!(esp, "gps reconfigured");
+                                    } else {
+                                        status_println!(esp, "gps did not accept settings");
+                                    }
                                 }
                                 *cfg_loaded = true;
                                 // Both stores are best effort, but a config
@@ -433,6 +438,18 @@ mod app {
             if !gps_nmea_seen && gps.present() {
                 gps_nmea_seen = true;
                 status_println!(esp, "gps: NMEA up ({} bytes)", gps.rx_bytes());
+                // The boot-time settings push can reach the module before it
+                // has finished starting, and an unacknowledged push leaves it
+                // running its own defaults. Its first sentence is the earliest
+                // proof it is listening, so that is where the retry belongs.
+                if !gps.configured {
+                    let ok = gps.configure(&cfg.gps);
+                    status_println!(
+                        esp,
+                        "gps: settings {}",
+                        if ok { "applied" } else { "still not accepted" }
+                    );
+                }
             }
             if !gps_checked && due(now, gps_grace_until) {
                 gps_checked = true;
