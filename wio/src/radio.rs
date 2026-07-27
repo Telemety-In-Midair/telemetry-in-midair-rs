@@ -383,6 +383,18 @@ impl Sx1262Driver {
         match self.radio.status() {
             Ok(s) => {
                 debug_println!("Radio status: {:?}", s);
+                // The status byte reports the mode the radio is in, not
+                // whether it got there intact. GetError is the only thing
+                // that names a TCXO that never started, a calibration or PLL
+                // lock that failed, or a PA that would not ramp - a radio
+                // that came up deaf for any of those still reports a
+                // perfectly healthy standby.
+                if let Ok((_, err)) = self.radio.op_error()
+                    && err != 0
+                {
+                    rtt_target::rprintln!("WARNING: radio op error 0x{:04X}", err);
+                    self.radio.clear_error().ok();
+                }
                 true
             }
             Err(_) => {
