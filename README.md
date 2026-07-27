@@ -105,7 +105,8 @@ role = "leaf"              # leaf | repeater (leaf)
 max_hops = 1               # retransmissions allowed, 0-8 (1)
 
 [beacon]
-interval_s = 20            # position broadcast period, 0 = off (20)
+interval_s = 20            # broadcast period, 0 = off (20); also paces the
+                           #   no-fix ping
 fields = "lat,lon"         # what each broadcast carries (lat,lon); also
                            #   altitude|speed|course|sats|time
 
@@ -141,6 +142,30 @@ include, and fields nobody sent read back as zero.
 Air time is the scarce resource on a shared band, and it grows with the
 spreading factor - at SF12 a field costs about 32 times what it does at
 SF7. Add fields when a receiver needs them, not by default.
+
+### No-fix ping
+
+A node with no fix has no position to broadcast, and a silent node looks
+exactly like one out of range or one that is dead. So the beacon slot goes
+out anyway, carrying a 4-byte ping instead: uptime in seconds, whether the
+GPS module is talking at all, and whether a fix was ever held. A receiver
+then knows the node is up, roughly how long it has been searching, and
+whether to look at the sky or at the board - a silent module is usually the
+GPS/LoRa rail being off rather than a receiver that cannot see satellites.
+
+It is the same one transmission per `interval_s`, not an extra one, and a
+ping is smaller than the leanest position (248 ms against 330 ms on air at
+the defaults), so a node that never gets a fix costs the channel less than
+one that does. `interval_s = 0` and `role = "rx_only"` turn it off along
+with the beacon; there is no separate switch.
+
+A node that hears a ping reports it as a status line (`node 3 ping: rssi
+-97, up 214s, gps ok`) rather than a position, so it reaches the ESP
+console and the BLE status characteristic without inventing a position
+nobody measured. Nothing is written to `GPSLOG.CSV`, which holds fixes.
+The RSSI in that line is what makes a ping useful as a range check: a node
+left on a bench with its antenna disconnected from the sky still tells you
+what the link is doing.
 
 ### Leaves and repeaters
 
@@ -198,7 +223,7 @@ images.
 The WIO-E5 sends human-readable status lines to the ESP over the UART link
 (`msg::LOG`) on notable events - boot, GPS presence (first NMEA / silent
 module), GPS fix acquired/lost, soft sleep/wake, config applied, firmware
-receive. The ESP prints each to its USB console (prefixed `wio:`) and
+receive, and a no-fix ping heard from another node. The ESP prints each to its USB console (prefixed `wio:`) and
 notifies it on the status/log characteristic, so gps-gui-rs (or any BLE
 client) sees the same live log. Lines are ASCII, up to `link::LOG_MAX`
 (64) bytes.

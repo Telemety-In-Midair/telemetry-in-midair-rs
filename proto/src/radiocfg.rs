@@ -371,7 +371,11 @@ pub struct RadioConfig {
     /// would eventually collide with its remembered history and be suppressed
     /// as a duplicate. At the 20 s default interval that wrap is ~85 min.
     pub dedup_ttl_s: u16,
-    /// Position transmission interval in seconds (0 disables the beacon).
+    /// Broadcast interval in seconds (0 disables the beacon).
+    ///
+    /// One transmission per interval, carrying a position while the sender
+    /// has a fix and a [`crate::lora::Ping`] while it does not - so this is
+    /// the period a node is heard on, not the period it has a position on.
     pub beacon_interval_s: u16,
     /// Which [`PositionPacket`](gps_proto::packet::PositionPacket) fields the
     /// beacon puts on the air, as a mask of the `FIELD_*` bits in
@@ -1158,6 +1162,12 @@ mod tests {
         // The shipped default (SF9/BW62.5) beacon: ~330 ms, under the 400 ms a
         // 2% duty cycle allows at the 20 s interval.
         assert_eq!(RadioConfig::default().beacon_airtime_us(), 329_728);
+
+        // The no-fix ping that goes out in the same slot: header + 4 bytes,
+        // ~248 ms, so a node reporting a missing fix spends less of the
+        // budget than one reporting a position.
+        let ping = crate::lora::HEADER_LEN + crate::lora::PING_MSG_LEN;
+        assert_eq!(RadioConfig::default().time_on_air_us(ping), 247_808);
 
         // Slowest modulation the parser accepts, largest frame the firmware
         // sends: SF12 / BW62.5 / CR 4/8 with LDRO on, 35 bytes -> ~5 s.

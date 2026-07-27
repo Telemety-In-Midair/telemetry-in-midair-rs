@@ -90,7 +90,7 @@ dedup_ttl_s_description = "How long a broadcast is remembered so a repeat of it 
 # -- Beacon -------------------------------------------------------------
 [beacon]
 interval_s = 20
-interval_s_description = "Position broadcast period in seconds, 0-3600. 0 disables the beacon, as does a role of rx_only."
+interval_s_description = "Broadcast period in seconds, 0-3600. Each slot carries a position, or a small ping when there is no fix, so a node that cannot see the sky is still heard. 0 disables both, as does a role of rx_only."
 
 fields = "lat,lon"
 fields_description = "Which GPS fields each broadcast carries: lat, lon, altitude, speed, course, sats, time. lat and lon are required. More fields result in more air time."

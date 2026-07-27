@@ -239,6 +239,9 @@ mod app {
         let mut rx_count: u32 = 0;
         // Track the GPS fix state so only its transitions are announced.
         let mut had_fix = false;
+        // Whether a fix has ever held since boot, which is what separates a
+        // fix lost from one never acquired in the no-fix ping below.
+        let mut ever_had_fix = false;
 
         // Position report to the ESP at most once a second (the GPS fix
         // rate); the LoRa beacon runs on its own configured interval.
@@ -417,6 +420,7 @@ mod app {
             if fix != had_fix {
                 had_fix = fix;
                 if fix {
+                    ever_had_fix = true;
                     status_println!(esp, "gps fix acquired ({} sats)", gps.packet().sats);
                 } else {
                     status_println!(esp, "gps fix lost");
@@ -461,19 +465,40 @@ mod app {
                 }
             }
 
-            // ---- LoRa position beacon --------------------------------------
+            // ---- LoRa beacon: a position, or a ping without a fix ----------
             // Gated on the role here rather than inside the transmit, so a
             // receive-only node never claims the air with RADIO_BUSY for a
             // broadcast it was never going to send.
+            //
+            // One transmission per interval either way. A fix goes out as a
+            // position; without one the slot carries a ping, so a node
+            // searching for the sky is a node a receiver can hear rather
+            // than one indistinguishable from out of range or dead. A ping
+            // is the smaller of the two on air, so this cannot push a node
+            // past the duty cycle its beacon already fits in.
             if cfg.role.transmits() && cfg.beacon_interval_s != 0 && due(now, next_beacon) {
-                if gps.has_fix() && !esp.peer_busy(now) {
-                    let (data, n) = lora::encode_position(&gps.packet(), cfg.beacon_fields);
-                    let data = &data[..n];
+                if esp.peer_busy(now) {
+                    // ESP radio has the air: check again shortly.
+                    next_beacon = now.wrapping_add(500);
+                } else {
                     // Warn the ESP off the air for as long as the blocking
                     // transmit can hold the radio.
                     esp.send(msg::RADIO_BUSY, &[1]);
                     busy_clear_at = Some(now.wrapping_add(cfg.tx_poll_timeout_ms()));
-                    match node.broadcast(data) {
+                    let sent = if gps.has_fix() {
+                        let (pos, n) = lora::encode_position(&gps.packet(), cfg.beacon_fields);
+                        node.broadcast(&pos[..n])
+                    } else {
+                        node.broadcast(
+                            &lora::Ping {
+                                uptime_s: (now / 1_000).min(u16::MAX as u32) as u16,
+                                gps_present: gps.present(),
+                                had_fix: ever_had_fix,
+                            }
+                            .encode(),
+                        )
+                    };
+                    match sent {
                         Ok(()) => tx_count += 1,
                         Err(e) => debug_println!("Beacon TX failed: {:?}", e),
                     }
@@ -481,9 +506,6 @@ mod app {
                     next_beacon = now
                         .wrapping_add(cfg.beacon_interval_s as u32 * 1_000)
                         .wrapping_add(jitter);
-                } else {
-                    // No fix or ESP busy: check again shortly.
-                    next_beacon = now.wrapping_add(500);
                 }
             }
             if let Some(t) = busy_clear_at
@@ -503,6 +525,20 @@ mod app {
                     buf[3..].copy_from_slice(&p.encode());
                     esp.send(msg::POSITION, &buf);
                     sdlog.log_position(now, rx.src, rx.rssi, &p);
+                } else if let Some(ping) = lora::Ping::decode(rx.payload) {
+                    // A node on the air with no fix to report. There is no
+                    // position to log or notify, so the status line is the
+                    // whole record of it - and it carries the RSSI, which is
+                    // what makes a ping usable as a range check.
+                    status_println!(
+                        esp,
+                        "node {} ping: rssi {}, up {}s, gps {}{}",
+                        rx.src,
+                        rx.rssi,
+                        ping.uptime_s,
+                        if ping.gps_present { "ok" } else { "silent" },
+                        if ping.had_fix { ", fix lost" } else { "" }
+                    );
                 } else {
                     // Forward other payloads verbatim.
                     let mut buf = [0u8; 3 + lora::PAYLOAD_MAX];

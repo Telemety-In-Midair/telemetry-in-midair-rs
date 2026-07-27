@@ -237,6 +237,80 @@ pub fn decode_position(data: &[u8]) -> Option<PositionPacket> {
     Some(p)
 }
 
+/// Ping transmission: `[PING tag] [flags] [uptime_s u16le]`.
+///
+/// What a node puts on the air in place of a position while it has no fix.
+/// A silent node is indistinguishable from one out of range or one that is
+/// dead, so a node with nothing to report says so instead: a receiver then
+/// knows the node is alive, and the two flags say why it has no position
+/// yet - a receiver still searching, one that never came up at all, or a
+/// fix that was held and lost.
+///
+/// Four bytes, so a ping costs less air time than the leanest position, and
+/// a node that never sees the sky is cheaper on the channel than a fixed
+/// one rather than more expensive.
+pub const MSG_PING: u8 = 0x52;
+
+/// Encoded length of a ping message. Fixed - every field is always present.
+pub const PING_MSG_LEN: usize = 4;
+
+/// Set in [`Ping::flags`] when the GPS module is producing NMEA.
+pub const PING_FLAG_GPS_PRESENT: u8 = 1 << 0;
+/// Set when the sender has held a fix at some point since it booted.
+pub const PING_FLAG_HAD_FIX: u8 = 1 << 1;
+
+/// A node reporting that it is on the air without a position to send.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Ping {
+    /// Seconds since the sender booted, saturating at [`u16::MAX`] (18 h).
+    /// Read against a previous ping it also shows a node that rebooted.
+    pub uptime_s: u16,
+    /// The GPS module is talking (at least one NMEA sentence parsed). Clear
+    /// means a silent module - usually an unpowered rail or wiring, not a
+    /// receiver that cannot find the sky.
+    pub gps_present: bool,
+    /// The sender has had a fix since boot, so this ping is a fix lost
+    /// rather than one never acquired.
+    pub had_fix: bool,
+}
+
+impl Ping {
+    /// Flag byte as it travels on the air.
+    pub fn flags(&self) -> u8 {
+        let mut f = 0;
+        if self.gps_present {
+            f |= PING_FLAG_GPS_PRESENT;
+        }
+        if self.had_fix {
+            f |= PING_FLAG_HAD_FIX;
+        }
+        f
+    }
+
+    /// Encode the ping as a frame payload.
+    pub fn encode(&self) -> [u8; PING_MSG_LEN] {
+        let mut b = [0u8; PING_MSG_LEN];
+        b[0] = MSG_PING;
+        b[1] = self.flags();
+        b[2..4].copy_from_slice(&self.uptime_s.to_le_bytes());
+        b
+    }
+
+    /// Decode a ping, or `None` if the payload is something else or short.
+    /// Unknown flag bits are ignored, so a future sender that sets one is
+    /// still understood here.
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.first() != Some(&MSG_PING) || data.len() < PING_MSG_LEN {
+            return None;
+        }
+        Some(Self {
+            uptime_s: u16::from_le_bytes([data[2], data[3]]),
+            gps_present: data[1] & PING_FLAG_GPS_PRESENT != 0,
+            had_fix: data[1] & PING_FLAG_HAD_FIX != 0,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -318,6 +392,47 @@ mod tests {
         old[0] = 0x50;
         old[1..].copy_from_slice(&sample().encode());
         assert_eq!(decode_position(&old), None);
+    }
+
+    #[test]
+    fn ping_roundtrip() {
+        let p = Ping { uptime_s: 4321, gps_present: true, had_fix: false };
+        let enc = p.encode();
+        assert_eq!(enc.len(), PING_MSG_LEN);
+        assert_eq!(Ping::decode(&enc), Some(p));
+
+        // Each flag travels on its own bit.
+        let none = Ping { uptime_s: 0, gps_present: false, had_fix: false };
+        assert_eq!(none.flags(), 0);
+        assert_eq!(Ping::decode(&none.encode()), Some(none));
+        let both = Ping { uptime_s: u16::MAX, gps_present: true, had_fix: true };
+        assert_eq!(Ping::decode(&both.encode()), Some(both));
+
+        // Set bits this build does not know are ignored, not a rejection.
+        let mut future = both.encode();
+        future[1] |= 0x80;
+        assert_eq!(Ping::decode(&future), Some(both));
+    }
+
+    /// The two payload kinds must never decode as each other: a receiver
+    /// tries both, and a position read as a ping would report an alive node
+    /// with no position when it had one.
+    #[test]
+    fn ping_and_position_do_not_alias() {
+        let (pos, n) = encode_position(&sample(), FIELDS_DEFAULT);
+        assert_eq!(Ping::decode(&pos[..n]), None);
+        assert_eq!(decode_position(&Ping::default().encode()), None);
+        // Runts and other payloads are refused rather than read short.
+        assert_eq!(Ping::decode(&Ping::default().encode()[..3]), None);
+        assert_eq!(Ping::decode(b""), None);
+        assert_eq!(Ping::decode(b"hello"), None);
+    }
+
+    /// A ping is cheaper on the air than the leanest position, which is what
+    /// makes reporting a missing fix free of a duty-cycle argument.
+    #[test]
+    fn ping_is_smaller_than_a_position() {
+        assert!(PING_MSG_LEN < position_msg_len(FIELDS_REQUIRED));
     }
 
     #[test]
