@@ -38,11 +38,11 @@
 frequency_hz = 915000000
 frequency_hz_description = "RF center frequency in Hz. Valid 150000000-960000000."
 
-spreading_factor = 9
+spreading_factor = 12
 spreading_factor_description = "LoRa spreading factor, 5-12. Higher gives longer range at a lower data rate."
 
-bandwidth_khz = 62
-bandwidth_khz_description = "LoRa bandwidth in kHz: 62, 125, 250 or 500 (62 means 62.5). Narrower gives longer range at a lower data rate."
+bandwidth_khz = 500
+bandwidth_khz_description = "LoRa bandwidth in kHz: 62, 125, 250 or 500 (62 means 62.5). Narrower gives longer range at a lower data rate, but only 500 is wide enough to count as a digital modulation in the 902-928 MHz band - narrower settings there have to hop across 50 channels instead of sitting on one."
 
 coding_rate = 5
 coding_rate_description = "Coding rate denominator 5-8 for 4/5..4/8. Higher adds forward error correction at a lower data rate."

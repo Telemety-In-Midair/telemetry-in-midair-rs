@@ -90,8 +90,8 @@ SD copy. All keys are optional; defaults in parentheses:
 ```toml
 [radio]
 frequency_hz = 915000000   # (915 MHz)
-spreading_factor = 9       # 5-12 (9)
-bandwidth_khz = 62         # 62|125|250|500 (62)
+spreading_factor = 12      # 5-12 (12)
+bandwidth_khz = 500        # 62|125|250|500 (500)
 coding_rate = 5            # 4/5..4/8 (5)
 power_dbm = 22             # -9..22 (22)
 rx_boost = true            # boosted RX gain (true)
@@ -130,6 +130,32 @@ dynamic_model = "portable" # portable|stationary|pedestrian|automotive|
                            #   sea|airborne1g|airborne2g|airborne4g (portable)
 ```
 
+### Modulation
+
+The default is SF12 at 500 kHz, which is a deliberately wide signal rather
+than the narrow one a range-first reading would pick.
+
+In the 902-928 MHz band a 500 kHz signal counts as a digital modulation and
+is allowed to sit on a single channel indefinitely, with no dwell or duty
+cycle ceiling. Anything narrower has to qualify as frequency hopping
+instead: at least 50 channels, no more than 0.4 s on any one of them per
+20 s, and receivers hopping in step with the sender. That last part is what
+rules it out here. Hopping needs a clock the whole network agrees on, the
+only one available is GPS time, and a node that has never had a fix does not
+have it - which is exactly the node the no-fix ping exists to keep audible.
+
+SF12 buys most of the width back. The narrow alternative it replaced,
+SF9 at 62.5 kHz, is 1.5 dB more sensitive (-132.5 against -131 dBm), worth
+roughly a tenth of the range on real terrain. It is also *longer* on air:
+2^12/500 kHz and 2^9/62.5 kHz are the same 8.192 ms symbol, and SF12 needs
+fewer symbols per byte, so the default beacon is 289 ms where the narrow one
+was 330 ms.
+
+Both are still config keys. If you are somewhere the band rules differ - EU
+868, say, where there is no minimum bandwidth and the constraint is a duty
+cycle instead - `spreading_factor = 9` and `bandwidth_khz = 62` on the card
+gets the narrow modulation back, along with `power_dbm = 14`.
+
 ### Beacon payload
 
 `fields` decides what goes on the air. The default is position only: 13
@@ -158,7 +184,7 @@ whether to look at the sky or at the board - a silent module is usually the
 GPS/LoRa rail being off rather than a receiver that cannot see satellites.
 
 It is the same one transmission per `interval_s`, not an extra one, and a
-ping is smaller than the leanest position (248 ms against 330 ms on air at
+ping is smaller than the leanest position (248 ms against 289 ms on air at
 the defaults), so a node that never gets a fix costs the channel less than
 one that does. `interval_s = 0` and `role = "rx_only"` turn it off along
 with the beacon; there is no separate switch.
@@ -194,10 +220,11 @@ channel. `max_hops = 1` is the setting that pays; past 2 the traffic grows
 faster than the coverage.
 
 A frame is 3 header bytes plus the payload at its true length, with no
-padding - a 20-byte position costs 24 bytes on air. Air time is the budget
-that buys spreading factor, and spreading factor is the largest range knob
-here (SF7 to SF12 is roughly 12 dB), so the framing is kept small to leave
-room for a slow preset.
+padding - a 20-byte position costs 24 bytes on air. Spreading factor is the
+largest range knob here (SF7 to SF12 is roughly 12 dB) and every byte of
+framing is paid for at whichever one is in use, so the framing is kept
+small: at the SF12 default a header byte costs 32 times what it would at
+SF7.
 
 Nodes transmit on the private LoRa sync word (0x1424), not the public
 LoRaWAN one, so a receiver does not lock onto LoRaWAN preambles it can never

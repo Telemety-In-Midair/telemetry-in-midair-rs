@@ -422,12 +422,23 @@ impl Default for RadioConfig {
     fn default() -> Self {
         Self {
             frequency_hz: 915_000_000,
-            // SF9 at BW62.5 kHz, CR 4/5: the longest-range modulation whose
-            // beacon still fits a 2% channel duty cycle at the 20 s interval
-            // below (about 330 ms on air, under the 400 ms that 2% of 20 s -
-            // and the 902-928 MHz dwell ceiling - allows).
-            spreading_factor: 9,
-            bandwidth_khz: 62,
+            // SF12 at BW500 kHz, CR 4/5.
+            //
+            // The bandwidth is the deliberate part. A 500 kHz signal is wide
+            // enough to count as a digital modulation in the 902-928 MHz
+            // band, which is the difference between being allowed to sit on
+            // one channel and having to hop across fifty. Hopping needs a
+            // clock every node agrees on, and the only one here is GPS time -
+            // which a node that has never had a fix does not have, and that
+            // is precisely the node the no-fix ping exists to keep audible.
+            //
+            // SF12 buys most of that width back. Against the SF9/BW62.5 this
+            // replaces it costs 1.5 dB of sensitivity (-131 against -132.5
+            // dBm), and the beacon is shorter on air rather than longer -
+            // 289 ms against 330 ms - because the symbol time works out
+            // identical at 8.192 ms.
+            spreading_factor: 12,
+            bandwidth_khz: 500,
             coding_rate: 5,
             power_dbm: 22,
             // On, unlike the chip's power-up state: a couple of dB of
@@ -443,9 +454,10 @@ impl Default for RadioConfig {
             // fleet works without reconfiguring the nodes already deployed.
             max_hops: 1,
             dedup_ttl_s: 3,
-            // 20 s: long enough that one beacon lands in a 20 s window, so the
-            // dwell budget is the full 400 ms rather than 2% of a shorter
-            // period - which is what lets the default modulation reach for SF9.
+            // 20 s. The wideband default carries no dwell or duty-cycle
+            // ceiling, so this is no longer a budget the modulation has to
+            // fit inside - it is a plain trade of battery life and shared air
+            // time against how stale a position is allowed to get.
             beacon_interval_s: 20,
             // Position only. Everything else a fix produces is written to
             // the SD log, where a byte costs nothing, rather than spent on
@@ -1108,9 +1120,15 @@ mod tests {
         assert_eq!(parse("dedup_ttl_s = often"), Err(ConfigError::BadValue(1)));
     }
 
+    /// Built from explicit modulation rather than from the default, which is
+    /// itself the slowest spreading factor and so has nothing to grow into.
     #[test]
     fn repeat_jitter_tracks_air_time() {
-        let mut cfg = RadioConfig::default();
+        let mut cfg = RadioConfig {
+            spreading_factor: 7,
+            bandwidth_khz: 125,
+            ..RadioConfig::default()
+        };
         let fast = cfg.repeat_jitter_ms();
         cfg.spreading_factor = 12;
         assert!(cfg.repeat_jitter_ms() > fast);
@@ -1160,13 +1178,15 @@ mod tests {
         assert_eq!(cfg.time_on_air_us(13), 46_336);
         assert_eq!(cfg.beacon_airtime_us(), 46_336);
 
-        // The shipped default (SF9/BW62.5) beacon: ~330 ms, under the 400 ms a
-        // 2% duty cycle allows at the 20 s interval.
-        assert_eq!(RadioConfig::default().beacon_airtime_us(), 329_728);
+        // The shipped default (SF12/BW500) beacon: ~289 ms. Shorter than the
+        // ~330 ms of the SF9/BW62.5 it replaced, despite the far higher
+        // spreading factor, because 2^12/500 kHz and 2^9/62.5 kHz are the
+        // same 8.192 ms symbol and SF12 needs fewer of them per byte.
+        assert_eq!(RadioConfig::default().beacon_airtime_us(), 288_768);
 
         // The no-fix ping that goes out in the same slot: header + 4 bytes,
-        // ~248 ms, so a node reporting a missing fix spends less of the
-        // budget than one reporting a position.
+        // ~248 ms, so a node reporting a missing fix spends less air time
+        // than one reporting a position.
         let ping = crate::lora::HEADER_LEN + crate::lora::PING_MSG_LEN;
         assert_eq!(RadioConfig::default().time_on_air_us(ping), 247_808);
 
@@ -1187,14 +1207,22 @@ mod tests {
     /// with the spreading factor - the two levers a range-vs-limit trade pulls.
     #[test]
     fn beacon_airtime_grows_with_fields_and_sf() {
+        // Fields are measured against the shipped default, since that is the
+        // payload choice the default actually makes.
         let base = RadioConfig::default();
         let mut richer = base;
         richer.beacon_fields = lora::FIELDS_ALL;
         assert!(richer.beacon_airtime_us() > base.beacon_airtime_us());
 
-        let mut slower = base;
+        // The spreading factor needs a base with room above it: the default
+        // is SF12, the slowest the parser accepts.
+        let fast = RadioConfig {
+            spreading_factor: 9,
+            ..base
+        };
+        let mut slower = fast;
         slower.spreading_factor = 10;
-        assert!(slower.beacon_airtime_us() > base.beacon_airtime_us());
+        assert!(slower.beacon_airtime_us() > fast.beacon_airtime_us());
     }
 
     #[test]
