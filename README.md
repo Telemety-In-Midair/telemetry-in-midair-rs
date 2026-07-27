@@ -94,15 +94,16 @@ spreading_factor = 9       # 5-12 (9)
 bandwidth_khz = 62         # 62|125|250|500 (62)
 coding_rate = 5            # 4/5..4/8 (5)
 power_dbm = 22             # -9..22 (22)
-rx_boost = false           # boosted RX gain (false)
+rx_boost = true            # boosted RX gain (true)
 dcdc_enabled = true        # internal DC-DC instead of LDO (true)
 tcxo_volts = "1.8"         # TCXO supply; board hardware, not a tuning knob
 tcxo_startup_ms = 10       # TCXO settling wait, 1-1000 (10)
 
 [network]
 address = 1                # 1-255 (1)
-role = "leaf"              # leaf | repeater (leaf)
+role = "leaf"              # leaf | repeater | tx_only | rx_only (leaf)
 max_hops = 1               # retransmissions allowed, 0-8 (1)
+dedup_ttl_s = 3            # how long a (sender, id) pair is remembered (3)
 
 [beacon]
 interval_s = 20            # broadcast period, 0 = off (20); also paces the
@@ -112,6 +113,9 @@ fields = "lat,lon"         # what each broadcast carries (lat,lon); also
 
 [sd]
 sd_enabled = true          # use the SD card at all (true)
+
+[debug]
+verbose = true             # per-frame detail on the ESP console (true)
 
 [gps]                       # MAX-M10 receiver (UBX-CFG-VALSET, RAM layer)
 gps_enabled = true         # (true)

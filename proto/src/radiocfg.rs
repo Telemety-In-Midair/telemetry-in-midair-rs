@@ -430,9 +430,10 @@ impl Default for RadioConfig {
             bandwidth_khz: 62,
             coding_rate: 5,
             power_dbm: 22,
-            // Off, matching the chip's power-up state: enabling it costs
-            // receive current continuously on whichever node is listening,
-            // which is a trade to opt into rather than inherit.
+            // On, unlike the chip's power-up state: a couple of dB of
+            // sensitivity is worth a few mA on a board whose receiver is
+            // already listening continuously, and range is set by the worse
+            // of the two directions.
             rx_boost: true,
             address: 1,
             // Leaf by default: repeating is a job you give one well-placed
