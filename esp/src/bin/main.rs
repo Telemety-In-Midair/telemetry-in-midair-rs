@@ -643,8 +643,8 @@ const HEARTBEAT_TIMEOUT_MS: u64 = 500;
 
 /// Latest WIO status/log lines awaiting delivery to the connected central.
 /// The BLE characteristic value must match [`link::LOG_MAX`].
-const _: () = assert!(link::LOG_MAX == 64);
-static LOG_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 64>, 8> = Channel::new();
+const _: () = assert!(link::LOG_MAX == 128);
+static LOG_CHANNEL: Channel<CriticalSectionRawMutex, heapless::Vec<u8, 128>, 8> = Channel::new();
 
 fn queue_frame(cmd: u8, payload: &[u8]) {
     let mut v = heapless::Vec::new();
@@ -1019,7 +1019,7 @@ struct GpsService {
     node_ping: [u8; ble::NODE_PING_LEN],
     /// Latest WIO status/log line (ASCII text).
     #[characteristic(uuid = ble::LOG_UUID_U128, read, notify)]
-    log: heapless::Vec<u8, 64>,
+    log: heapless::Vec<u8, 128>,
     /// Current power/sleep settings, so an app can populate its controls
     /// on connect instead of assuming defaults.
     #[characteristic(uuid = ble::SETTINGS_UUID_U128, read, notify)]

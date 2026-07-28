@@ -157,7 +157,12 @@ pub const DATA_CHUNK: usize = 192;
 
 /// Maximum bytes in a [`msg::LOG`] status line (and the matching BLE
 /// characteristic value). Longer lines are truncated at the source.
-pub const LOG_MAX: usize = 64;
+///
+/// The longest line the WIO builds is the verbose radio breakdown, which
+/// runs to about 115 bytes once the drop counters reach six digits; 64 cut
+/// it mid-word. A central that never negotiates its ATT MTU up still only
+/// sees the first MTU - 3 bytes of whatever arrives.
+pub const LOG_MAX: usize = 128;
 
 /// Payload length of [`msg::PING`]: src + rssi + the two on-air ping fields.
 ///
