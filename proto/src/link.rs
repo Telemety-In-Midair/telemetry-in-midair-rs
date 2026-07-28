@@ -84,6 +84,17 @@ pub mod msg {
     /// is at most [`super::LOG_MAX`] bytes.
     pub const LOG: u8 = 0x44;
 
+    /// `[src u8, rssi i16le, flags u8, uptime_s u16le]` - a remote node
+    /// reporting that it is on the air without a position
+    /// ([`crate::lora::Ping`]), [`super::PING_LEN`] bytes.
+    ///
+    /// Sent alongside the [`LOG`] line that describes it, because the two
+    /// answer different questions: the log line is for a human reading the
+    /// console, this is for an app that has to show which nodes are alive
+    /// and why the ones without a position have none. Without it a node
+    /// that never gets a fix is visible only as prose.
+    pub const PING: u8 = 0x46;
+
     /// [`crate::radiocfg::RadioConfig::encode`] blob - the WIO's current radio
     /// configuration. The ESP caches it and serves it on the BLE radio-config
     /// characteristic ([`crate::ble::RADIO_CONFIG_UUID`]) without parsing it.
@@ -147,6 +158,13 @@ pub const DATA_CHUNK: usize = 192;
 /// Maximum bytes in a [`msg::LOG`] status line (and the matching BLE
 /// characteristic value). Longer lines are truncated at the source.
 pub const LOG_MAX: usize = 64;
+
+/// Payload length of [`msg::PING`]: src + rssi + the two on-air ping fields.
+///
+/// Not [`crate::lora::PING_MSG_LEN`], which is the length of the ping as it
+/// travels over LoRa - this one has the receiver's src/rssi in front of it
+/// and no message tag.
+pub const PING_LEN: usize = 1 + 2 + 1 + 2;
 
 // -- Telemetry (WIO -> ESP -> BLE) ------------------------------------------
 

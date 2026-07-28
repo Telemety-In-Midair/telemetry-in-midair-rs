@@ -192,10 +192,13 @@ with the beacon; there is no separate switch.
 A node that hears a ping reports it as a status line (`node 3 ping: rssi
 -97, up 214s, gps ok`) rather than a position, so it reaches the ESP
 console and the BLE status characteristic without inventing a position
-nobody measured. Nothing is written to `GPSLOG.CSV`, which holds fixes.
-The RSSI in that line is what makes a ping useful as a range check: a node
-left on a bench with its antenna disconnected from the sky still tells you
-what the link is doing.
+nobody measured. The same ping also goes over the link as data
+(`msg::PING`) and out on the node-ping characteristic, so an app can show
+the node as alive-without-a-fix instead of having to parse the line.
+Nothing is written to `GPSLOG.CSV`, which holds fixes. The RSSI in either
+form is what makes a ping useful as a range check: a node left on a bench
+with its antenna disconnected from the sky still tells you what the link is
+doing.
 
 ### Leaves and repeaters
 
@@ -258,10 +261,40 @@ sentence.
 Same service UUID as the ESP32-C3 beacon, so gps-gui-rs discovers it
 unchanged (device name `GPS-C6`). On top of the gps-proto position /
 config / ack characteristics the C6 adds telemetry (LoRa RSSI/SNR,
-counters, SD + fix flags), the last remote node position, a status/log
+counters, SD + fix flags), remote node positions and pings, a status/log
 characteristic (notify + read), the WIO's current radio config (read +
 notify), and a bulk write characteristic for TOML config and WIO firmware
 images.
+
+### Remote nodes
+
+What other nodes report arrives on two characteristics: positions on
+`c3a10007-...` (`[src, rssi i16le, 20-byte packet, age_s u16le]`) and pings
+from nodes without a fix on `c3a1000b-...` (`[src, rssi i16le, flags,
+uptime_s u16le, age_s u16le]`).
+
+Both are notified when a report arrives rather than on the position notify
+tick, and the C6 keeps the newest report from each of up to 8 nodes rather
+than one report in total. That combination is what makes the stream
+lossless: sampling one cached value on a timer delivered only whichever
+node reported last before the tick, and silently dropped the rest. A node
+holds one slot, so its newer report replaces its older one - including
+replacing a position with a ping when it loses its fix, and the other way
+round - and no node can crowd the others out by beaconing fast.
+
+`age_s` is how long ago the board heard the report, on its own clock. A
+live report reads 0; anything higher means the value was replayed rather
+than just heard. On connect the board hands over every node it has heard
+from in the last 30 minutes, so an app opens on the whole roster instead of
+waiting for each node's next beacon; nodes quiet for longer than that are
+forgotten rather than replayed as if they were still there. The age is
+measured on arrival because the sender chooses which fields to spend air
+time on and `time` is not one of the defaults - there is nothing in a lean
+beacon to age it by.
+
+The age field is appended to the position layout, not inserted, so an app
+built before it reads the same fields at the same offsets and ignores the
+tail.
 
 ## Status updates
 

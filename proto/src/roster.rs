@@ -1,0 +1,424 @@
+//! The latest report heard from each remote node, and the BLE values it
+//! hands out.
+//!
+//! One slot per node, newest report wins. That is the whole idea: a node
+//! says one thing at a time - a position while it has a fix, a
+//! [`crate::lora::Ping`] while it does not - and what it said before is
+//! superseded, not queued. A single cached report instead loses a node
+//! whenever two report between one notification and the next, and a plain
+//! queue lets one fast-beaconing node push every other node out of it.
+//!
+//! Reports are handed out once each ([`Roster::take_dirty`]), so a value on
+//! the air means something was actually heard rather than that a timer
+//! fired. Ages are stamped in on the way out, from when the report arrived
+//! rather than from anything inside it - the sender chooses which fields to
+//! spend air time on and `tod_ms` is not among the defaults, so there is
+//! nothing in a beacon to age it by.
+//!
+//! This lives in the shared crate rather than the ESP firmware because it
+//! emits the exact BLE byte layouts (see [`crate::ble`]) and can be tested
+//! on the host, which a `no_std` binary cannot be.
+
+use crate::ble;
+use crate::link;
+
+/// Nodes tracked at once. A shared LoRa channel saturates well before this
+/// many nodes are beaconing on it, so the table is not the limit.
+pub const SLOTS: usize = 8;
+
+/// A node not heard from in this long is forgotten rather than handed to the
+/// next central that connects. Long against the 20 s default beacon, so
+/// falling out takes a node genuinely off the air rather than a missed
+/// transmission or two.
+pub const TTL_MS: u64 = 30 * 60 * 1000;
+
+/// What a node last told us, in the bytes the link delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Report {
+    /// [`link::msg::POSITION`] payload: `[src, rssi, packet]`.
+    Position([u8; ble::REMOTE_LEN]),
+    /// [`link::msg::PING`] payload: `[src, rssi, flags, uptime]`.
+    Ping([u8; link::PING_LEN]),
+}
+
+impl Report {
+    /// Originating node address, which is byte 0 of either payload.
+    pub fn src(&self) -> u8 {
+        match self {
+            Report::Position(b) => b[0],
+            Report::Ping(b) => b[0],
+        }
+    }
+}
+
+/// One report as a BLE characteristic value, age stamped in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Value {
+    /// For [`ble::REMOTE_UUID`].
+    Position([u8; ble::REMOTE_LEN_V2]),
+    /// For [`ble::NODE_PING_UUID`].
+    Ping([u8; ble::NODE_PING_LEN]),
+}
+
+impl Value {
+    /// The bytes to notify.
+    pub fn bytes(&self) -> &[u8] {
+        match self {
+            Value::Position(b) => b,
+            Value::Ping(b) => b,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Slot {
+    report: Report,
+    /// When the report arrived, on the caller's monotonic millisecond clock.
+    at_ms: u64,
+    /// Set on arrival, cleared once handed out, so one report produces one
+    /// notification rather than a value resent on every tick.
+    dirty: bool,
+}
+
+/// Per-node table of the latest report from each remote node.
+#[derive(Default)]
+pub struct Roster {
+    slots: [Option<Slot>; SLOTS],
+}
+
+impl Roster {
+    pub const fn new() -> Self {
+        Self { slots: [None; SLOTS] }
+    }
+
+    /// Record a node's newest report, replacing whatever that node last said.
+    ///
+    /// A full table gives up the node that has gone quietest. Entries past
+    /// [`TTL_MS`] are dropped first, so it is a node long off the air that
+    /// makes way rather than a live one that happens to beacon slowly.
+    pub fn record(&mut self, now_ms: u64, report: Report) {
+        let src = report.src();
+        self.expire(now_ms);
+        let idx = self
+            .slots
+            .iter()
+            .position(|s| matches!(s, Some(s) if s.report.src() == src))
+            .or_else(|| self.slots.iter().position(Option::is_none))
+            .unwrap_or_else(|| self.oldest());
+        self.slots[idx] = Some(Slot { report, at_ms: now_ms, dirty: true });
+    }
+
+    /// Take the oldest report still waiting to go out, as the value to
+    /// notify. `None` once every node's current report has been handed out.
+    ///
+    /// Oldest first, so a central connecting to a board that has heard
+    /// several nodes receives them in the order they were heard.
+    pub fn take_dirty(&mut self, now_ms: u64) -> Option<Value> {
+        let mut pick: Option<(usize, u64)> = None;
+        for (i, slot) in self.slots.iter().enumerate() {
+            let Some(s) = *slot else { continue };
+            let older = match pick {
+                Some((_, at)) => s.at_ms < at,
+                None => true,
+            };
+            if s.dirty && older {
+                pick = Some((i, s.at_ms));
+            }
+        }
+        let (idx, at_ms) = pick?;
+        let slot = self.slots[idx].as_mut()?;
+        slot.dirty = false;
+        let age = (now_ms.saturating_sub(at_ms) / 1000).min(ble::AGE_MAX_S as u64) as u16;
+        Some(match slot.report {
+            Report::Position(b) => {
+                let mut v = [0u8; ble::REMOTE_LEN_V2];
+                v[..ble::REMOTE_LEN].copy_from_slice(&b);
+                v[ble::REMOTE_AGE_OFF..].copy_from_slice(&age.to_le_bytes());
+                Value::Position(v)
+            }
+            Report::Ping(b) => {
+                let mut v = [0u8; ble::NODE_PING_LEN];
+                v[..link::PING_LEN].copy_from_slice(&b);
+                v[ble::NODE_PING_AGE_OFF..].copy_from_slice(&age.to_le_bytes());
+                Value::Ping(v)
+            }
+        })
+    }
+
+    /// Re-arm every node still inside the TTL, so a central that has just
+    /// connected receives the whole roster rather than only the next node to
+    /// report.
+    ///
+    /// Nodes past the TTL are dropped instead of replayed: a position from a
+    /// node half an hour off the air would put a marker on a map with
+    /// nothing behind it. The ages that go out with the replay are what
+    /// separate the rest from live reports.
+    pub fn replay(&mut self, now_ms: u64) {
+        self.expire(now_ms);
+        for slot in self.slots.iter_mut().flatten() {
+            slot.dirty = true;
+        }
+    }
+
+    /// Nodes currently remembered.
+    pub fn len(&self) -> usize {
+        self.slots.iter().flatten().count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Forget nodes not heard from within [`TTL_MS`].
+    fn expire(&mut self, now_ms: u64) {
+        for slot in self.slots.iter_mut() {
+            let stale = match *slot {
+                Some(s) => now_ms.saturating_sub(s.at_ms) >= TTL_MS,
+                None => false,
+            };
+            if stale {
+                *slot = None;
+            }
+        }
+    }
+
+    /// Index of the slot holding the oldest report; empty slots count as
+    /// infinitely old, so this only matters on a full table.
+    fn oldest(&self) -> usize {
+        let mut oldest = 0;
+        for i in 1..SLOTS {
+            let older = match (self.slots[i], self.slots[oldest]) {
+                (Some(a), Some(b)) => a.at_ms < b.at_ms,
+                (None, _) => true,
+                _ => false,
+            };
+            if older {
+                oldest = i;
+            }
+        }
+        oldest
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn position(src: u8, rssi: i16) -> Report {
+        let mut b = [0u8; ble::REMOTE_LEN];
+        b[0] = src;
+        b[1..3].copy_from_slice(&rssi.to_le_bytes());
+        // A recognizable packet body: lat_e7 = src, so a value can be traced
+        // back to the node it came from.
+        b[3..7].copy_from_slice(&(src as i32).to_le_bytes());
+        Report::Position(b)
+    }
+
+    fn ping(src: u8, uptime_s: u16) -> Report {
+        let mut b = [0u8; link::PING_LEN];
+        b[0] = src;
+        b[4..6].copy_from_slice(&uptime_s.to_le_bytes());
+        Report::Ping(b)
+    }
+
+    fn drain(r: &mut Roster, now_ms: u64) -> Vec<Value> {
+        let mut out = Vec::new();
+        while let Some(v) = r.take_dirty(now_ms) {
+            out.push(v);
+        }
+        out
+    }
+
+    /// Age of a value, whichever kind it is.
+    fn age(v: &Value) -> u16 {
+        let b = v.bytes();
+        let off = match v {
+            Value::Position(_) => ble::REMOTE_AGE_OFF,
+            Value::Ping(_) => ble::NODE_PING_AGE_OFF,
+        };
+        u16::from_le_bytes([b[off], b[off + 1]])
+    }
+
+    /// The bug this table exists for: two nodes reporting between one
+    /// notification and the next must both be delivered, not just the
+    /// second.
+    #[test]
+    fn two_nodes_in_one_window_both_survive() {
+        let mut r = Roster::new();
+        r.record(1_000, position(3, -80));
+        r.record(1_100, position(7, -95));
+        let got = drain(&mut r, 1_200);
+        assert_eq!(got.len(), 2);
+        // Oldest first: node 3 was heard before node 7.
+        assert_eq!(got[0].bytes()[0], 3);
+        assert_eq!(got[1].bytes()[0], 7);
+        assert_eq!(r.len(), 2);
+    }
+
+    /// A node's newer report supersedes its older one instead of queueing
+    /// behind it, so a fast beacon costs one slot and one notification.
+    #[test]
+    fn newest_report_per_node_wins() {
+        let mut r = Roster::new();
+        r.record(1_000, position(3, -80));
+        r.record(2_000, position(3, -60));
+        assert_eq!(r.len(), 1);
+        let got = drain(&mut r, 2_000);
+        assert_eq!(got.len(), 1);
+        assert_eq!(i16::from_le_bytes([got[0].bytes()[1], got[0].bytes()[2]]), -60);
+    }
+
+    /// A node that loses its fix stops presenting the position it can no
+    /// longer stand behind.
+    #[test]
+    fn a_ping_replaces_that_nodes_position() {
+        let mut r = Roster::new();
+        r.record(1_000, position(3, -80));
+        r.record(2_000, ping(3, 120));
+        assert_eq!(r.len(), 1);
+        let got = drain(&mut r, 2_000);
+        assert!(matches!(got.as_slice(), [Value::Ping(_)]));
+
+        // And back again once it has a fix.
+        r.record(3_000, position(3, -80));
+        assert!(matches!(drain(&mut r, 3_000).as_slice(), [Value::Position(_)]));
+    }
+
+    /// Each report goes out once. A value resent every tick cannot be told
+    /// apart from a node still reporting.
+    #[test]
+    fn a_report_is_handed_out_once() {
+        let mut r = Roster::new();
+        r.record(1_000, position(3, -80));
+        assert!(r.take_dirty(1_000).is_some());
+        assert!(r.take_dirty(1_000).is_none());
+        assert!(r.take_dirty(9_000).is_none());
+        // The node is still known, just not news.
+        assert_eq!(r.len(), 1);
+    }
+
+    /// Age is measured from arrival on the receiver's clock, which is the
+    /// only clock both a lean beacon and a rich one leave available.
+    /// Age is measured from arrival on the receiver's clock, which is the
+    /// only clock both a lean beacon and a rich one leave available.
+    #[test]
+    fn age_counts_from_arrival() {
+        let mut r = Roster::new();
+        r.record(1_000, position(3, -80));
+        let v = r.take_dirty(1_000 + 42_000).unwrap();
+        assert_eq!(v.bytes().len(), ble::REMOTE_LEN_V2);
+        assert_eq!(age(&v), 42);
+
+        // A report handed out as it arrives is aged zero: a live report and
+        // a replayed one are not the same thing.
+        r.record(100_000, ping(4, 7));
+        let v = r.take_dirty(100_000).unwrap();
+        assert_eq!(v.bytes().len(), ble::NODE_PING_LEN);
+        assert_eq!(age(&v), 0);
+    }
+
+    /// Whole seconds, so a long-idle node cannot saturate the field into
+    /// looking recent.
+    #[test]
+    fn age_truncates_and_saturates() {
+        let mut r = Roster::new();
+        r.record(0, position(3, -80));
+        assert_eq!(age(&r.take_dirty(1_999).unwrap()), 1);
+
+        // Past what the field can hold it pins at the maximum rather than
+        // wrapping. Only reachable with a TTL longer than this build's.
+        r.record(0, position(4, -80));
+        assert_eq!(age(&r.take_dirty(u64::MAX).unwrap()), ble::AGE_MAX_S);
+    }
+
+    /// Everything a reader that predates the age field knows about stays
+    /// where it was, which is what lets an old app read a new board.
+    #[test]
+    fn the_value_keeps_the_link_bytes_in_place() {
+        let mut r = Roster::new();
+        let Report::Position(sent) = position(9, -101) else {
+            unreachable!()
+        };
+        r.record(1_000, Report::Position(sent));
+        let v = r.take_dirty(1_000).unwrap();
+        assert_eq!(&v.bytes()[..ble::REMOTE_LEN], &sent);
+
+        let Report::Ping(sent) = ping(9, 4_242) else {
+            unreachable!()
+        };
+        r.record(1_000, Report::Ping(sent));
+        let v = r.take_dirty(1_000).unwrap();
+        assert_eq!(&v.bytes()[..link::PING_LEN], &sent);
+    }
+
+    /// A table with no room drops the node that has gone quietest, not the
+    /// one that reported first.
+    #[test]
+    fn a_full_table_evicts_the_quietest_node() {
+        let mut r = Roster::new();
+        for i in 0..SLOTS {
+            r.record(1_000 + i as u64, position(i as u8 + 1, -80));
+        }
+        assert_eq!(r.len(), SLOTS);
+        // Node 1 is the oldest; refreshing it makes node 2 the quietest.
+        r.record(5_000, position(1, -70));
+        r.record(6_000, position(99, -80));
+        assert_eq!(r.len(), SLOTS);
+
+        let srcs: Vec<u8> = drain(&mut r, 6_000).iter().map(|v| v.bytes()[0]).collect();
+        assert!(srcs.contains(&99), "the new node must be admitted");
+        assert!(srcs.contains(&1), "a refreshed node must not be evicted");
+        assert!(!srcs.contains(&2), "the quietest node makes way");
+    }
+
+    /// An expired node makes way before a live one does.
+    #[test]
+    fn expired_nodes_go_first() {
+        let mut r = Roster::new();
+        r.record(0, position(1, -80));
+        for i in 1..SLOTS {
+            r.record(TTL_MS + i as u64, position(i as u8 + 1, -80));
+        }
+        // Node 1 is now past the TTL, so the table has room without
+        // evicting any of the live nodes.
+        r.record(TTL_MS + 100, position(99, -80));
+        assert_eq!(r.len(), SLOTS);
+        let srcs: Vec<u8> = drain(&mut r, TTL_MS + 100).iter().map(|v| v.bytes()[0]).collect();
+        assert!(!srcs.contains(&1));
+        assert!(srcs.contains(&99));
+        assert!(srcs.contains(&2));
+    }
+
+    /// A connect hands over every node still inside the TTL, with ages, and
+    /// forgets the ones that are not.
+    #[test]
+    fn replay_covers_the_live_roster_only() {
+        let mut r = Roster::new();
+        r.record(1_000, position(3, -80));
+        r.record(2_000, ping(4, 30));
+        // Both already delivered to whoever was connected at the time.
+        assert_eq!(drain(&mut r, 2_000).len(), 2);
+
+        let now = 2_000 + TTL_MS - 1_000;
+        r.record(now, position(5, -90));
+        r.replay(now);
+        let got = drain(&mut r, now);
+        // Node 3 aged out; nodes 4 and 5 are replayed, oldest first.
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].bytes()[0], 4);
+        assert_eq!(got[1].bytes()[0], 5);
+        // The replayed node carries its real age, so it cannot be read as
+        // having just reported.
+        assert_eq!(age(&got[0]), ((TTL_MS - 1_000) / 1000) as u16);
+        assert_eq!(age(&got[1]), 0);
+    }
+
+    #[test]
+    fn an_empty_roster_hands_out_nothing() {
+        let mut r = Roster::new();
+        assert!(r.is_empty());
+        assert!(r.take_dirty(0).is_none());
+        r.replay(0);
+        assert!(r.take_dirty(0).is_none());
+    }
+}

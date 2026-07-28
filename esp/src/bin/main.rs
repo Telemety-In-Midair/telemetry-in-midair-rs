@@ -2,10 +2,11 @@
 //!
 //! The C6 is the BLE face of the board: it serves the gps-proto GATT
 //! service (so the existing gps-gui-rs app connects unchanged) extended
-//! with telemetry, remote-position and bulk-transfer characteristics
+//! with telemetry, remote-node and bulk-transfer characteristics
 //! (midair-proto). Position and status data come from the WIO-E5 over
 //! UART0 (GPIO16 TX / GPIO17 RX) and are cached, so a freshly connected
-//! central immediately receives the latest fix, LoRa RSSI and timestamps.
+//! central immediately receives the latest fix, LoRa RSSI and timestamps,
+//! along with every remote node heard from recently.
 //!
 //! Controls, all over BLE config writes:
 //! - GPS/LoRa power rail (AP2112K LDO enable on GPIO2)
@@ -62,6 +63,7 @@ use gps_proto::packet::{self, PositionPacket};
 use midair_proto::ble;
 use midair_proto::link::{self, cmd, msg, FrameBuf, FrameParser, Telemetry};
 use midair_proto::radiocfg;
+use midair_proto::roster::{Report, Roster, Value as RemoteValue};
 use trouble_host::prelude::*;
 
 extern crate alloc;
@@ -173,8 +175,20 @@ static GPS_STATE: Mutex<CriticalSectionRawMutex, Cell<PositionPacket>> =
         tod_ms: 0,
     }));
 
-static REMOTE_STATE: Mutex<CriticalSectionRawMutex, Cell<[u8; ble::REMOTE_LEN]>> =
-    Mutex::new(Cell::new([0; ble::REMOTE_LEN]));
+/// The latest report from each remote node, served on the remote-position
+/// and node-ping characteristics.
+///
+/// A table rather than the single slot this used to be, because the single
+/// slot lost data: two nodes reporting between one notify tick and the next
+/// left only whichever arrived second. See [`midair_proto::roster`] for the
+/// rest of the reasoning; it lives in the shared crate so it can be tested
+/// on a host.
+static REMOTES: Mutex<CriticalSectionRawMutex, RefCell<Roster>> =
+    Mutex::new(RefCell::new(Roster::new()));
+
+/// Pulsed when a report arrives, so the connected session notifies it on
+/// arrival instead of sampling the cache on the notify tick.
+static REMOTE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 static TELEM_STATE: Mutex<CriticalSectionRawMutex, Cell<Telemetry>> = Mutex::new(Cell::new(
     Telemetry {
@@ -215,6 +229,25 @@ static WIO_BUSY_UNTIL: Mutex<CriticalSectionRawMutex, Cell<u64>> = Mutex::new(Ce
 
 fn wio_busy() -> bool {
     WIO_BUSY_UNTIL.lock(|c| c.get()) > Instant::now().as_millis()
+}
+
+/// Record a node's newest report and wake the session to send it. Called
+/// from the link task; the notifying happens in the connected session.
+fn store_remote(report: Report) {
+    REMOTES.lock(|r| r.borrow_mut().record(Instant::now().as_millis(), report));
+    REMOTE_SIGNAL.signal(());
+}
+
+/// The next report waiting to go out, with its age stamped in.
+fn take_dirty_remote() -> Option<RemoteValue> {
+    REMOTES.lock(|r| r.borrow_mut().take_dirty(Instant::now().as_millis()))
+}
+
+/// Hand a central that has just connected every node heard from recently,
+/// rather than only the next node to report.
+fn replay_remotes() {
+    REMOTES.lock(|r| r.borrow_mut().replay(Instant::now().as_millis()));
+    REMOTE_SIGNAL.signal(());
 }
 
 // ---------------------------------------------------------------------------
@@ -727,8 +760,30 @@ fn handle_link_frame(cmd_id: u8, payload: &[u8]) {
                 }
                 let mut buf = [0u8; ble::REMOTE_LEN];
                 buf.copy_from_slice(&payload[..ble::REMOTE_LEN]);
-                REMOTE_STATE.lock(|c| c.set(buf));
+                store_remote(Report::Position(buf));
             }
+        }
+        msg::PING => {
+            // A node on the air without a fix. It goes in the same table as a
+            // position: this is that node's current report, and it replaces
+            // the position it was sending before it lost the fix.
+            if payload.len() < link::PING_LEN {
+                return;
+            }
+            let src = payload[0];
+            if src == 0 {
+                return;
+            }
+            vprintln!(
+                "wio node {} ping: rssi={} flags=0x{:02x} up={}s",
+                src,
+                i16::from_le_bytes([payload[1], payload[2]]),
+                payload[3],
+                u16::from_le_bytes([payload[4], payload[5]])
+            );
+            let mut buf = [0u8; link::PING_LEN];
+            buf.copy_from_slice(&payload[..link::PING_LEN]);
+            store_remote(Report::Ping(buf));
         }
         msg::STATUS => {
             if let Some(t) = Telemetry::decode(payload) {
@@ -953,9 +1008,15 @@ struct GpsService {
     /// Bulk transfer ops (radio TOML / WIO firmware).
     #[characteristic(uuid = ble::BULK_UUID_U128, write)]
     bulk: heapless::Vec<u8, 200>,
-    /// Last remote position heard over LoRa: [src, rssi i16le, packet].
+    /// Last remote position heard over LoRa: [src, rssi i16le, packet,
+    /// age_s i16le]. Notified once per report, and replayed on connect for
+    /// every node still in the table.
     #[characteristic(uuid = ble::REMOTE_UUID_U128, read, notify)]
-    remote: [u8; ble::REMOTE_LEN],
+    remote: [u8; ble::REMOTE_LEN_V2],
+    /// Last ping heard from a node with no fix: [src, rssi i16le, flags,
+    /// uptime_s u16le, age_s u16le]. Notified like the remote position.
+    #[characteristic(uuid = ble::NODE_PING_UUID_U128, read, notify)]
+    node_ping: [u8; ble::NODE_PING_LEN],
     /// Latest WIO status/log line (ASCII text).
     #[characteristic(uuid = ble::LOG_UUID_U128, read, notify)]
     log: heapless::Vec<u8, 64>,
@@ -1315,6 +1376,11 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
     publish_settings(server, conn).await;
     publish_radio_config(server, conn).await;
 
+    // Hand the new central every node heard from recently. Their ages go out
+    // with them, so a report from before this connection cannot be read as a
+    // live one.
+    replay_remotes();
+
     let events = async {
         let mut bulk: Option<BulkState> = None;
         loop {
@@ -1382,10 +1448,35 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
             }
             let telem = TELEM_STATE.lock(|c| c.get()).encode();
             let _ = server.gps.telemetry.notify(conn, &telem).await;
-            let remote = REMOTE_STATE.lock(|c| c.get());
-            // src 0 means nothing heard yet.
-            if remote[0] != 0 {
-                let _ = server.gps.remote.notify(conn, &remote).await;
+        }
+    };
+
+    // Remote reports are pushed as they arrive rather than sampled here: a
+    // node's report is news exactly once, and two nodes reporting inside one
+    // tick used to mean only the second was ever sent.
+    let remote_pub = async {
+        loop {
+            REMOTE_SIGNAL.wait().await;
+            // Same courtesy the notifier extends: the LoRa transmit has the
+            // power budget, so wait it out before adding BLE traffic.
+            while wio_busy() {
+                Timer::after(Duration::from_millis(100)).await;
+            }
+            while let Some(value) = take_dirty_remote() {
+                // `set` first so the value is readable by a central that
+                // never subscribed; an unsubscribed notify is not an error.
+                match value {
+                    RemoteValue::Position(v) => {
+                        if server.gps.remote.set(server, &v).is_ok() {
+                            let _ = server.gps.remote.notify(conn, &v).await;
+                        }
+                    }
+                    RemoteValue::Ping(v) => {
+                        if server.gps.node_ping.set(server, &v).is_ok() {
+                            let _ = server.gps.node_ping.notify(conn, &v).await;
+                        }
+                    }
+                }
             }
         }
     };
@@ -1412,7 +1503,7 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
 
     // Any arm ending (disconnect / position-notify failure) ends the
     // session.
-    select(select3(events, notifier, logger), config_pub).await;
+    select3(select3(events, notifier, logger), config_pub, remote_pub).await;
 }
 
 /// Apply a config write and build the ack to send back.

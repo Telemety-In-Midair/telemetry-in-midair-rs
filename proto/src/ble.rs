@@ -14,7 +14,8 @@ pub const DEVICE_NAME: &str = "GPS-C6";
 pub const TELEMETRY_UUID: &str = "c3a10005-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 /// Bulk transfer (radio TOML config / WIO firmware), write.
 pub const BULK_UUID: &str = "c3a10006-9f6e-4b2c-8f5a-2e32c3b1e5d0";
-/// Remote position: `[src u8, rssi i16le, PositionPacket 20B]`, notify + read.
+/// Remote position: `[src u8, rssi i16le, PositionPacket 20B, age_s u16le]`,
+/// notify + read. One notification per report received, not per tick.
 pub const REMOTE_UUID: &str = "c3a10007-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 /// WIO status/log line (ASCII), notify + read. Carries the latest
 /// [`crate::link::msg::LOG`] text, up to [`crate::link::LOG_MAX`] bytes.
@@ -25,8 +26,55 @@ pub const BULK_UUID_U128: u128 = 0xc3a10006_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 pub const REMOTE_UUID_U128: u128 = 0xc3a10007_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 pub const LOG_UUID_U128: u128 = 0xc3a10008_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 
-/// Remote position value length (src + rssi + packet).
+/// Smallest remote position value: src + rssi + packet.
+///
+/// This is the length a reader must accept, not the length the board sends
+/// (see [`REMOTE_LEN_V2`]). It is deliberately unchanged from the layout
+/// that had no age field, so a reader built against a newer version of this
+/// crate still understands a board running older firmware.
 pub const REMOTE_LEN: usize = 1 + 2 + gps_proto::packet::POSITION_PACKET_LEN;
+
+/// Remote position value as the board sends it: [`REMOTE_LEN`] followed by
+/// the age field.
+///
+/// The extra bytes are appended rather than inserted, so a reader that only
+/// knows the shorter layout reads the same fields at the same offsets and
+/// ignores the tail (`PositionPacket::decode` tolerates trailing bytes).
+pub const REMOTE_LEN_V2: usize = REMOTE_LEN + 2;
+
+/// Offset of the `age_s` field in a [`REMOTE_LEN_V2`] value.
+pub const REMOTE_AGE_OFF: usize = REMOTE_LEN;
+
+/// Remote node ping: `[src u8, rssi i16le, flags u8, uptime_s u16le,
+/// age_s u16le]`, notify + read.
+///
+/// What a node reports in place of a position while it has no fix (see
+/// [`crate::lora::Ping`]). Carried separately from [`REMOTE_UUID`] because a
+/// ping is not a position: folding one into a position blob would mean
+/// inventing coordinates for a node that explicitly has none.
+///
+/// `flags` is the [`crate::lora::PING_FLAG_GPS_PRESENT`] /
+/// [`crate::lora::PING_FLAG_HAD_FIX`] byte as it travelled on the air.
+pub const NODE_PING_UUID: &str = "c3a1000b-9f6e-4b2c-8f5a-2e32c3b1e5d0";
+pub const NODE_PING_UUID_U128: u128 = 0xc3a1000b_9f6e_4b2c_8f5a_2e32c3b1e5d0;
+
+/// Node ping value length: the [`crate::link::msg::PING`] payload plus the
+/// same age field a remote position carries.
+pub const NODE_PING_LEN: usize = crate::link::PING_LEN + 2;
+
+/// Offset of the `age_s` field in a [`NODE_PING_LEN`] value.
+pub const NODE_PING_AGE_OFF: usize = crate::link::PING_LEN;
+
+/// How the `age_s` field on [`REMOTE_UUID`] and [`NODE_PING_UUID`] reads:
+/// seconds since the board heard the report, saturating here.
+///
+/// Age is measured on the board's own clock rather than taken from the
+/// report, because the position fields a sender spends air time on are
+/// configurable and `tod_ms` is not among the defaults - a receiver would
+/// have nothing to age a beacon by. A value is only ever notified once, on
+/// arrival, so a non-zero age means the value was replayed to a central that
+/// connected after the fact.
+pub const AGE_MAX_S: u16 = u16::MAX;
 
 // -- Config command ids (on the gps-proto config characteristic) -------------
 //
@@ -234,11 +282,24 @@ mod tests {
         assert_eq!(to_u128(super::LOG_UUID), super::LOG_UUID_U128);
         assert_eq!(to_u128(super::SETTINGS_UUID), super::SETTINGS_UUID_U128);
         assert_eq!(to_u128(super::RADIO_CONFIG_UUID), super::RADIO_CONFIG_UUID_U128);
+        assert_eq!(to_u128(super::NODE_PING_UUID), super::NODE_PING_UUID_U128);
         // Same service as the C3 beacon, different characteristic ids.
         assert!(str_eq(
             gps_proto::packet::SERVICE_UUID,
             "c3a10001-9f6e-4b2c-8f5a-2e32c3b1e5d0"
         ));
+    }
+
+    /// The age field is appended, never inserted: everything a reader that
+    /// predates it knows about sits at the same offset, which is what lets
+    /// an old app read a new board.
+    #[test]
+    fn age_field_is_appended() {
+        assert_eq!(super::REMOTE_LEN, 23);
+        assert_eq!(super::REMOTE_LEN_V2, super::REMOTE_LEN + 2);
+        assert_eq!(super::REMOTE_AGE_OFF, super::REMOTE_LEN);
+        assert_eq!(super::NODE_PING_LEN, crate::link::PING_LEN + 2);
+        assert_eq!(super::NODE_PING_AGE_OFF, crate::link::PING_LEN);
     }
 
     #[test]

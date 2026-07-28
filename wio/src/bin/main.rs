@@ -545,10 +545,18 @@ mod app {
                     esp.send(msg::POSITION, &buf);
                     sdlog.log_position(now, rx.src, rx.rssi, &p);
                 } else if let Some(ping) = lora::Ping::decode(rx.payload) {
-                    // A node on the air with no fix to report. There is no
-                    // position to log or notify, so the status line is the
-                    // whole record of it - and it carries the RSSI, which is
-                    // what makes a ping usable as a range check.
+                    // A node on the air with no fix to report. Nothing to log
+                    // to SD - there is no position - but the ESP gets it as
+                    // data as well as prose, so an app can show the node as
+                    // alive-without-a-fix rather than have to parse the line
+                    // below. The RSSI rides along either way, which is what
+                    // makes a ping usable as a range check.
+                    let mut buf = [0u8; link::PING_LEN];
+                    buf[0] = rx.src;
+                    buf[1..3].copy_from_slice(&rx.rssi.to_le_bytes());
+                    buf[3] = ping.flags();
+                    buf[4..6].copy_from_slice(&ping.uptime_s.to_le_bytes());
+                    esp.send(msg::PING, &buf);
                     status_println!(
                         esp,
                         "node {} ping: rssi {}, up {}s, gps {}{}",

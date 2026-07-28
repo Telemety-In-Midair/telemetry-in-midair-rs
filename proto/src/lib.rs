@@ -11,6 +11,8 @@
 //! - [`ble`]: BLE GATT extensions on top of the gps-proto service (extra
 //!   characteristic UUIDs and config command ids).
 //! - [`radiocfg`]: the radio TOML configuration file format and its parser.
+//! - [`roster`]: the latest report from each remote node, and the BLE values
+//!   the ESP32-C6 serves from it.
 //!
 //! The BLE position/ack protocol itself lives in the shared `gps-proto`
 //! crate (re-exported here) so the existing gps-gui-rs app keeps working.
@@ -23,3 +25,4 @@ pub mod ble;
 pub mod link;
 pub mod lora;
 pub mod radiocfg;
+pub mod roster;
