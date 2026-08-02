@@ -649,8 +649,12 @@ impl PacketRadio for Sx1262Driver {
             .lora_packet_status()
             .map_err(|_| Sx1262Error::Radio)?;
         let rssi = pkt_status.rssi_pkt().to_integer();
-        // snr_pkt() is Ratio<i16> with denominator 4 (quarter dB).
-        self.last_snr_cb = *pkt_status.snr_pkt().numer() * 25;
+        // snr_pkt() is Ratio<i16> with denominator 4 (quarter dB), but the
+        // numerator arrives zero-extended from the register byte while SnrPkt
+        // is two's complement: every negative SNR comes back as a large
+        // positive (-16 dB reads as +48). Fold it back through i8.
+        let snr_quarter_db = *pkt_status.snr_pkt().numer() as u8 as i8;
+        self.last_snr_cb = i16::from(snr_quarter_db) * 25;
 
         crate::leds::note_rx();
 
