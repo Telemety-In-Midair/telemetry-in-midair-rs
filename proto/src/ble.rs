@@ -221,12 +221,16 @@ pub const CFG_ESP_ADV_WINDOW_S: u8 = 0x14;
 
 /// Clamp range and default for [`CFG_ESP_ADV_WINDOW_S`].
 ///
-/// The floor is not a comfortable connect time, it is the point below
-/// which a window stops being worth waking for at all - a phone that only
-/// scans intermittently can miss several 3 s windows in a row. The ceiling
-/// exists because a window is time spent at full advertising current;
-/// past a minute, shortening the interval is the better trade.
-pub const ESP_ADV_MIN_S: u32 = 3;
+/// The floor exists only to keep a window from being no window at all: at
+/// one second the board is genuinely advertising, and a central that scans
+/// continuously (the app's "connect to sleeping") will catch it. It is not
+/// a comfortable connect time - a phone that scans intermittently can miss
+/// several one-second windows in a row - so a window that short is a
+/// deliberate duty-cycle choice, or a bench setting for watching a whole
+/// wake/advertise/sleep round go by in seconds. The ceiling exists because
+/// a window is time spent at full advertising current; past a minute,
+/// shortening the interval is the better trade.
+pub const ESP_ADV_MIN_S: u32 = 1;
 pub const ESP_ADV_MAX_S: u32 = 60;
 pub const ESP_ADV_DEFAULT_S: u32 = 15;
 
