@@ -217,8 +217,9 @@ U5 MAX-M10N), not proposed - the board exists.
 | USB D- / D+ | GPIO19 / GPIO20 | | USB-C J3, console and host tools |
 | J5 JST SH 4-pin | GPIO10, GPIO11 | `Net-(J5-Pin_3/4)` | plus GND and +3V3; I2C-shaped |
 | J1 header 1x07 | GPIO41, 40, 39, 38, 47 | `Net-(J1-Pin_3..7)` | pin 1 GND, pin 2 +3V3 |
+| GPS EXTINT | GPIO15 | `/EXT_INT_GPS` | U5 pad 5, added in board V2 |
 | BOOT / RST | GPIO0 / RST | | test points BOOT1 / RST1 |
-| Free | GPIO12, 13, 15, 16, 17, 18, 42, 48 | | nothing routed to them |
+| Free | GPIO12, 13, 16, 17, 18, 42, 48 | | nothing routed to them |
 
 `GPIO33-37` are not on the pads: the R8 part uses octal PSRAM, which
 takes them. `GPIO26-32` are the flash interface. Neither is available
@@ -228,14 +229,14 @@ The LoRa RF port (U1 pad 37) goes to the SMA J6. The Wi-Fi/BT port
 (U1 pad 18) goes to test point BLE1 and stops there - there is no 2.4 GHz
 antenna on the board as drawn.
 
-**Three of the four SD lines sit on ESP32-S3 strapping pins, and all
-three carry a 10k pull-up to +3V3.** GPIO45 selects VDD_SPI: low is
-3.3 V, high is 1.8 V, and it is sampled at reset. R17 holds it high.
-If the module's flash rail is not forced by eFuse, the part comes out of
-reset expecting 1.8 V flash and does not boot. GPIO46 pulled high (R19)
-disables the ROM boot log, and GPIO3 pulled high (R18) changes the JTAG
-source - both survivable, GPIO45 is not. This wants checking on a real
-module before anything else on this list.
+**Three of the four SD lines sit on ESP32-S3 strapping pins.** GPIO45
+selects VDD_SPI: low is 3.3 V, high is 1.8 V, sampled at reset. R17 used
+to hold it high, which on a module without `VDD_SPI_FORCE` burned means
+the part comes out of reset expecting 1.8 V flash and does not boot -
+R17 is DNP as of board V2. GPIO46 pulled high (R19) still disables the
+ROM boot log and GPIO3 pulled high (R18) still moves the JTAG source;
+both are survivable. Worth confirming the eFuse state on a real module
+regardless.
 
 ## What the board forces on the firmware
 
@@ -249,11 +250,11 @@ can do:
   control, `Stored::rail_at_boot`, the `PFLAG_PWR_OFF` flag and the
   RTC pad hold all lose their meaning. Deep sleep drops the S3 to ~10 uA
   but leaves a MAX-M10 acquiring beside it, which is the dominant draw.
-- **GPS EXTINT is not wired to the MCU.** `/EXT_INT_GPS` is a labelled
-  net with exactly one member, U5 pad 5. The firmware's GPS sleep is
-  UBX-RXM-PMREQ into backup mode, and the only way out of backup is an
-  EXTINT edge - so as routed, `gps::sleep()` is a one-way trip. Either
-  the net gets a host GPIO or GPS sleep comes out of the firmware.
+- **GPS sleep is the only power lever, and it is a narrow one.**
+  `/EXT_INT_GPS` reaches GPIO15 as of board V2, so UBX-RXM-PMREQ backup
+  mode has a way back out and `gps::sleep()` works - but backup drops the
+  module's RAM configuration layer, so the run loop has to re-push
+  settings on every wake. That is the whole GPS power story now.
 - **Two LEDs, both active low.** The current firmware drives three
   (D5/D6 LoRa TX/RX on the WIO, D2 on the ESP) and all active high. The
   blink patterns need re-assigning to D5 (GPIO43) and D2 (GPIO14), and
