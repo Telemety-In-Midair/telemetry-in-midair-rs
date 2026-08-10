@@ -107,9 +107,9 @@ classDiagram
     class SdCardHw {
         <<FAT16 or FAT32, SPI, optional>>
     }
-    class PowerRail {
-        <<LDO enable, RTC GPIO>>
-        GPS and SD supply
+    class Power {
+        <<USB-C or LiPo, diode-OR, LDO>>
+        +3V3 always on, no host control
     }
 
     GpsGuiApp ..> GattSession : GATT
@@ -133,11 +133,11 @@ classDiagram
     RadioTask ..> LoraCodec
     RadioTask --> Sx1262Spi
     RadioTask --> RadioConfig : live settings
-    GpsTask --> MaxM10
+    GpsTask --> MaxM10 : backup mode is the only power lever
     SdTask --> SdCardHw
-    ServeTask --> PowerRail : raise on connect, cut before sleep
-    PowerRail --> MaxM10
-    PowerRail --> SdCardHw
+    Power --> Firmware
+    Power --> MaxM10
+    Power --> SdCardHw
     Sx1262Spi <..> RemoteNode : broadcasts and hops
 ```
 
@@ -157,7 +157,7 @@ two chips:
   is in the dependency list today.
 - **The power-master dance.** No rail to cut for a second MCU, no
   open-drain reset pulse on GPIO6, no "wake the WIO, fall back to a
-  reset" retry. A rail stays only for the GPS and the SD card.
+  reset" retry. On the board as drawn no rail stays at all - see below.
 - **`RADIO_BUSY` as a protocol message.** BLE notifications currently
   defer while the WIO flags its radio busy, negotiated over the link.
   Same-chip, this is a local mutex around the LoRa TX window.
@@ -199,25 +199,71 @@ rather than on PA4/PA5, and DIO1 is a real interrupt line to an ESP GPIO
 instead of an internal NVIC vector. Confirm both against the module
 schematic before writing the driver.
 
-## Proposed pin map
+## Pin map
 
-Free pads are plentiful, so the constraints are the strapping pins
-(GPIO0, 3, 45, 46), USB (GPIO19/20), and deep-sleep pad hold, which
-needs an RTC GPIO (0-21 on the S3).
+Read from the carrier design in `~/gps/wio-s3-max-gps` (U1 Wio-S3,
+U5 MAX-M10N), not proposed - the board exists.
 
-| Function | Pad | Note |
-|-|-|-|
-| GPS UART TX / RX | GPIO17 / GPIO18 | UART1 |
-| GPS EXTINT (wake) | GPIO16 | |
-| SD SCK / MOSI / MISO / CS | GPIO12 / 11 / 13 / 14 | SPI2, separate bus from the internal SX1262 |
-| GPS + SD rail enable | GPIO2 | RTC GPIO, so the level survives deep sleep as today |
-| LED D5 / D6 | GPIO47 / GPIO48 | LoRa TX / RX blink |
-| USB D- / D+ | GPIO19 / GPIO20 | console and host tools, as on the C6 |
-| BOOT / RST | GPIO0 / RST | keep both on a header for recovery |
+| Function | GPIO | Net | Note |
+|-|-|-|-|
+| GPS UART RX (from GPS TXD) | GPIO1 | `Net-(U1-GPIO1)` | U5 pad 2 |
+| GPS UART TX (to GPS RXD) | GPIO2 | `Net-(U1-GPIO2)` | U5 pad 3 |
+| SD CS | GPIO44 | `/SPI-CS` | 10k pull-up R16 |
+| SD MOSI | GPIO45 | `/SPI-COTI` | 10k pull-up R17 - **strapping pin, see below** |
+| SD SCK | GPIO46 | `/SPI-SCK` | 10k pull-up R19 - strapping pin |
+| SD MISO | GPIO3 | `/SPI-CITO` | 10k pull-up R18 - strapping pin |
+| LED D5 | GPIO43 | `Net-(D5-K)` | active low (R21 to +3V3 on the anode); also UART0_TX |
+| LED D2 | GPIO14 | `Net-(D2-K)` | active low (R20 to +3V3 on the anode) |
+| USB D- / D+ | GPIO19 / GPIO20 | | USB-C J3, console and host tools |
+| J5 JST SH 4-pin | GPIO10, GPIO11 | `Net-(J5-Pin_3/4)` | plus GND and +3V3; I2C-shaped |
+| J1 header 1x07 | GPIO41, 40, 39, 38, 47 | `Net-(J1-Pin_3..7)` | pin 1 GND, pin 2 +3V3 |
+| BOOT / RST | GPIO0 / RST | | test points BOOT1 / RST1 |
+| Free | GPIO12, 13, 15, 16, 17, 18, 42, 48 | | nothing routed to them |
 
 `GPIO33-37` are not on the pads: the R8 part uses octal PSRAM, which
 takes them. `GPIO26-32` are the flash interface. Neither is available
-whatever a pin table suggests.
+whatever a generic ESP32-S3 pin table suggests.
+
+The LoRa RF port (U1 pad 37) goes to the SMA J6. The Wi-Fi/BT port
+(U1 pad 18) goes to test point BLE1 and stops there - there is no 2.4 GHz
+antenna on the board as drawn.
+
+**Three of the four SD lines sit on ESP32-S3 strapping pins, and all
+three carry a 10k pull-up to +3V3.** GPIO45 selects VDD_SPI: low is
+3.3 V, high is 1.8 V, and it is sampled at reset. R17 holds it high.
+If the module's flash rail is not forced by eFuse, the part comes out of
+reset expecting 1.8 V flash and does not boot. GPIO46 pulled high (R19)
+disables the ROM boot log, and GPIO3 pulled high (R18) changes the JTAG
+source - both survivable, GPIO45 is not. This wants checking on a real
+module before anything else on this list.
+
+## What the board forces on the firmware
+
+Three of these are not "port this file", they change what the firmware
+can do:
+
+- **There is no power rail to cut.** The GPS `VCC` and `V_IO` are tied
+  straight to +3V3, and the SD is on +3V3 too. The only load switch on
+  the board (U3, SiP32431) feeds the GPS *active antenna* and is driven
+  by the GPS's own `LNA_EN`, not by a host GPIO. So `ServeTask`'s rail
+  control, `Stored::rail_at_boot`, the `PFLAG_PWR_OFF` flag and the
+  RTC pad hold all lose their meaning. Deep sleep drops the S3 to ~10 uA
+  but leaves a MAX-M10 acquiring beside it, which is the dominant draw.
+- **GPS EXTINT is not wired to the MCU.** `/EXT_INT_GPS` is a labelled
+  net with exactly one member, U5 pad 5. The firmware's GPS sleep is
+  UBX-RXM-PMREQ into backup mode, and the only way out of backup is an
+  EXTINT edge - so as routed, `gps::sleep()` is a one-way trip. Either
+  the net gets a host GPIO or GPS sleep comes out of the firmware.
+- **Two LEDs, both active low.** The current firmware drives three
+  (D5/D6 LoRa TX/RX on the WIO, D2 on the ESP) and all active high. The
+  blink patterns need re-assigning to D5 (GPIO43) and D2 (GPIO14), and
+  the levels inverted.
+
+Smaller ones: `GPIO43` is UART0_TX, so the ROM bootloader's boot log
+will flicker D5 on every reset (cosmetic, and the console is on USB
+anyway); GPS `TIMEPULSE` is unconnected, so no PPS discipline is
+available; and there is no battery sense divider, so telemetry cannot
+report the LiPo voltage without a board change.
 
 ## Phasing
 
@@ -241,11 +287,10 @@ which is what makes this tractable.
 
 ## Open questions
 
-- **Does the rest of the board carry over unchanged?** This plan assumes
-  the same MAX-M10 GPS, the same SPI SD card, the same 915 MHz plan, and
-  that only the two MCUs are replaced.
-- **Which Wio-S3 variant?** IPEX or bare-pad, and US915 for both RF
-  ports.
+- **Does the board get another spin?** The board-side changes this port
+  needs are listed in `BOARD-REVIEW.md` in the `wio-s3-max-gps` repo.
+  GPS EXTINT and the GPIO45 strapping pull-up are the two that firmware
+  cannot work around.
 - **Repo shape.** A new crate (`s3/`) built up beside the working `esp/`
   and `wio/`, deleting them at step 6, or `esp/` mutated in place. The
   new crate keeps a flashable fleet during the port; in-place keeps the
