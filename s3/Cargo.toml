@@ -37,6 +37,9 @@ embassy-time     = "0.5.0"
 
 critical-section = "1.2.0"
 
+# Board link protocol, BLE extensions and radio config. Host-tested.
+midair-proto = { path = "../proto" }
+
 [profile.dev]
 # Rust debug is too slow.
 # For debug builds always builds with some optimization

@@ -60,7 +60,7 @@ Beeper?
 
 
 
-The PMode::Boost value: the code writes 0x97, which the HAL documents as best sensitivity, but Semtech's datasheet documents only 0x94 and 0x96. I left the behavior alone and corrected the note in NOTES.md that claimed 0x96 was being written — worth a look at RM0453 if you want certainty.
+The PMode::Boost value: the code writes 0x97, which the HAL documents as best sensitivity, but Semtech's datasheet documents only 0x94 and 0x96. The WIO-E5 build still writes 0x97; the s3 port writes the register directly and uses the documented 0x96, so the two are an A/B on one constant. Worth a look at RM0453 if you want certainty.
 
 Since the sync word is a flag day, reflash every node before testing — a partially updated fleet will look exactly like the range problem you started with.
 

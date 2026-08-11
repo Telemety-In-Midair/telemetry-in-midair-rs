@@ -291,9 +291,20 @@ report the LiPo voltage without a board change.
    One difference from the C6 crate worth knowing: that one's `build.rs`
    installs a `--error-handling-script` linker arg, which is lld-only -
    Xtensa links through `xtensa-esp32s3-elf-gcc`, which rejects it.
-2. **Radio.** Port `Sx1262Driver` onto an SPI transport, external DIO1
-   and NRST. Test against an existing board on the bench - the air
-   format does not change, so a ported node must talk to an unported one.
+2. **Radio.** **Written, not yet run.** `s3/src/sx1262.rs` is the command
+   layer (NSS, BUSY, the opcodes) and `s3/src/radio.rs` is the driver,
+   ported with its tuned values and reasoning intact. Two things the WL
+   could not do are in: DIO1 is a real pin, so an idle listening node
+   pays a GPIO read per poll instead of an SPI round trip, and the
+   transmit wait is `.await` rather than a spin feeding the watchdog, so
+   nothing else is locked out for the 9.7 s a SF12/BW62.5 beacon can
+   take. Bench test against an existing board - the air format does not
+   change, so a ported node must talk to an unported one.
+
+   Blocked on one fact: the module's internal ESP32-S3-to-SX1262 wiring
+   is not published, so the seven GPIOs in `s3/src/bin/main.rs` are an
+   inference (GPIO4-10 is the only run of pins the module does not bring
+   out to a pad). Nothing else in the crate depends on them.
 3. **GPS and SD.** Move `gps.rs` and the SD stack over. At this point
    the board is a working node with no BLE.
 4. **BLE and session.** Fold `esp/src/bin/main.rs` in, minus the link
