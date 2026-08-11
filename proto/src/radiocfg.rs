@@ -21,6 +21,7 @@
 //! coding_rate = 5           # 4/5 .. 4/8
 //! power_dbm = 22            # -9 .. 22
 //! rx_boost = true           # boosted RX gain, ~+2 dB for more RX current
+//! dio2_rf_switch = false    # radio drives its own antenna switch on DIO2
 //!
 //! [mesh]
 //! address = 1               # 1-255
@@ -405,6 +406,21 @@ pub struct RadioConfig {
     /// leave on for boards that have one - the Wio-E5 does. Turning it off
     /// costs current but is safe anywhere.
     pub dcdc_enabled: bool,
+    /// Let the radio drive its own antenna switch from DIO2
+    /// (`SetDio2AsRfSwitchCtrl`, opcode 0x9D).
+    ///
+    /// This is a property of how the module's RF port is wired, not a
+    /// tuning choice. A part that feeds a connector directly has no switch
+    /// to drive and wants this off, which is also the chip's power-up
+    /// state; one whose RF pads run into an external switch or front-end
+    /// needs it on, or the antenna is never joined to the PA and every
+    /// transmission goes nowhere.
+    ///
+    /// Only a discrete SX1262 can honor it. The STM32WLE5's radio is
+    /// on-die with no bonded DIO2 and no such opcode in its table, so that
+    /// firmware parses the key and ignores it, switching the antenna from
+    /// MCU GPIOs instead.
+    pub dio2_rf_switch: bool,
     /// Supply the radio drives the TCXO at.
     pub tcxo_volts: TcxoVolts,
     /// How long the radio waits for the TCXO to stabilize before it will
@@ -471,6 +487,10 @@ impl Default for RadioConfig {
             // The Wio-E5 carries the SMPS inductor and a 1.8 V TCXO; these
             // defaults are that module's hardware, not a tuning choice.
             dcdc_enabled: true,
+            // Off is the chip's power-up state and the safe default: a
+            // board that does need DIO2 switching says so, and one that
+            // does not is left alone.
+            dio2_rf_switch: false,
             tcxo_volts: TcxoVolts::V1_8,
             tcxo_startup_ms: 10,
             gps: GpsConfig::default(),
@@ -609,6 +629,7 @@ const RCFG_RX_BOOST: u8 = 1 << 0;
 const RCFG_SD_ENABLED: u8 = 1 << 1;
 const RCFG_VERBOSE: u8 = 1 << 2;
 const RCFG_DCDC: u8 = 1 << 3;
+const RCFG_DIO2_RF_SWITCH: u8 = 1 << 4;
 // byte 2 (GPS constellations)
 const RCFG_GPS: u8 = 1 << 0;
 const RCFG_GLONASS: u8 = 1 << 1;
@@ -635,6 +656,9 @@ impl RadioConfig {
         }
         if self.dcdc_enabled {
             flags |= RCFG_DCDC;
+        }
+        if self.dio2_rf_switch {
+            flags |= RCFG_DIO2_RF_SWITCH;
         }
         b[1] = flags;
         let mut g = 0u8;
@@ -704,6 +728,7 @@ impl RadioConfig {
             sd_enabled: flags & RCFG_SD_ENABLED != 0,
             verbose: flags & RCFG_VERBOSE != 0,
             dcdc_enabled: flags & RCFG_DCDC != 0,
+            dio2_rf_switch: flags & RCFG_DIO2_RF_SWITCH != 0,
             tcxo_volts: TcxoVolts::from_trim(b[20])?,
             tcxo_startup_ms: u16at(21),
             gps: GpsConfig {
@@ -859,6 +884,9 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
             }
             "dcdc_enabled" => {
                 cfg.dcdc_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?
+            }
+            "dio2_rf_switch" => {
+                cfg.dio2_rf_switch = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?
             }
             "tcxo_volts" => {
                 cfg.tcxo_volts = match unquote(value) {
@@ -1017,6 +1045,32 @@ mod tests {
     fn example_file_documents_the_real_defaults() {
         let example = include_str!("../../RADIO.example.toml");
         assert_eq!(parse(example).unwrap(), RadioConfig::default());
+    }
+
+    /// Why a reader must never hand this parser a truncated file.
+    ///
+    /// Comments and blank lines are skipped, so any prefix that happens to end
+    /// on a line boundary parses clean - it is simply a file with fewer keys,
+    /// and every key it lost comes back as its default. There is nothing in the
+    /// result to say it was cut. The example file is the worst case of that:
+    /// its first 1024 bytes, the ceiling both transfer paths enforce, are all
+    /// header comment, so a truncated read of it succeeds and yields *every*
+    /// setting at its default - address included.
+    ///
+    /// So the size check belongs at the reader (`SdLog::read_config` refuses a
+    /// file it cannot hold whole) and cannot be delegated to a parse failure.
+    #[test]
+    fn a_truncated_file_parses_as_a_shorter_one() {
+        let example = include_str!("../../RADIO.example.toml");
+        let head = &example.as_bytes()[..1024];
+        assert_eq!(parse_bytes(head), Ok(RadioConfig::default()));
+        // Not a quirk of that one offset: a config cut after its first key
+        // keeps that key and defaults the rest, silently.
+        let cut = parse("address = 7\nspreading_factor = 9").unwrap();
+        assert_eq!((cut.address, cut.spreading_factor), (7, 9));
+        let truncated = parse("address = 7\n").unwrap();
+        assert_eq!(truncated.address, 7);
+        assert_eq!(truncated.spreading_factor, RadioConfig::default().spreading_factor);
     }
 
     #[test]
@@ -1372,6 +1426,7 @@ mod tests {
             sd_enabled: false,
             verbose: false,
             dcdc_enabled: false,
+            dio2_rf_switch: true,
             tcxo_volts: TcxoVolts::V3_3,
             tcxo_startup_ms: 250,
             gps: GpsConfig {
@@ -1390,6 +1445,30 @@ mod tests {
         assert_eq!(bytes.len(), RADIO_CONFIG_LEN);
         assert_eq!(bytes[0], RADIO_CONFIG_VERSION);
         assert_eq!(RadioConfig::decode(&bytes), Some(cfg));
+    }
+
+    /// The antenna switch is a board property, so a card that says nothing
+    /// about it must not turn it on, and the key must not ride on any of
+    /// the flag byte's other bits - a board told to drive DIO2 when there
+    /// is no switch, or not to when there is, transmits into a
+    /// disconnected antenna either way.
+    #[test]
+    fn dio2_rf_switch_is_off_unless_asked() {
+        assert!(!RadioConfig::default().dio2_rf_switch);
+        let quiet = parse("rx_boost = true\ndcdc_enabled = true\n").unwrap();
+        assert!(!quiet.dio2_rf_switch);
+
+        let on = parse("dio2_rf_switch = true\n").unwrap();
+        assert!(on.dio2_rf_switch);
+        // and it did not disturb the other bools sharing the flag byte
+        let d = RadioConfig::default();
+        assert_eq!(on.rx_boost, d.rx_boost);
+        assert_eq!(on.sd_enabled, d.sd_enabled);
+        assert_eq!(on.verbose, d.verbose);
+        assert_eq!(on.dcdc_enabled, d.dcdc_enabled);
+
+        assert!(RadioConfig::decode(&on.encode()).unwrap().dio2_rf_switch);
+        assert!(!RadioConfig::decode(&d.encode()).unwrap().dio2_rf_switch);
     }
 
     #[test]

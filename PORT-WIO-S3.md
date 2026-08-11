@@ -199,6 +199,22 @@ rather than on PA4/PA5, and DIO1 is a real interrupt line to an ESP GPIO
 instead of an internal NVIC vector. Confirm both against the module
 schematic before writing the driver.
 
+The RF switch difference gains a setting rather than losing one. On the
+WL, `SetDio2AsRfSwitchCtrl` (0x9D) is absent from the opcode table
+entirely - the die has no bonded DIO2, so switching is an MCU GPIO job
+and the register could never be a config key. The Wio-S3's SX1262 is
+discrete and DIO2 is a real pin, so it is one now: `dio2_rf_switch`,
+sitting with `dcdc_enabled` and `tcxo_volts` as a board-description key.
+Off is the chip's power-up state and the default; on is for a module
+whose RF port runs into an external switch or front-end. There is no
+middle ground if it is wrong - the antenna is never joined to the PA and
+every transmission goes into a disconnected port.
+
+Note what this is *not*: the module's u.FL-versus-RF-pad choice is two
+SKUs (100020327 with IPEX, 100079384 with bare pads), not a switch, so
+no register selects it. The 2.4 GHz port has no equivalent control at
+all - the ESP32-S3 has no antenna switch.
+
 ## Pin map
 
 Read from the carrier design in `~/gps/wio-s3-max-gps` (U1 Wio-S3,

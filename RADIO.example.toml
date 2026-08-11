@@ -53,12 +53,15 @@ power_dbm_description = "Transmit power in dBm, -9 to 22 on the high-power PA."
 rx_boost = true
 rx_boost_description = "Boosted receiver gain: roughly +2 dB of sensitivity for a few mA more current whenever the node is listening."
 
-# The three keys below describe the board the firmware is running on, not a
+# The four keys below describe the board the firmware is running on, not a
 # preference. The defaults are the Wio-E5's own hardware; change them only
 # for a different module, where a wrong value means a radio that does not
 # start rather than one that performs badly.
 # dcdc_enabled = true
 # dcdc_enabled_description = "Use the internal DC-DC (SMPS) WIO-E5 supports this."
+
+# dio2_rf_switch = false
+# dio2_rf_switch_description = "Let the radio drive its own antenna switch from DIO2 (SetDio2AsRfSwitchCtrl). On for a module whose RF port runs into an external switch or front-end, off for one that feeds a connector directly. The Wio-E5's radio is on-die with no bonded DIO2, so it ignores this and switches the antenna from MCU pins."
 
 # tcxo_volts = "1.8"
 # tcxo_volts_description = "Supply the radio drives the TCXO at. Wio-E5 uses a 1.8V part."
