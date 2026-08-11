@@ -21,13 +21,17 @@ use embassy_time::{Duration, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
+use esp_hal::delay::Delay;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
+use esp_hal::uart::{Config as UartConfig, Uart};
 use esp_println::println;
 use midair_proto::radiocfg::RadioConfig;
+use wio_s3_gps::gps::{Gps, BAUD as GPS_BAUD};
 use wio_s3_gps::radio::Sx1262Driver;
+use wio_s3_gps::sdlog::SdLog;
 use wio_s3_gps::sx1262::Sx1262;
 
 /// Status LED, cathode on GPIO43. Active low.
@@ -37,6 +41,11 @@ const LED_OFF: Level = Level::High;
 /// The SX1262 SPI clock. The chip takes up to 16 MHz; the bus here is
 /// entirely inside the module, so this is conservative rather than tuned.
 const LORA_SPI_HZ: u32 = 8_000_000;
+
+/// SD card SPI clock. Cards must be initialized at 400 kHz or under, and
+/// this never raises it afterwards - a flush is about a kilobyte every five
+/// seconds, so the 25 ms it costs is not worth the reconfiguration.
+const SD_SPI_HZ: u32 = 400_000;
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -94,6 +103,38 @@ async fn main(_spawner: Spawner) -> ! {
         println!("radio did not answer - check the pin map above");
     }
 
+    // GPS on UART1: GPIO1 is RX (module TX), GPIO2 is TX. 9600 8N1 is the
+    // u-blox M10 factory default.
+    let gps_uart = Uart::new(
+        peripherals.UART1,
+        UartConfig::default().with_baudrate(GPS_BAUD),
+    )
+    .expect("gps uart")
+    .with_rx(peripherals.GPIO1)
+    .with_tx(peripherals.GPIO2);
+    let mut gps = Gps::new(gps_uart);
+    // The module may still be starting, in which case this goes
+    // unacknowledged and the run loop re-pushes once it is talking.
+    gps.configure(&cfg.gps).await;
+
+    // microSD on SPI3. Three of these four lines are ESP32-S3 strapping
+    // pins - see BOARD-REVIEW.md in the board repo; R17 on GPIO45 is DNP
+    // for that reason.
+    let sd_spi = Spi::new(
+        peripherals.SPI3,
+        SpiConfig::default()
+            .with_frequency(Rate::from_hz(SD_SPI_HZ))
+            .with_mode(Mode::_0),
+    )
+    .expect("sd spi")
+    .with_sck(peripherals.GPIO46)
+    .with_mosi(peripherals.GPIO45)
+    .with_miso(peripherals.GPIO3);
+    let sd_cs = Output::new(peripherals.GPIO44, Level::High, OutputConfig::default());
+    let sd_dev = embedded_hal_bus::spi::ExclusiveDevice::new(sd_spi, sd_cs, Delay::new())
+        .expect("sd spi device");
+    let mut sdlog = SdLog::new(embedded_sdmmc::SdCard::new(sd_dev, Delay::new()));
+
     let mut buf = [0u8; 255];
     let mut ticks: u32 = 0;
     loop {
@@ -112,10 +153,18 @@ async fn main(_spawner: Spawner) -> ! {
                     lora.last_snr_cb()
                 );
             }
+            gps.poll();
             Timer::after(Duration::from_millis(10)).await;
         }
 
         ticks += 1;
+        let now_ms = ticks.saturating_mul(1000);
+
+        if gps.take_updated() {
+            sdlog.log_position(now_ms, 0, 0, &gps.packet());
+        }
+        sdlog.poll(now_ms);
+
         if ticks % 10 == 0 {
             let (mode, err) = lora.health();
             println!(
@@ -124,6 +173,13 @@ async fn main(_spawner: Spawner) -> ! {
                 mode,
                 err,
                 lora.rx_crc_errors()
+            );
+            println!(
+                "gps {} sentences ({} bytes), fix {}, sd {}",
+                gps.rx_sentences(),
+                gps.rx_bytes(),
+                gps.has_fix(),
+                if sdlog.ready() { "mounted" } else { "absent" }
             );
         }
     }

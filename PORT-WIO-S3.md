@@ -233,9 +233,8 @@ U5 MAX-M10N), not proposed - the board exists.
 | USB D- / D+ | GPIO19 / GPIO20 | | USB-C J3, console and host tools |
 | J5 JST SH 4-pin | GPIO10, GPIO11 | `Net-(J5-Pin_3/4)` | plus GND and +3V3; I2C-shaped |
 | J1 header 1x07 | GPIO41, 40, 39, 38, 47 | `Net-(J1-Pin_3..7)` | pin 1 GND, pin 2 +3V3 |
-| GPS EXTINT | GPIO15 | `/EXT_INT_GPS` | U5 pad 5, added in board V2 |
 | BOOT / RST | GPIO0 / RST | | test points BOOT1 / RST1 |
-| Free | GPIO12, 13, 16, 17, 18, 42, 48 | | nothing routed to them |
+| Free | GPIO12, 13, 15, 16, 17, 18, 42, 48 | | nothing routed to them |
 
 `GPIO33-37` are not on the pads: the R8 part uses octal PSRAM, which
 takes them. `GPIO26-32` are the flash interface. Neither is available
@@ -266,11 +265,13 @@ can do:
   control, `Stored::rail_at_boot`, the `PFLAG_PWR_OFF` flag and the
   RTC pad hold all lose their meaning. Deep sleep drops the S3 to ~10 uA
   but leaves a MAX-M10 acquiring beside it, which is the dominant draw.
-- **GPS sleep is the only power lever, and it is a narrow one.**
-  `/EXT_INT_GPS` reaches GPIO15 as of board V2, so UBX-RXM-PMREQ backup
-  mode has a way back out and `gps::sleep()` works - but backup drops the
-  module's RAM configuration layer, so the run loop has to re-push
-  settings on every wake. That is the whole GPS power story now.
+- **GPS backup mode is the only power lever.** `/EXT_INT_GPS` is not
+  routed to the MCU, but that does not strand the module: UBX-RXM-PMREQ
+  requests EXTINT0 *and* UART RX as wake sources, and the WIO firmware
+  already relied on both - `wake()` pulses EXTINT and then sends bytes.
+  So sleep and wake work on this board over the UART alone. What backup
+  does cost is the module's RAM configuration layer, so the run loop has
+  to re-push settings on every wake.
 - **Two LEDs, both active low.** The current firmware drives three
   (D5/D6 LoRa TX/RX on the WIO, D2 on the ESP) and all active high. The
   blink patterns need re-assigning to D5 (GPIO43) and D2 (GPIO14), and
@@ -305,8 +306,14 @@ report the LiPo voltage without a board change.
    is not published, so the seven GPIOs in `s3/src/bin/main.rs` are an
    inference (GPIO4-10 is the only run of pins the module does not bring
    out to a pad). Nothing else in the crate depends on them.
-3. **GPS and SD.** Move `gps.rs` and the SD stack over. At this point
-   the board is a working node with no BLE.
+3. **GPS and SD.** **Written, not yet run.** `s3/src/gps.rs` is the
+   MAX-M10 driver - NMEA folding, UBX-CFG-VALSET, backup mode - on an
+   esp-hal UART, with the waits awaiting instead of spinning.
+   `s3/src/sdlog.rs` is the FAT logger. The WIO-E5's 348-line SPI-mode SD
+   driver does *not* come across: it existed only because
+   `stm32wlxx-hal` stopped at embedded-hal 0.2, which ruled out
+   `embedded-sdmmc`'s own driver. esp-hal implements 1.0, so the upstream
+   driver does the job and that file is simply deleted.
 4. **BLE and session.** Fold `esp/src/bin/main.rs` in, minus the link
    task; wire `GattSession` to call the radio and GPS directly.
 5. **Sleep and OTA.** Redo the sleep story for one MCU, move firmware
