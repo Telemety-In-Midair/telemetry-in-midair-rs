@@ -314,8 +314,18 @@ report the LiPo voltage without a board change.
    `stm32wlxx-hal` stopped at embedded-hal 0.2, which ruled out
    `embedded-sdmmc`'s own driver. esp-hal implements 1.0, so the upstream
    driver does the job and that file is simply deleted.
-4. **BLE and session.** Fold `esp/src/bin/main.rs` in, minus the link
-   task; wire `GattSession` to call the radio and GPS directly.
+4. **BLE and session.** **Core written, not yet run.** The GATT service
+   is byte-identical to the C6's - same UUIDs from the shared crates - so
+   gps-gui-rs needs no change. Advertising, connect, the settings publish
+   and the position/telemetry stream are in, and config writes go through
+   the same host-tested `session::apply`. The link is gone: an action
+   that was a frame and a wait for the WIO's answer is now a signal the
+   hardware loop picks up, so the ack the policy built always holds.
+   `RADIO_BUSY` went the same way - it is a bool, not two frames.
+
+   Deferred to a 4b: the bulk transfer handler (the characteristic is
+   declared so the service shape matches), deep sleep with its nvs-backed
+   settings, the remote-node roster replay, and the USB console.
 5. **Sleep and OTA.** Redo the sleep story for one MCU, move firmware
    update to ESP-IDF OTA, retire `wio-upload` and `fw-upload`.
 6. **Cleanup.** Delete `wio/`, `wio/bootloader/`, the UART link, and

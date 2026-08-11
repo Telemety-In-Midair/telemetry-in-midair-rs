@@ -13,7 +13,12 @@ path = "./src/bin/main.rs"
 # matched esp-rtos 0.2 / esp-radio 0.17 pair expects esp-hal 1.0.x.
 esp-hal = { version = "~1.0", features = ["esp32s3", "unstable"] }
 
-esp-rtos = { version = "0.2.0", features = ["embassy", "esp-alloc", "esp32s3"] }
+esp-rtos = { version = "0.2.0", features = [
+  "embassy",
+  "esp-alloc",
+  "esp-radio",
+  "esp32s3",
+] }
 
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32s3"] }
 
@@ -33,9 +38,27 @@ esp-println = { version = "0.16.1", default-features = false, features = [
 ] }
 
 embassy-executor = { version = "0.9.1", features = [] }
+embassy-futures  = "0.1"
+embassy-sync     = "0.7"
 embassy-time     = "0.5.0"
 
+# BLE. Same stack the C6 runs; the bigger packet-pool MTU lets a central
+# negotiate a large ATT MTU for the bulk transfer characteristic.
+bt-hci = "0.6.0"
+esp-radio = { version = "0.17.0", features = [
+  "ble",
+  "esp-alloc",
+  "esp32s3",
+  "unstable",
+] }
+trouble-host = { version = "0.5.0", features = [
+  "gatt",
+  "default-packet-pool-mtu-251",
+] }
+static_cell = "2.1.1"
+
 critical-section = "1.2.0"
+heapless         = "0.9"
 
 # FAT filesystem so the SD card logs are readable on a phone/computer.
 # Unlike the WIO-E5 build this uses the crate's own SPI-mode SD driver:
