@@ -14,6 +14,7 @@ serves everything over BLE to the gps-gui-rs app and manages power. See
 | `wio/` | WIO-E5 application firmware (RTIC). | `thumbv7em-none-eabi` (nightly) |
 | `wio/bootloader/` | Two-partition swap bootloader for UART-fed firmware updates. | `thumbv7em-none-eabi` |
 | `esp/` | ESP32-C6 firmware (embassy + trouble BLE). | `riscv32imac-unknown-none-elf` (stable) |
+| `s3/` | Wio-S3 firmware for the next board, which replaces both MCUs with one module. Skeleton so far - see `PORT-WIO-S3.md`. | `xtensa-esp32s3-none-elf` (`esp` channel) |
 | `tools/` | Host uploader (Python/pixi) to flash the WIO through the ESP USB. | host |
 
 Depends on the sibling repo `../gps-proto` for the BLE position protocol
@@ -36,6 +37,10 @@ cd proto && cargo test
 # WIO-E5: bootloader once, then the app (SWD via probe-rs)
 cd wio && cargo run --release -p bootloader   # no RTT output; Ctrl-C once flashed
 cd wio && cargo run --release                 # app, RTT console
+
+# Wio-S3 (next board; Xtensa, so it needs the `esp` toolchain from espup)
+# espup install        # once per machine, provides the `esp` channel
+cd s3 && cargo run --release
 
 # ESP32-C6 (USB Serial/JTAG; console also lives there)
 # Per-frame link + per-heartbeat logging is on by default.

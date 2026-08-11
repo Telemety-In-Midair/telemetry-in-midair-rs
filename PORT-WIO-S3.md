@@ -284,9 +284,13 @@ report the LiPo voltage without a board change.
 
 ## Phasing
 
-1. **Toolchain and skeleton.** `espup`, a new crate targeting
-   `xtensa-esp32s3-none-elf`, blink an LED, bring up USB serial. Proves
-   the build host before any porting.
+1. ~~**Toolchain and skeleton.**~~ **Done.** `s3/` builds on the `esp`
+   channel for `xtensa-esp32s3-none-elf` and links to an Xtensa ELF:
+   esp-hal 1.0, esp-rtos with embassy, USB Serial/JTAG console, D5
+   heartbeat on GPIO43. `cd s3 && cargo run --release` flashes it.
+   One difference from the C6 crate worth knowing: that one's `build.rs`
+   installs a `--error-handling-script` linker arg, which is lld-only -
+   Xtensa links through `xtensa-esp32s3-elf-gcc`, which rejects it.
 2. **Radio.** Port `Sx1262Driver` onto an SPI transport, external DIO1
    and NRST. Test against an existing board on the bench - the air
    format does not change, so a ported node must talk to an unported one.
