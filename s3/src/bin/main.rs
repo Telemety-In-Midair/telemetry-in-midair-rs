@@ -425,6 +425,7 @@ async fn hardware_task(
     let mut buf = [0u8; 255];
     let mut rx_count: u32 = 0;
     let mut last_rssi: i16 = 0;
+    let mut last_status_s: u64 = u64::MAX;
     let start = Instant::now();
 
     loop {
@@ -465,6 +466,28 @@ async fn hardware_task(
         });
 
         sdlog.poll(start.elapsed().as_millis() as u32);
+
+        // Periodic status. Without this a quiet radio and a quiet GPS look
+        // identical from the console, which is exactly the state the board
+        // is in until the pin map is confirmed.
+        let secs = start.elapsed().as_secs();
+        if secs != last_status_s && secs % 10 == 0 {
+            last_status_s = secs;
+            let (mode, err) = lora.health();
+            println!(
+                "t={}s radio {} err 0x{:04X} rx {} | gps {} sentences ({} B) fix {} sats {} | sd {}",
+                secs,
+                mode,
+                err,
+                rx_count,
+                gps.rx_sentences(),
+                gps.rx_bytes(),
+                gps.has_fix(),
+                gps.packet().sats,
+                if sdlog.ready() { "mounted" } else { "absent" }
+            );
+        }
+
         Timer::after(Duration::from_millis(10)).await;
     }
 }
