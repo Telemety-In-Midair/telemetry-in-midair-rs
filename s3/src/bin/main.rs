@@ -143,18 +143,15 @@ async fn main(spawner: Spawner) -> ! {
 
     println!("wio-s3-gps v{} up", env!("CARGO_PKG_VERSION"));
 
-    // ---------------------------------------------------------------
-    // UNVERIFIED: the Wio-S3's internal ESP32-S3-to-SX1262 wiring is not
-    // published in the module introduction, and searches for it return the
-    // XIAO ESP32S3 + Wio-SX1262 kit, which is a different product with a
-    // different map. GPIO4-10 is the only run of pins the module does not
-    // bring out to a pad, and seven signals is exactly what the radio
-    // needs, so that is the assumption below.
+    // Wio-S3 internal SX1262 wiring, from the module datasheet. Confirmed
+    // against hardware - do not guess at these. An earlier build had three
+    // of them wrong in a way that put an ESP push-pull output on a line the
+    // SX1262 also drives, and it destroyed a board (see NOTES.md).
     //
-    // Everything else in this crate is independent of these seven lines -
-    // confirm them against the module datasheet or reference schematic and
-    // this block is the only edit.
-    // ---------------------------------------------------------------
+    //   NSS  GPIO21    SCK  GPIO4    MOSI GPIO6    MISO GPIO5
+    //   NRESET GPIO7   BUSY GPIO8    DIO1 GPIO9
+    //   DIO2 goes to the SKY13453 RF switch inside the module, so it never
+    //   reaches an ESP pin - it is the radio's own antenna control.
     let lora_spi = Spi::new(
         peripherals.SPI2,
         SpiConfig::default()
@@ -162,16 +159,18 @@ async fn main(spawner: Spawner) -> ! {
             .with_mode(Mode::_0),
     )
     .expect("lora spi")
-    .with_sck(peripherals.GPIO5)
+    .with_sck(peripherals.GPIO4)
     .with_mosi(peripherals.GPIO6)
-    .with_miso(peripherals.GPIO7);
+    .with_miso(peripherals.GPIO5);
 
     let lora = Sx1262Driver::new(Sx1262::new(
         lora_spi,
-        Output::new(peripherals.GPIO8, Level::High, OutputConfig::default()),
-        Input::new(peripherals.GPIO4, InputConfig::default()),
-        Input::new(peripherals.GPIO10, InputConfig::default()),
-        Output::new(peripherals.GPIO9, Level::High, OutputConfig::default()),
+        // NSS and NRESET are ours to drive; BUSY and DIO1 are the radio's,
+        // so they are inputs and nothing here may ever drive them.
+        Output::new(peripherals.GPIO21, Level::High, OutputConfig::default()),
+        Input::new(peripherals.GPIO8, InputConfig::default()),
+        Input::new(peripherals.GPIO9, InputConfig::default()),
+        Output::new(peripherals.GPIO7, Level::High, OutputConfig::default()),
     ));
 
     // GPS on UART1: GPIO1 is RX (module TX), GPIO2 is TX. 9600 8N1 is the
@@ -415,7 +414,11 @@ async fn hardware_task(
     mut sdlog: SdLog<'static>,
     mut d5: Output<'static>,
 ) {
-    let cfg = RadioConfig::default();
+    // The module wires SX1262 DIO2 to the SKY13453 RF switch's VCTL, so
+    // the radio has to drive its own antenna path. Without this every
+    // transmission ramps the PA into an isolated switch.
+    let mut cfg = RadioConfig::default();
+    cfg.dio2_rf_switch = true;
     lora.init(&cfg).await;
     if !lora.print_diagnostics() {
         println!("radio did not answer - check the pin map in main");
