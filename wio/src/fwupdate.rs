@@ -33,6 +33,15 @@ struct StaticPageBuf(UnsafeCell<[u8; PAGE_BUF_SIZE]>);
 unsafe impl Sync for StaticPageBuf {}
 static PAGE_BUF: StaticPageBuf = StaticPageBuf(UnsafeCell::new([0xFF; PAGE_BUF_SIZE]));
 
+/// A transfer with no frame for this long is abandoned.
+///
+/// An active transfer owns the main loop - no GPS, no radio, no SD - so a host
+/// that stops halfway takes the node off the air until someone power-cycles it.
+/// The ESP gives up after 5 s of its own, but an ESP that resets mid-transfer
+/// never sends the abort, and that is the case this covers. Long enough that no
+/// legitimate gap between chunks comes close.
+const IDLE_TIMEOUT_MS: u32 = 30_000;
+
 struct Receiving {
     size: u32,
     crc32: u32,
@@ -40,6 +49,8 @@ struct Receiving {
     received: u32,
     current_page: u16,
     page_offset: u16,
+    /// When the last frame for this transfer arrived, for [`IDLE_TIMEOUT_MS`].
+    last_ms: u32,
 }
 
 pub enum FwEvent {
@@ -74,6 +85,19 @@ impl FwUpdate {
         self.state = None;
     }
 
+    /// Drop a transfer that has gone quiet, returning whether one was dropped.
+    /// Call every main-loop iteration; see [`IDLE_TIMEOUT_MS`].
+    pub fn expire(&mut self, now_ms: u32) -> bool {
+        let stale = match &self.state {
+            Some(rx) => now_ms.wrapping_sub(rx.last_ms) >= IDLE_TIMEOUT_MS,
+            None => false,
+        };
+        if stale {
+            self.state = None;
+        }
+        stale
+    }
+
     fn page_buf(&self) -> &[u8; PAGE_BUF_SIZE] {
         unsafe { &*PAGE_BUF.0.get() }
     }
@@ -83,7 +107,7 @@ impl FwUpdate {
     }
 
     /// FW_BEGIN: `[size u32le, crc32 u32le, version u16le]`.
-    pub fn begin(&mut self, payload: &[u8]) -> FwEvent {
+    pub fn begin(&mut self, payload: &[u8], now_ms: u32) -> FwEvent {
         if payload.len() < 10 {
             return FwEvent::Error(err::BAD_FRAME);
         }
@@ -102,29 +126,34 @@ impl FwUpdate {
             received: 0,
             current_page: 0,
             page_offset: 0,
+            last_ms: now_ms,
         });
         FwEvent::Ack(0)
     }
 
     /// FW_DATA: `[seq u16le, bytes...]`.
-    pub fn data(&mut self, payload: &[u8], flash: &mut pac::FLASH) -> FwEvent {
-        let Some(rx) = &self.state else {
+    pub fn data(&mut self, payload: &[u8], flash: &mut pac::FLASH, now_ms: u32) -> FwEvent {
+        let Some(rx) = self.state.as_mut() else {
             return FwEvent::Error(err::INVALID_STATE);
         };
         if payload.len() < 3 {
             return FwEvent::Error(err::BAD_FRAME);
         }
+        // Any well-formed frame proves the host is still there, a retransmit
+        // included, so the idle deadline moves before the sequence checks.
+        rx.last_ms = now_ms;
+        let (next_seq, received, size) = (rx.next_seq, rx.received, rx.size);
         let seq = u16::from_le_bytes(payload[0..2].try_into().unwrap());
         let data = &payload[2..];
 
         // Duplicate (retransmit after a lost ack): re-ack, don't rewrite.
-        if seq.wrapping_add(1) == rx.next_seq {
-            return FwEvent::Ack(rx.next_seq);
+        if seq.wrapping_add(1) == next_seq {
+            return FwEvent::Ack(next_seq);
         }
-        if seq != rx.next_seq {
+        if seq != next_seq {
             return FwEvent::Error(err::BAD_SEQ);
         }
-        if rx.received + data.len() as u32 > rx.size {
+        if received + data.len() as u32 > size {
             self.state = None;
             return FwEvent::Error(err::BAD_SIZE);
         }
@@ -161,31 +190,33 @@ impl FwUpdate {
     }
 
     /// FW_END: flush the tail page, verify CRC32, request the swap.
+    ///
+    /// Every failure leaves the transfer in place, so a host that retries the
+    /// step - which the uploader does when an ack goes missing - gets the same
+    /// answer instead of `INVALID_STATE` for a transfer this call had quietly
+    /// destroyed. `FW_ABORT` and the idle deadline are what clear a transfer
+    /// that ends badly; only success consumes it here.
     pub fn end(&mut self, flash: &mut pac::FLASH) -> FwEvent {
         let Some(rx) = &self.state else {
             return FwEvent::Error(err::INVALID_STATE);
         };
         if rx.received != rx.size {
-            let missing = rx.next_seq;
-            self.state = None;
-            rtt_target::rprintln!("FW: end with missing data (next seq {})", missing);
+            rtt_target::rprintln!("FW: end with missing data (next seq {})", rx.next_seq);
             return FwEvent::Error(err::BAD_SIZE);
         }
-        if rx.page_offset > 0 {
-            let page_idx = DFU_PAGE_START + rx.current_page as u8;
-            if !self.write_page(flash, page_idx) {
-                self.state = None;
-                return FwEvent::Error(err::FLASH_ERROR);
-            }
+        let (size, want_crc, page_offset, current_page) =
+            (rx.size, rx.crc32, rx.page_offset, rx.current_page);
+        if page_offset > 0 && !self.write_page(flash, DFU_PAGE_START + current_page as u8) {
+            return FwEvent::Error(err::FLASH_ERROR);
         }
-        let rx = self.state.take().unwrap();
         // Flash is memory-mapped, so the shared CRC runs over it directly.
-        let staged = unsafe { core::slice::from_raw_parts(DFU_BASE as *const u8, rx.size as usize) };
+        let staged = unsafe { core::slice::from_raw_parts(DFU_BASE as *const u8, size as usize) };
         let computed = crc32(staged);
-        if computed != rx.crc32 {
-            rtt_target::rprintln!("FW: crc mismatch {:08x} != {:08x}", computed, rx.crc32);
+        if computed != want_crc {
+            rtt_target::rprintln!("FW: crc mismatch {:08x} != {:08x}", computed, want_crc);
             return FwEvent::Error(err::CRC_MISMATCH);
         }
+        self.state = None;
         crate::boot_state::request_swap(flash);
         rtt_target::rprintln!("FW: image verified, swap requested");
         FwEvent::Complete

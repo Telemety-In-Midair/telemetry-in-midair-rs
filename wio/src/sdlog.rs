@@ -56,6 +56,12 @@ impl BlockDevice for SdDev {
     fn read(&self, blocks: &mut [Block], start: BlockIdx, _reason: &str) -> Result<(), SdError> {
         let mut sd = self.0.borrow_mut();
         for (i, block) in blocks.iter_mut().enumerate() {
+            // One FAT operation is many blocks, and a failing card spends the
+            // full per-block timeout on each of them - enough of them in a row
+            // to outlast the watchdog between two main-loop feeds. Each block
+            // is individually bounded, so feeding per block keeps the deadline
+            // meaningful while letting a slow card finish.
+            crate::watchdog::feed_now();
             sd.read_block(start.0 + i as u32, &mut block.contents)?;
         }
         Ok(())
@@ -64,6 +70,7 @@ impl BlockDevice for SdDev {
     fn write(&self, blocks: &[Block], start: BlockIdx) -> Result<(), SdError> {
         let mut sd = self.0.borrow_mut();
         for (i, block) in blocks.iter().enumerate() {
+            crate::watchdog::feed_now();
             sd.write_block(start.0 + i as u32, &block.contents)?;
         }
         Ok(())
@@ -273,11 +280,31 @@ impl SdLog {
     }
 
     /// Read `RADIO.CFG` into `buf`, returning the length read.
+    ///
+    /// A file too big for `buf` is refused rather than truncated. Filling the
+    /// buffer and reporting its length looks exactly like a short file to the
+    /// caller, and the TOML parser accepts any prefix that happens to end on a
+    /// line boundary - so a card holding a long config would be adopted as
+    /// whatever fitted, silently, and reported as loaded. The reference
+    /// `RADIO.example.toml` is the worst case: its first 1024 bytes are all
+    /// header comment, so it parses clean as *every* setting at its default.
     pub fn read_config(&mut self, buf: &mut [u8]) -> Option<usize> {
         let m = self.mounted.as_ref()?;
         let root = m.root;
         let file = self.vm.open_file_in_dir(root, CONFIG_FILE, Mode::ReadOnly).ok()?;
-        let n = self.vm.read(file, buf).ok();
+        let len = self.vm.file_length(file).ok();
+        let n = match len {
+            Some(len) if len as usize <= buf.len() => self.vm.read(file, buf).ok(),
+            Some(len) => {
+                rtt_target::rprintln!(
+                    "SD: RADIO.CFG is {} bytes, over the {}-byte limit - ignored",
+                    len,
+                    buf.len()
+                );
+                None
+            }
+            None => None,
+        };
         let _ = self.vm.close_file(file);
         n
     }

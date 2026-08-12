@@ -58,3 +58,24 @@ pub fn start(iwdg: &pac::IWDG, timeout_ms: u32) {
 pub fn feed(iwdg: &pac::IWDG) {
     iwdg.kr.write(|w| unsafe { w.key().bits(KEY_RELOAD) });
 }
+
+/// Feed the watchdog without holding the peripheral.
+///
+/// The key register is write-only and the reload key is idempotent, so this
+/// cannot disturb whatever the owner of the [`pac::IWDG`] is doing, and a
+/// write before [`start`] is simply ignored.
+///
+/// It exists for the bounded wait loops that sit below the main loop and
+/// cannot reach the peripheral: a blocking LoRa transmit and an SD block
+/// transfer. Both carry their own deadline, so feeding from inside them says
+/// "still waiting on something that will time out", not "trust me". Loops
+/// with no deadline of their own - `wait_on_busy` in particular - are
+/// deliberately left unfed, because a radio that never releases BUSY is
+/// exactly what the watchdog is for.
+#[inline]
+pub fn feed_now() {
+    // SAFETY: a single write of the reload key to a write-only register.
+    unsafe {
+        (*pac::IWDG::PTR).kr.write(|w| w.key().bits(KEY_RELOAD));
+    }
+}

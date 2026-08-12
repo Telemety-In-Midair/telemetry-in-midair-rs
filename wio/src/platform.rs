@@ -81,5 +81,10 @@ pub fn random(min: i32, max: i32) -> i32 {
     if max <= min {
         return min;
     }
-    min + (s as i32).unsigned_abs() as i32 % (max - min)
+    // Reduce in unsigned space. Going through `(s as i32).unsigned_abs()`
+    // returns 2^31 for exactly one state value, which casts back to a negative
+    // i32 and, since `%` keeps the sign of its left operand, produced a result
+    // below `min` - a repeat jitter that reads as already due.
+    let span = max.wrapping_sub(min) as u32;
+    min.wrapping_add((s % span) as i32)
 }

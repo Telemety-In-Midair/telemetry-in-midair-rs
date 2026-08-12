@@ -250,8 +250,14 @@ mod app {
         // Position report to the ESP at most once a second (the GPS fix
         // rate); the LoRa beacon runs on its own configured interval.
         let mut next_esp_pos: u32 = 0;
+        // Stagger the first beacon so a fleet powered up together does not
+        // transmit as one. Folded into eight slots rather than scaled by the
+        // address itself, which made node 200 sit silent for three and a half
+        // minutes after boot with nothing on the console to explain it. One
+        // second apart is already wide against the air time of a beacon, and
+        // the jitter added after each transmission keeps them apart from there.
         let mut next_beacon: u32 = platform::millis()
-            .wrapping_add(cfg.address as u32 * 1_000)
+            .wrapping_add((cfg.address as u32 % 8) * 1_000)
             .wrapping_add(2_000);
         let mut next_status: u32 = platform::millis().wrapping_add(3_000);
         // While set, we flagged our radio busy to the ESP; clear at this time.
@@ -264,6 +270,11 @@ mod app {
         let mut gps_checked = false;
         let gps_grace_until = platform::millis().wrapping_add(5_000);
         let mut next_gps_log = platform::millis().wrapping_add(5_000);
+        // Settings-push retries, and how many are spent before the loop stops
+        // asking. Reset whenever something makes the module unconfigured again.
+        const GPS_CFG_TRIES: u8 = 5;
+        let mut gps_cfg_tries: u8 = 0;
+        let mut next_gps_cfg: u32 = 0;
 
         status_println!(esp, "wio v{} up, node {}", FIRMWARE_VERSION, cfg.address);
         // Report the config we came up on, so an ESP already connected to a
@@ -302,71 +313,103 @@ mod app {
                         if sleep {
                             gps.sleep();
                         } else {
+                            // `wake` marks the module unconfigured: backup mode
+                            // loses the RAM layer the settings live in. Re-arm
+                            // the retry so the loop pushes them again once the
+                            // receiver is talking.
                             gps.wake();
+                            gps_cfg_tries = 0;
+                            next_gps_cfg = now;
                         }
                         esp.send_ack(cmd::GPS_SLEEP, sleep as u16);
                     }
                     cmd::CFG_BEGIN => match cfgxfer.begin(esp.payload()) {
                         CfgEvent::Ack(seq) => esp.send_ack(cmd::CFG_BEGIN, seq),
                         CfgEvent::Error(e) => esp.send_nak(cmd::CFG_BEGIN, e),
-                        CfgEvent::Complete => unreachable!(),
+                        CfgEvent::Complete | CfgEvent::Done => unreachable!(),
                     },
                     cmd::CFG_DATA => match cfgxfer.data(esp.payload()) {
                         CfgEvent::Ack(seq) => esp.send_ack(cmd::CFG_DATA, seq),
                         CfgEvent::Error(e) => esp.send_nak(cmd::CFG_DATA, e),
-                        CfgEvent::Complete => unreachable!(),
+                        CfgEvent::Complete | CfgEvent::Done => unreachable!(),
                     },
-                    cmd::CFG_END => match cfgxfer.end(esp.payload()) {
-                        CfgEvent::Complete => match radiocfg::parse_bytes(cfgxfer.bytes()) {
-                            Ok(new_cfg) => {
-                                let regps = new_cfg.gps != cfg.gps;
-                                *cfg = new_cfg;
-                                node.radio_mut().init(cfg);
-                                node.reconfigure(cfg);
-                                if regps && !gps.sleeping {
-                                    if gps.configure(&cfg.gps) {
-                                        status_println!(esp, "gps reconfigured");
-                                    } else {
-                                        status_println!(esp, "gps did not accept settings");
+                    cmd::CFG_END => {
+                        // Applying one costs a radio re-init, a GPS settings
+                        // push that waits up to 250 ms for an ack, an SD write
+                        // and a flash page erase, all before the loop's own
+                        // feed at the bottom.
+                        watchdog::feed(iwdg);
+                        // Bound the borrow of `cfgxfer` to this call so the
+                        // arms below can take it mutably again.
+                        let event = cfgxfer.end(esp.payload());
+                        match event {
+                            CfgEvent::Complete => match radiocfg::parse_bytes(cfgxfer.bytes()) {
+                                Ok(new_cfg) => {
+                                    let regps = new_cfg.gps != cfg.gps;
+                                    *cfg = new_cfg;
+                                    node.radio_mut().init(cfg);
+                                    node.reconfigure(cfg);
+                                    if regps && !gps.sleeping {
+                                        // Re-arm the retry either way: a push
+                                        // that is not acknowledged leaves the
+                                        // module on its old settings, and the
+                                        // loop is what gets it onto the new.
+                                        gps_cfg_tries = 0;
+                                        next_gps_cfg = now.wrapping_add(2_000);
+                                        if gps.configure(&cfg.gps) {
+                                            status_println!(esp, "gps reconfigured");
+                                        } else {
+                                            status_println!(esp, "gps did not accept settings");
+                                        }
                                     }
+                                    *cfg_loaded = true;
+                                    // Both stores are best effort, but a config
+                                    // that reached neither is gone at the next
+                                    // power cycle - and that has to reach the
+                                    // host, which sees only what goes over the
+                                    // link. An RTT-only warning left a push
+                                    // looking successful right up until a
+                                    // reboot quietly restored the defaults.
+                                    let sd_ok = sdlog.write_config(now, cfgxfer.bytes());
+                                    let flash_ok = cfgstore::write(flash, cfgxfer.bytes());
+                                    let stored = match (sd_ok, flash_ok) {
+                                        (true, true) => "saved to SD and flash",
+                                        (true, false) => "saved to SD only",
+                                        (false, true) => "saved to flash only (no SD)",
+                                        (false, false) => "NOT SAVED - lost on reboot",
+                                    };
+                                    status_println!(
+                                        esp,
+                                        "config applied, node {}, {}",
+                                        cfg.address,
+                                        stored
+                                    );
+                                    // Only now is a repeat of this END
+                                    // answerable as the success it was, rather
+                                    // than as a transfer that no longer exists.
+                                    // A config that verified but would not
+                                    // parse is never marked, so retrying that
+                                    // one keeps failing - which is the truth.
+                                    cfgxfer.mark_applied();
+                                    esp.send_ack(cmd::CFG_END, 0);
+                                    // Report the new config so a connected
+                                    // app's view updates without a fresh read.
+                                    esp.send(msg::CONFIG, &cfg.encode());
                                 }
-                                *cfg_loaded = true;
-                                // Both stores are best effort, but a config
-                                // that reached neither is gone at the next
-                                // power cycle - and that has to reach the
-                                // host, which sees only what goes over the
-                                // link. An RTT-only warning left a push
-                                // looking successful right up until a reboot
-                                // quietly restored the defaults.
-                                let sd_ok = sdlog.write_config(now, cfgxfer.bytes());
-                                let flash_ok = cfgstore::write(flash, cfgxfer.bytes());
-                                let stored = match (sd_ok, flash_ok) {
-                                    (true, true) => "saved to SD and flash",
-                                    (true, false) => "saved to SD only",
-                                    (false, true) => "saved to flash only (no SD)",
-                                    (false, false) => "NOT SAVED - lost on reboot",
-                                };
-                                status_println!(
-                                    esp,
-                                    "config applied, node {}, {}",
-                                    cfg.address,
-                                    stored
-                                );
-                                esp.send_ack(cmd::CFG_END, 0);
-                                // Report the new config so a connected app's
-                                // view updates without a fresh read.
-                                esp.send(msg::CONFIG, &cfg.encode());
-                            }
-                            Err(_) => esp.send_nak(cmd::CFG_END, link::err::BAD_CONFIG),
-                        },
-                        CfgEvent::Ack(seq) => esp.send_ack(cmd::CFG_END, seq),
-                        CfgEvent::Error(e) => esp.send_nak(cmd::CFG_END, e),
-                    },
+                                Err(_) => esp.send_nak(cmd::CFG_END, link::err::BAD_CONFIG),
+                            },
+                            // The host retried an END whose ack went missing;
+                            // the config is already live and stored.
+                            CfgEvent::Done => esp.send_ack(cmd::CFG_END, 0),
+                            CfgEvent::Ack(seq) => esp.send_ack(cmd::CFG_END, seq),
+                            CfgEvent::Error(e) => esp.send_nak(cmd::CFG_END, e),
+                        }
+                    }
                     cmd::CFG_READ => {
                         // Read-back: the config blob is the reply, not an ack.
                         esp.send(msg::CONFIG, &cfg.encode());
                     }
-                    cmd::FW_BEGIN => match fw.begin(esp.payload()) {
+                    cmd::FW_BEGIN => match fw.begin(esp.payload(), now) {
                         FwEvent::Ack(seq) => {
                             status_println!(esp, "fw update: receiving image");
                             esp.send_ack(cmd::FW_BEGIN, seq);
@@ -376,7 +419,7 @@ mod app {
                     },
                     cmd::FW_DATA => {
                         watchdog::feed(iwdg);
-                        match fw.data(esp.payload(), flash) {
+                        match fw.data(esp.payload(), flash, now) {
                             FwEvent::Ack(seq) => esp.send_ack(cmd::FW_DATA, seq),
                             FwEvent::Error(e) => esp.send_nak(cmd::FW_DATA, e),
                             FwEvent::Complete => unreachable!(),
@@ -408,6 +451,14 @@ mod app {
 
             // A firmware transfer owns the loop: skip GPS/SD/radio work so
             // the link stays responsive and nothing else erases flash.
+            //
+            // Which is why it has to be able to end on its own. The ESP aborts
+            // a stalled transfer after 5 s, but an ESP that resets mid-upload
+            // never sends that abort, and the node would then sit off the air -
+            // no beacon, no GPS, no logging - until someone power-cycled it.
+            if fw.expire(now) {
+                status_println!(esp, "fw update: abandoned, resuming normal operation");
+            }
             if fw.is_active() {
                 watchdog::feed(iwdg);
                 Mono::delay(1_u32.millis()).await;
@@ -438,17 +489,31 @@ mod app {
             if !gps_nmea_seen && gps.present() {
                 gps_nmea_seen = true;
                 status_println!(esp, "gps: NMEA up ({} bytes)", gps.rx_bytes());
-                // The boot-time settings push can reach the module before it
-                // has finished starting, and an unacknowledged push leaves it
-                // running its own defaults. Its first sentence is the earliest
-                // proof it is listening, so that is where the retry belongs.
-                if !gps.configured {
-                    let ok = gps.configure(&cfg.gps);
-                    status_println!(
-                        esp,
-                        "gps: settings {}",
-                        if ok { "applied" } else { "still not accepted" }
-                    );
+            }
+            // Settings retry. Two things leave the module running its own
+            // defaults while the firmware reports the ones it asked for: a
+            // boot-time push that landed before the receiver had finished
+            // starting, and a wake from backup mode, which cuts power to the
+            // receiver core and takes the whole RAM configuration layer with it
+            // - including the four NMEA sentences this firmware silences to fit
+            // 9600 baud. Driving the retry off `configured` rather than off the
+            // first sentence covers both, since `wake` clears it.
+            //
+            // A sentence is the earliest proof the module is listening, so that
+            // gates the attempt; the tries are capped so a module that keeps
+            // refusing does not talk over the console forever.
+            if !gps.configured
+                && !gps.sleeping
+                && gps.present()
+                && gps_cfg_tries < GPS_CFG_TRIES
+                && due(now, next_gps_cfg)
+            {
+                next_gps_cfg = now.wrapping_add(2_000);
+                gps_cfg_tries += 1;
+                if gps.configure(&cfg.gps) {
+                    status_println!(esp, "gps: settings applied");
+                } else if gps_cfg_tries == GPS_CFG_TRIES {
+                    status_println!(esp, "gps: settings still not accepted, giving up");
                 }
             }
             if !gps_checked && due(now, gps_grace_until) {

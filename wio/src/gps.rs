@@ -393,6 +393,11 @@ impl Gps {
     /// Put the module into backup mode (UBX-RXM-PMREQ, indefinite, wake
     /// on EXTINT or UART RX activity).
     pub fn sleep(&mut self) {
+        // UART RX is one of the wake sources below, so sending the request to
+        // a module that is already in backup would wake it just to put it back.
+        if self.sleeping {
+            return;
+        }
         // Version-0 16-byte payload: version, reserved[3], duration (0 =
         // until wake source), flags (bit1 = backup), wakeupSources
         // (bit3 = uartrx, bit5 = extint0).
@@ -407,13 +412,26 @@ impl Gps {
     }
 
     /// Wake the module from backup: EXTINT pulse plus UART traffic.
+    ///
+    /// Clears [`configured`](Self::configured), because backup mode cuts power
+    /// to the receiver core and the RAM configuration layer - the only one
+    /// [`configure`](Self::configure) writes - does not survive it. The module
+    /// comes back on its BBR/flash defaults, which means the four NMEA
+    /// sentences this firmware silences are talking again and the measurement
+    /// rate is whatever the factory set. The caller re-pushes the settings once
+    /// the module is producing sentences again; it is not done here because the
+    /// receiver needs a moment to start and would not acknowledge yet.
     pub fn wake(&mut self) {
+        if !self.sleeping {
+            return;
+        }
         self.extint.set_level_high();
         // Hold EXTINT high a few ms so the edge is registered.
         cortex_m::asm::delay(crate::platform::SYSCLK_HZ / 1000 * 5);
         self.extint.set_level_low();
         self.write_all(&[0xFF, 0xFF]);
         self.sleeping = false;
+        self.configured = false;
     }
 }
 

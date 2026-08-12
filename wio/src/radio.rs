@@ -696,8 +696,16 @@ impl PacketRadio for Sx1262Driver {
         crate::leds::note_tx();
 
         // Poll IRQ for TxDone/Timeout.
+        //
+        // The deadline scales with the modulation and reaches 9.7 s at the
+        // slowest settings the config accepts (SF12/BW62.5), against a 6 s
+        // watchdog - and a beacon plus a repeat forward can both run between
+        // two of the main loop's feeds. So the wait feeds the watchdog itself;
+        // it is bounded by `tx_poll_timeout_ms` either way, so this cannot
+        // hide a radio that has stopped answering.
         let start_ms = platform::millis();
         let result = loop {
+            crate::watchdog::feed_now();
             let elapsed = platform::millis().wrapping_sub(start_ms);
             if elapsed > self.tx_poll_timeout_ms {
                 debug_println!("TX timeout (no TxDone after {} ms)", self.tx_poll_timeout_ms);

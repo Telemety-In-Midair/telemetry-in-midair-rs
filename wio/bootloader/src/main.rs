@@ -98,7 +98,14 @@ fn flash_erase_page(page: u32) {
 
 /// Program `len` bytes from `src` to flash address `dst`.
 /// Both `dst` and `len` must be 8-byte (double-word) aligned.
-/// `src` must be 4-byte aligned.
+///
+/// `src` has no alignment requirement: the words are assembled from bytes
+/// rather than read through a `*const u32`. That cast was undefined behavior
+/// for the byte arrays `write_state` builds on the stack, which carry no
+/// alignment at all - and the compiler is free to answer it with an `ldrd`,
+/// which faults. Nothing to lose by assembling instead, since LLVM still emits
+/// a plain load where it can prove the alignment, and a fault here would be in
+/// the code that writes the boot state, with no way back.
 fn flash_program(dst: u32, src: &[u8]) {
     assert!(dst % 8 == 0);
     assert!(src.len() % 8 == 0);
@@ -110,9 +117,9 @@ fn flash_program(dst: u32, src: &[u8]) {
             ptr::write_volatile(FLASH_CR, FLASH_CR_PG);
 
             // Write low word then high word (must be two consecutive 32-bit writes)
-            let src_ptr = src.as_ptr().add(offset as usize);
-            let lo = ptr::read(src_ptr as *const u32);
-            let hi = ptr::read(src_ptr.add(4) as *const u32);
+            let w = &src[offset as usize..offset as usize + 8];
+            let lo = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
+            let hi = u32::from_le_bytes([w[4], w[5], w[6], w[7]]);
 
             let dst_ptr = dst + offset;
             ptr::write_volatile(dst_ptr as *mut u32, lo);

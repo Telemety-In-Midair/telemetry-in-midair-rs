@@ -22,8 +22,12 @@ pub enum CfgEvent {
     /// Step failed; NAK with this error code.
     Error(u8),
     /// Transfer complete and CRC-verified; the payload is in
-    /// [`CfgTransfer::bytes`]. Ack after applying.
+    /// [`CfgTransfer::bytes`]. Apply it, then call
+    /// [`CfgTransfer::mark_applied`] and ack.
     Complete,
+    /// A repeat of an END that already completed and was applied. Ack it
+    /// without doing the work a second time.
+    Done,
 }
 
 pub struct CfgTransfer {
@@ -31,6 +35,16 @@ pub struct CfgTransfer {
     received: usize,
     next_seq: u16,
     active: bool,
+    /// CRC of the last transfer that verified, with whether the caller went on
+    /// to apply it.
+    ///
+    /// Together they let a repeated CFG_END be answered as the success it was.
+    /// The uploader retries the step whenever an ack goes missing - and the ESP
+    /// gives up on this one after 2 s, which the apply can outlast on a slow
+    /// card - so without this a config that was applied and saved comes back to
+    /// the host as a failure.
+    last_crc: u32,
+    applied: bool,
 }
 
 impl CfgTransfer {
@@ -40,6 +54,8 @@ impl CfgTransfer {
             received: 0,
             next_seq: 0,
             active: false,
+            last_crc: 0,
+            applied: false,
         }
     }
 
@@ -66,7 +82,16 @@ impl CfgTransfer {
         self.received = 0;
         self.next_seq = 0;
         self.active = true;
+        self.applied = false;
         CfgEvent::Ack(0)
+    }
+
+    /// Record that the caller parsed and adopted the completed transfer, so a
+    /// repeated CFG_END for it answers [`CfgEvent::Done`] rather than
+    /// `INVALID_STATE`. A config that verified but would not parse is never
+    /// marked, and a retry of that one keeps failing, which is the truth.
+    pub fn mark_applied(&mut self) {
+        self.applied = true;
     }
 
     /// CFG_DATA: `[seq u16le, bytes...]`.
@@ -98,20 +123,27 @@ impl CfgTransfer {
 
     /// CFG_END: `[crc32 u32le]`.
     pub fn end(&mut self, payload: &[u8]) -> CfgEvent {
-        if !self.active {
-            return CfgEvent::Error(err::INVALID_STATE);
-        }
-        self.active = false;
         if payload.len() < 4 {
             return CfgEvent::Error(err::BAD_FRAME);
         }
+        let want = u32::from_le_bytes(payload[0..4].try_into().unwrap());
+        if !self.active {
+            // Either a retry of the END that already landed, or a stray frame.
+            // The CRC is what tells the two apart: it names the transfer.
+            return if self.applied && self.last_crc == want {
+                CfgEvent::Done
+            } else {
+                CfgEvent::Error(err::INVALID_STATE)
+            };
+        }
+        self.active = false;
         if self.received != self.total {
             return CfgEvent::Error(err::BAD_SIZE);
         }
-        let want = u32::from_le_bytes(payload[0..4].try_into().unwrap());
         if crc32(self.bytes()) != want {
             return CfgEvent::Error(err::CRC_MISMATCH);
         }
+        self.last_crc = want;
         CfgEvent::Complete
     }
 }

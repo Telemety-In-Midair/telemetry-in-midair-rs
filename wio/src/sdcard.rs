@@ -217,10 +217,13 @@ impl SdCard {
                 _ => false, // illegal command: v1 card
             };
 
-            // ACMD41 until the card leaves idle (up to 1 s).
+            // ACMD41 until the card leaves idle (up to 1 s). Bounded, but the
+            // caller reaches here from the main loop's SD housekeeping, so it
+            // shares that loop's watchdog interval with everything else.
             let hcs = if v2 { 0x4000_0000 } else { 0 };
             let start = crate::platform::millis();
             loop {
+                crate::watchdog::feed_now();
                 sd.cmd(55, 0)?;
                 if sd.cmd(41, hcs)? == 0x00 {
                     break;
