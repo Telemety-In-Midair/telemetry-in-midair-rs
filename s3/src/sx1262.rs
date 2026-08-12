@@ -15,7 +15,7 @@
 //! anything shifted in while it is high - which is what [`Sx1262::xfer`]
 //! guarantees for all of them.
 
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use esp_hal::gpio::{Input, Output};
 use esp_hal::spi::master::Spi;
 use esp_hal::Blocking;
@@ -124,6 +124,13 @@ pub enum FallbackMode {
     StandbyRc = 0x20,
 }
 
+/// How long [`Sx1262::wait_on_busy`] waits before deciding the radio is not
+/// going to answer.
+///
+/// Comfortably past the longest BUSY the chip produces: a full `Calibrate`
+/// of every block takes about 3.5 ms, and startup after NRESET is similar.
+const BUSY_TIMEOUT_MS: u64 = 50;
+
 /// Timeout value that selects continuous RX.
 ///
 /// On the SX126x the `SetRx` timeout doubles as a mode select: 0x000000 is
@@ -188,12 +195,26 @@ impl<'d> Sx1262<'d> {
         self.dio1.is_high()
     }
 
-    /// Spin until the radio releases BUSY.
+    /// Spin until the radio releases BUSY, or [`BUSY_TIMEOUT_MS`] passes.
     ///
     /// The SX126x silently ignores commands sent while BUSY is high, so
     /// this runs before every transaction.
+    ///
+    /// The timeout is what makes a dead radio diagnosable. BUSY is an input
+    /// with no pull, so a radio that is absent, held in reset or wired to
+    /// the wrong pad floats this line - and an unbounded spin here hangs
+    /// the firmware inside `init`, before the diagnostic that would have
+    /// named the problem ever runs. Giving up and letting the transaction
+    /// proceed produces a garbage status byte instead, which
+    /// [`crate::radio::Sx1262Driver::print_diagnostics`] reports as a radio
+    /// that is not responding.
     fn wait_on_busy(&self) {
-        while self.busy.is_high() {}
+        let deadline = Instant::now() + Duration::from_millis(BUSY_TIMEOUT_MS);
+        while self.busy.is_high() {
+            if Instant::now() > deadline {
+                return;
+            }
+        }
     }
 
     /// One SPI transaction with NSS held across it, replacing `buf` with

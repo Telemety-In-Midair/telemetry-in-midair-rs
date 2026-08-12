@@ -195,7 +195,15 @@ impl<'d> Sx1262Driver<'d> {
         // actual output level is set via the TX params below.
         self.radio.set_pa_config(0x04, 0x07);
         // Ramp time 0x04 = 200 us.
-        self.radio.set_tx_params(cfg.power_dbm, 0x04);
+        //
+        // Clamped rather than passed through. The TOML parser range-checks
+        // this key, but `RadioConfig::decode` does not - it takes the byte
+        // as an i8 - so a blob from anywhere else can name a level the HP
+        // PA has no setting for. The datasheet gives -9..+22 and says
+        // nothing about what the part does outside it, which is not a
+        // question to answer with a PA.
+        self.radio
+            .set_tx_params(cfg.power_dbm.clamp(-9, 22), 0x04);
 
         // Applied after the PA is configured, since configuring it is what
         // this compensates for. The board's antenna is a connector and a
