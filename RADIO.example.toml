@@ -54,17 +54,25 @@ rx_boost = true
 rx_boost_description = "Boosted receiver gain: roughly +2 dB of sensitivity for a few mA more current whenever the node is listening."
 
 # The four keys below describe the board the firmware is running on, not a
-# preference. The defaults are the Wio-E5's own hardware; change them only
+# preference. The defaults are the Wio-S3's own hardware; change them only
 # for a different module, where a wrong value means a radio that does not
 # start rather than one that performs badly.
+#
+# The two RF-path keys are the dangerous pair. Inside the module, SX1262
+# DIO2 is the VCTL of an SKY13453-385LF antenna switch and DIO3 is that
+# same switch's VDD. Turning the switch off, or supplying it below the
+# 2.5 V its datasheet specifies, leaves the PA transmitting +22 dBm into an
+# isolated port - which destroys the module rather than shortening its
+# range. The firmware therefore refuses both, logs that it did, and runs
+# the board's values instead; these keys are here to be read, not retuned.
 # dcdc_enabled = true
-# dcdc_enabled_description = "Use the internal DC-DC (SMPS) WIO-E5 supports this."
+# dcdc_enabled_description = "Use the internal DC-DC (SMPS). The Wio-S3 carries the inductor it needs."
 
-# dio2_rf_switch = false
-# dio2_rf_switch_description = "Let the radio drive its own antenna switch from DIO2 (SetDio2AsRfSwitchCtrl). On for a module whose RF port runs into an external switch or front-end, off for one that feeds a connector directly. The Wio-E5's radio is on-die with no bonded DIO2, so it ignores this and switches the antenna from MCU pins."
+# dio2_rf_switch = true
+# dio2_rf_switch_description = "Let the radio drive its own antenna switch from DIO2 (SetDio2AsRfSwitchCtrl). The Wio-S3 wires DIO2 to the SKY13453-385LF between the PA and the LoRa port, so this must stay on; the firmware ignores an off."
 
-# tcxo_volts = "1.8"
-# tcxo_volts_description = "Supply the radio drives the TCXO at. Wio-E5 uses a 1.8V part."
+# tcxo_volts = "3.3"
+# tcxo_volts_description = "Supply the radio drives DIO3 at. Named for the TCXO, but on the Wio-S3 DIO3 is also the antenna switch's VDD, specified 2.5-3.5 V - so only 2.7, 3.0 and 3.3 are usable and the firmware raises anything lower."
 # tcxo_volts_type = "enum:1.6,1.7,1.8,2.2,2.4,2.7,3.0,3.3"
 
 # tcxo_startup_ms = 10

@@ -10,8 +10,9 @@
 //! Three things changed with the hardware:
 //!
 //! - The antenna switch is inside the module instead of on two MCU pins,
-//!   so `RfPath` is gone. If the board needs the switch driven, the radio
-//!   does it from DIO2 - see `dio2_rf_switch` in the config.
+//!   so `RfPath` is gone. The radio drives it from DIO2 and supplies it
+//!   from DIO3, both of which `init` fixes at the board's values rather
+//!   than reading from the config.
 //! - DIO1 is a real pin, so a receive poll costs a GPIO read rather than
 //!   an SPI round trip until something actually arrives.
 //! - Transmit waits are `.await` rather than a spin that has to feed the
@@ -36,6 +37,19 @@ pub enum Sx1262Error {
 /// accept. Every transmit has to narrow it to the size of the frame being
 /// sent, so receiving means putting it back.
 const RX_MAX_PAYLOAD: u8 = 255;
+
+/// Lowest `SetDio3AsTcxoCtrl` trim the Wio-S3 may be driven at: 2.7 V.
+///
+/// DIO3 is not only the TCXO supply on this module. It is also the VDD of
+/// the SKY13453-385LF antenna switch, specified 2.5 - 3.5 V, and the
+/// switch's truth table calls any state outside that undefined. A config
+/// naming a lower voltage - 1.8 V is the Wio-E5 value and was the default
+/// here for a while - leaves the switch undefined while the PA transmits
+/// into it, so it is raised to the board's own 3.3 V rather than honored.
+const TCXO_TRIM_MIN: u8 = 0x5;
+/// The trim this board wants: 3.3 V, inside the switch's window with room
+/// on both sides.
+const TCXO_TRIM_BOARD: u8 = 0x7;
 
 /// Image calibration bounds for operation at `freq_hz`, as the `(f1, f2)`
 /// byte pair `CalibrateImage` takes.
@@ -136,16 +150,32 @@ impl<'d> Sx1262Driver<'d> {
             .modify_reg(reg::SMPS_C0, |v| v | reg::SMPS_CLK_DET_EN);
         self.radio.set_regulator_mode(cfg.dcdc_enabled);
 
-        // Whether the radio drives the board's antenna switch itself. On
-        // the WL this was two MCU pins and could never be a setting; here
-        // it is one command, and getting it wrong means a PA ramping into
-        // a switch nobody moved.
-        self.radio.set_dio2_as_rf_switch(cfg.dio2_rf_switch);
+        // The radio drives this board's antenna switch itself: DIO2 is the
+        // SKY13453-385LF's VCTL. Unconditional, and deliberately not read
+        // from the config - a config that said false would put the PA into
+        // an isolated port on every transmission, and no setting a user can
+        // reach should be able to ask for that.
+        if !cfg.dio2_rf_switch {
+            println!("config: dio2_rf_switch=false ignored, this board needs it on");
+        }
+        self.radio.set_dio2_as_rf_switch(true);
 
-        // The radio powers the 32 MHz TCXO from DIO3 and waits for it to
-        // settle before using the clock.
+        // DIO3 supplies the 32 MHz TCXO *and* that same antenna switch's
+        // VDD, so it is floored at the switch's 2.5 V minimum rather than
+        // taken as given. The radio waits `tcxo_startup_ms` for both to
+        // come up before it will use the clock.
+        let trim = cfg.tcxo_volts.trim();
+        let trim = if trim < TCXO_TRIM_MIN {
+            println!(
+                "config: tcxo_volts trim {} is under the RF switch's 2.5 V floor, using 3.3 V",
+                trim
+            );
+            TCXO_TRIM_BOARD
+        } else {
+            trim
+        };
         self.radio
-            .set_tcxo_ctrl(cfg.tcxo_volts.trim(), cfg.tcxo_startup_ms as u32);
+            .set_tcxo_ctrl(trim, cfg.tcxo_startup_ms as u32);
 
         // Recalibrate every block now that there is a 32 MHz clock. The
         // automatic calibration at power-up ran before the TCXO was

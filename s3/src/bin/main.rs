@@ -414,11 +414,11 @@ async fn hardware_task(
     mut sdlog: SdLog<'static>,
     mut d5: Output<'static>,
 ) {
-    // The module wires SX1262 DIO2 to the SKY13453 RF switch's VCTL, so
-    // the radio has to drive its own antenna path. Without this every
-    // transmission ramps the PA into an isolated switch.
-    let mut cfg = RadioConfig::default();
-    cfg.dio2_rf_switch = true;
+    // The module wires SX1262 DIO2 to the SKY13453 RF switch's VCTL and
+    // DIO3 to its VDD, so the radio owns its own antenna path. Both are
+    // enforced inside `init` rather than set here: this config is the
+    // firmware's own, but the one that arrives over BLE is not.
+    let cfg = RadioConfig::default();
     lora.init(&cfg).await;
     if !lora.print_diagnostics() {
         println!("radio did not answer - check the pin map in main");

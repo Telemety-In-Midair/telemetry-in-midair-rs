@@ -21,7 +21,7 @@
 //! coding_rate = 5           # 4/5 .. 4/8
 //! power_dbm = 22            # -9 .. 22
 //! rx_boost = true           # boosted RX gain, ~+2 dB for more RX current
-//! dio2_rf_switch = false    # radio drives its own antenna switch on DIO2
+//! dio2_rf_switch = true     # radio drives its own antenna switch on DIO2
 //!
 //! [mesh]
 //! address = 1               # 1-255
@@ -112,11 +112,16 @@ impl Role {
 
 /// Supply voltage the radio drives the TCXO at (`SetTcxoMode` trim field).
 ///
-/// This is a property of the crystal fitted to the board, not a preference.
-/// The Wio-E5 module's TCXO is a 1.8 V part; the other values exist for
-/// boards built around a different one, and setting a value the hardware
-/// does not expect stops the oscillator starting, which takes the radio
-/// with it.
+/// This is a property of the board, not a preference. Setting a value the
+/// hardware does not expect stops the oscillator starting, which takes the
+/// radio with it.
+///
+/// On the Wio-S3 the pin does double duty and the floor is not the TCXO's.
+/// DIO3 also supplies the SKY13453-385LF antenna switch, whose VDD is
+/// specified 2.5 - 3.5 V, so only "2.7", "3.0" and "3.3" are usable at all;
+/// below 2.5 V the switch's own truth table calls the part undefined. See
+/// [`RadioConfig::dio2_rf_switch`] for what an undefined switch does to a
+/// transmitting PA.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TcxoVolts {
     V1_6,
@@ -331,7 +336,7 @@ pub struct RadioConfig {
     pub bandwidth_khz: u16,
     /// LoRa coding rate denominator: 5-8 for 4/5..4/8.
     pub coding_rate: u8,
-    /// TX power in dBm (-9..22 on the STM32WLE5 high-power PA).
+    /// TX power in dBm (-9..22 on the SX1262 high-power PA).
     pub power_dbm: i8,
     /// Receiver boosted gain (SX126x `RxGain` register). Roughly +2 dB of
     /// sensitivity for a few mA more while listening; the chip powers up
@@ -403,25 +408,27 @@ pub struct RadioConfig {
     /// RX and TX current at 3.3 V.
     ///
     /// The SMPS needs the module's inductor fitted, so this is only safe to
-    /// leave on for boards that have one - the Wio-E5 does. Turning it off
+    /// leave on for boards that have one - the Wio-S3 does. Turning it off
     /// costs current but is safe anywhere.
     pub dcdc_enabled: bool,
     /// Let the radio drive its own antenna switch from DIO2
     /// (`SetDio2AsRfSwitchCtrl`, opcode 0x9D).
     ///
     /// This is a property of how the module's RF port is wired, not a
-    /// tuning choice. A part that feeds a connector directly has no switch
-    /// to drive and wants this off, which is also the chip's power-up
-    /// state; one whose RF pads run into an external switch or front-end
-    /// needs it on, or the antenna is never joined to the PA and every
-    /// transmission goes nowhere.
-    ///
-    /// Only a discrete SX1262 can honor it. The STM32WLE5's radio is
-    /// on-die with no bonded DIO2 and no such opcode in its table, so that
-    /// firmware parses the key and ignores it, switching the antenna from
-    /// MCU GPIOs instead.
+    /// tuning choice, and on the Wio-S3 there is only one correct answer.
+    /// DIO2 is the VCTL of an SKY13453-385LF between the PA and the LoRa
+    /// antenna port; left off, VCTL never rises, the switch parks on the
+    /// path that is not the PA, and every transmission ramps +22 dBm into
+    /// an isolated port. That is a PA-destroying condition, not a range
+    /// problem, which is why [`crate::radiocfg`] defaults it on and the
+    /// firmware refuses to honor an off.
     pub dio2_rf_switch: bool,
-    /// Supply the radio drives the TCXO at.
+    /// Supply the radio drives DIO3 at.
+    ///
+    /// Named for the TCXO because that is the command
+    /// (`SetDio3AsTcxoCtrl`), but on the Wio-S3 the same pin is also the
+    /// antenna switch's VDD - see [`TcxoVolts`] for the floor that puts
+    /// under it.
     pub tcxo_volts: TcxoVolts,
     /// How long the radio waits for the TCXO to stabilize before it will
     /// use the clock, in milliseconds.
@@ -484,14 +491,17 @@ impl Default for RadioConfig {
             // detailed build is the one to ship and quieting it is the
             // deliberate choice.
             verbose: true,
-            // The Wio-E5 carries the SMPS inductor and a 1.8 V TCXO; these
-            // defaults are that module's hardware, not a tuning choice.
+            // The three below are the Wio-S3's hardware, not a tuning
+            // choice. The module carries the SMPS inductor, wires SX1262
+            // DIO2 to the antenna switch's VCTL, and wires DIO3 to that
+            // same switch's VDD.
             dcdc_enabled: true,
-            // Off is the chip's power-up state and the safe default: a
-            // board that does need DIO2 switching says so, and one that
-            // does not is left alone.
-            dio2_rf_switch: false,
-            tcxo_volts: TcxoVolts::V1_8,
+            dio2_rf_switch: true,
+            // 3.3 V, not the 1.8 V a TCXO alone would want: DIO3 is the
+            // switch's supply and its specified minimum is 2.5 V. The
+            // Wio-E5 default this replaces would have left the switch
+            // undefined on every transmission.
+            tcxo_volts: TcxoVolts::V3_3,
             tcxo_startup_ms: 10,
             gps: GpsConfig::default(),
         }
@@ -1312,12 +1322,19 @@ mod tests {
     }
 
     #[test]
-    fn tcxo_and_regulator_defaults_match_the_wio_e5() {
+    /// The defaults are the Wio-S3's hardware. `tcxo_volts` in particular
+    /// is not free: DIO3 supplies the SKY13453-385LF antenna switch as well
+    /// as the TCXO, and that part is specified 2.5 - 3.5 V, so the 1.8 V
+    /// this used to carry from the Wio-E5 left the switch undefined with
+    /// the PA transmitting into it.
+    fn tcxo_and_regulator_defaults_match_the_wio_s3() {
         let cfg = RadioConfig::default();
         assert!(cfg.dcdc_enabled);
-        assert_eq!(cfg.tcxo_volts, TcxoVolts::V1_8);
-        assert_eq!(cfg.tcxo_volts.trim(), 0x2);
+        assert_eq!(cfg.tcxo_volts, TcxoVolts::V3_3);
+        assert_eq!(cfg.tcxo_volts.trim(), 0x7);
         assert_eq!(cfg.tcxo_startup_ms, 10);
+        // 0x5 is 2.7 V, the lowest trim at or above the switch's minimum.
+        assert!(cfg.tcxo_volts.trim() >= 0x5);
     }
 
     #[test]
@@ -1447,28 +1464,28 @@ mod tests {
         assert_eq!(RadioConfig::decode(&bytes), Some(cfg));
     }
 
-    /// The antenna switch is a board property, so a card that says nothing
-    /// about it must not turn it on, and the key must not ride on any of
-    /// the flag byte's other bits - a board told to drive DIO2 when there
-    /// is no switch, or not to when there is, transmits into a
-    /// disconnected antenna either way.
+    /// The antenna switch is a board property, and on the Wio-S3 it is
+    /// wired, so a card that says nothing about it must leave it on. The
+    /// key must also not ride on any of the flag byte's other bits: a board
+    /// that stops driving DIO2 ramps its PA into an isolated switch on
+    /// every transmission.
     #[test]
-    fn dio2_rf_switch_is_off_unless_asked() {
-        assert!(!RadioConfig::default().dio2_rf_switch);
+    fn dio2_rf_switch_is_on_unless_refused() {
+        assert!(RadioConfig::default().dio2_rf_switch);
         let quiet = parse("rx_boost = true\ndcdc_enabled = true\n").unwrap();
-        assert!(!quiet.dio2_rf_switch);
+        assert!(quiet.dio2_rf_switch);
 
-        let on = parse("dio2_rf_switch = true\n").unwrap();
-        assert!(on.dio2_rf_switch);
+        let off = parse("dio2_rf_switch = false\n").unwrap();
+        assert!(!off.dio2_rf_switch);
         // and it did not disturb the other bools sharing the flag byte
         let d = RadioConfig::default();
-        assert_eq!(on.rx_boost, d.rx_boost);
-        assert_eq!(on.sd_enabled, d.sd_enabled);
-        assert_eq!(on.verbose, d.verbose);
-        assert_eq!(on.dcdc_enabled, d.dcdc_enabled);
+        assert_eq!(off.rx_boost, d.rx_boost);
+        assert_eq!(off.sd_enabled, d.sd_enabled);
+        assert_eq!(off.verbose, d.verbose);
+        assert_eq!(off.dcdc_enabled, d.dcdc_enabled);
 
-        assert!(RadioConfig::decode(&on.encode()).unwrap().dio2_rf_switch);
-        assert!(!RadioConfig::decode(&d.encode()).unwrap().dio2_rf_switch);
+        assert!(!RadioConfig::decode(&off.encode()).unwrap().dio2_rf_switch);
+        assert!(RadioConfig::decode(&d.encode()).unwrap().dio2_rf_switch);
     }
 
     #[test]
