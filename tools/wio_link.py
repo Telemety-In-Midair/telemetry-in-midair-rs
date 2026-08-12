@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """Shared host-side transport for talking to the board over USB.
 
-The ESP32-C6 firmware exposes the same bulk-transfer protocol it serves over
-BLE on its USB Serial/JTAG console, framed with the midair-proto link framing
-(see proto/src/link.rs, module `usb`). Both a firmware image and a TOML radio
-config travel that path, differing only in the `kind` byte, so the framing,
-port detection and retry logic live here and the tools on top stay short.
+The firmware exposes the same bulk-transfer protocol it serves over BLE on
+its USB Serial/JTAG console, framed with the midair-proto link framing (see
+proto/src/link.rs, module `usb`). Framing, port detection and retry logic
+live here so the tools on top stay short.
 
-The ESP console shares this port, so its text is interleaved with the reply
+This outlived the two-MCU board it was written for. The framed protocol was
+the ESP32-C6's UART link to the WIO-E5 as well as its USB console; a single
+Wio-S3 has nothing to link to, but the host still speaks the console half of
+it, so the framing survives with only the transport gone.
+
+The console shares this port, so firmware text is interleaved with the reply
 frames; the frame parser resyncs past it by sync byte and CRC.
 """
 
@@ -36,7 +40,6 @@ OP_END = 0x03
 OP_ABORT = 0x04
 
 KIND_TOML = 1
-KIND_FIRMWARE = 2
 
 ACK_ID_BULK = 0x20
 ACK_OK = 0
@@ -46,8 +49,11 @@ STATUS_NAMES = {
     0x00: "OK",
     0x01: "unknown id",
     0x02: "bad value",
-    0x10: "WIO error (NAK from the WIO)",
-    0x11: "WIO link timeout (ESP got no ack from the WIO)",
+    # 0x10 and 0x11 named failures of the ESP32-C6's UART link to the
+    # WIO-E5. One MCU cannot fail that way, but the codes stay reserved so a
+    # board still running the old firmware reports something legible.
+    0x10: "radio error (NAK)",
+    0x11: "link timeout (no ack) - two-MCU firmware only",
     0x12: "bad state (a transfer is already active?)",
 }
 
@@ -57,8 +63,8 @@ DATA_CHUNK = 192
 # Espressif USB vendor id, used to auto-detect the port.
 ESPRESSIF_VID = 0x303A
 
-# How many times to retry a bulk op before giving up (transport hiccups and,
-# for OP_END, WIO-side link timeouts).
+# How many times to retry a bulk op before giving up (transport hiccups,
+# and the apply that OP_END triggers taking longer than one timeout).
 ATTEMPTS = 10
 
 # Repo root, resolved from this file so a task works from any CWD.
@@ -156,8 +162,8 @@ def read_frame(ser: serial.Serial, wanted: set, timeout: float):
 def read_console(ser: serial.Serial, match: str, timeout: float) -> str | None:
     """Watch the console for a line containing `match`, ignoring frames.
 
-    The WIO's own status lines reach this port, so a tool can confirm what
-    the board did rather than only that the transfer was acked.
+    The firmware's own status lines reach this port, so a tool can confirm
+    what the board did rather than only that the transfer was acked.
     """
     deadline = time.monotonic() + timeout
     line = bytearray()
@@ -182,7 +188,7 @@ def open_port(port: str | None) -> serial.Serial:
         for p in list_ports.comports():
             if p.vid == ESPRESSIF_VID:
                 port = p.device
-                print(f"auto-detected ESP port {port} ({p.description})")
+                print(f"auto-detected board port {port} ({p.description})")
                 break
     if port is None:
         raise SystemExit("no --port given and no Espressif USB serial port found")
@@ -191,13 +197,13 @@ def open_port(port: str | None) -> serial.Serial:
 
 
 def bulk_op(ser: serial.Serial, op_payload: bytes, timeout: float = 3.0):
-    """Send one bulk op and return (status, next_seq) from the ESP's ack."""
+    """Send one bulk op and return (status, next_seq) from the board's ack."""
     ser.reset_input_buffer()
     ser.write(build_frame(USB_BULK, op_payload))
     ser.flush()
     frame, info = read_frame(ser, {USB_BULK_ACK}, timeout)
     if frame is None:
-        raise TimeoutError(f"no ack from ESP ({info})")
+        raise TimeoutError(f"no ack from the board ({info})")
     _, payload = frame
     if len(payload) < 2 or payload[0] != ACK_ID_BULK:
         raise ValueError(f"unexpected ack payload {payload.hex()}")
@@ -210,7 +216,7 @@ def bulk_op_retry(ser: serial.Serial, op_payload: bytes, timeout: float, label: 
                   attempts: int = ATTEMPTS) -> tuple[int, int]:
     """`bulk_op` with retries on transport hiccups (a lost/garbled ack).
 
-    Retrying is safe: the ESP and WIO both de-duplicate by sequence number,
+    Retrying is safe: the firmware de-duplicates by sequence number,
     so re-sending the same frame either re-acks (already applied) or applies
     it now. A returned protocol status (incl. a NAK) is passed straight back
     to the caller; only transport failures (timeout / bad ack frame) retry.
@@ -230,13 +236,13 @@ def bulk_op_retry(ser: serial.Serial, op_payload: bytes, timeout: float, label: 
 
 
 def send_end(ser: serial.Serial, attempts: int = ATTEMPTS) -> None:
-    """Finalize the transfer (OP_END), robust to both a dropped ESP ack and a
-    WIO-side link timeout. Returns on success; raises on a definitive failure.
+    """Finalize the transfer (OP_END). Returns on success; raises on a
+    definitive failure.
 
-    The end step erases/CRC-checks flash and the WIO reboots, so its ack can
-    be lost more easily than a data ack - hence the extra WIO-timeout retry on
-    top of the transport retry. The ESP keeps the transfer open on a WIO
-    timeout, so re-sending OP_END is safe.
+    The end step erases and CRC-checks flash, so its ack can be lost more
+    easily than a data ack - hence the retries on top of the transport ones.
+    The firmware keeps the transfer open when it does not confirm, so
+    re-sending OP_END is safe.
     """
     for attempt in range(1, attempts + 1):
         last = attempt >= attempts
@@ -244,29 +250,29 @@ def send_end(ser: serial.Serial, attempts: int = ATTEMPTS) -> None:
             status, _ = bulk_op(ser, bytes([OP_END]), timeout=8.0)
         except (TimeoutError, ValueError) as e:
             if last:
-                raise TimeoutError(f"end: no ESP reply after {attempts} tries ({e})") from e
+                raise TimeoutError(f"end: no reply after {attempts} tries ({e})") from e
             print(f"\n  end: {e}; retry {attempt}/{attempts - 1}", flush=True)
             ser.reset_input_buffer()
             time.sleep(0.2 * attempt)
             continue
         if status == ACK_OK:
             return
-        # 0x11 = WIO link timeout: the round-trip did not complete; the ESP
-        # kept the transfer open, so retrying is safe.
+        # 0x11: the round-trip did not complete and the transfer stayed
+        # open, so retrying is safe.
         if status == 0x11 and not last:
             print(f"\n  end: {status_str(status)}; retry {attempt}/{attempts - 1}", flush=True)
             time.sleep(0.3)
             continue
-        # 0x12 = ESP has no active transfer. On a retry this means a previous
+        # 0x12 = no active transfer. On a retry this means a previous
         # OP_END already finalized it (its ack was lost) - the work is
         # committed, so treat as success. On the first try it is a real error
         # (state vanished without finishing).
         if status == 0x12 and attempt > 1:
-            print("\n  end: ESP reports the transfer already finalized; "
+            print("\n  end: board reports the transfer already finalized; "
                   "treating as success")
             return
         raise RuntimeError(f"end/verify failed: status {status_str(status)}")
-    raise TimeoutError(f"end: WIO never confirmed after {attempts} tries")
+    raise TimeoutError(f"end: never confirmed after {attempts} tries")
 
 
 def ping(ser: serial.Serial) -> bool:
@@ -278,7 +284,7 @@ def ping(ser: serial.Serial) -> bool:
 
 
 def query_ble_address(ser: serial.Serial, timeout: float = 2.0) -> str | None:
-    """Ask the ESP for its BLE address on demand; return "FF:C6:..." or None.
+    """Ask the board for its BLE address on demand; return "FF:.." or None.
 
     The reply is [USB_INFO, addr[0]..addr[5]] with the address most-
     significant octet first, so it prints directly.
@@ -301,7 +307,7 @@ def send_bulk(ser: serial.Serial, kind: int, data: bytes, version: int = 0,
 
     Raises SystemExit with a diagnosis on a protocol rejection, or lets
     TimeoutError/RuntimeError out after a best-effort abort. `hint` is
-    appended to the "WIO is not answering" diagnosis, for advice that only
+    appended to the "board is not answering" diagnosis, for advice that only
     makes sense for one kind of transfer.
     """
     import zlib
@@ -316,8 +322,8 @@ def send_bulk(ser: serial.Serial, kind: int, data: bytes, version: int = 0,
             msg = f"begin rejected: status {status_str(status)}"
             if status in (0x10, 0x11):
                 msg += (
-                    "\nthe ESP could not get an ack from the WIO. Is the WIO running "
-                    "working firmware, powered (ESP GPIO2 rail on) and not held in reset?"
+                    "\nthe firmware did not accept the transfer. Is the board running "
+                    "working firmware and not held in reset?"
                 ) + hint
             raise SystemExit(msg)
         seq = 0
@@ -336,7 +342,7 @@ def send_bulk(ser: serial.Serial, kind: int, data: bytes, version: int = 0,
             print()
         send_end(ser)
     except (TimeoutError, RuntimeError, SystemExit):
-        # Best-effort abort so the WIO/ESP do not sit waiting for the rest.
+        # Best-effort abort so the board does not sit waiting for the rest.
         try:
             bulk_op(ser, bytes([OP_ABORT]), timeout=1.0)
         except (TimeoutError, ValueError):

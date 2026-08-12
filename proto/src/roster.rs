@@ -15,7 +15,7 @@
 //! spend air time on and `tod_ms` is not among the defaults, so there is
 //! nothing in a beacon to age it by.
 //!
-//! This lives in the shared crate rather than the ESP firmware because it
+//! This lives in the shared crate rather than the firmware because it
 //! emits the exact BLE byte layouts (see [`crate::ble`]) and can be tested
 //! on the host, which a `no_std` binary cannot be.
 
@@ -35,9 +35,9 @@ pub const TTL_MS: u64 = 30 * 60 * 1000;
 /// What a node last told us, in the bytes the link delivered.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Report {
-    /// [`link::msg::POSITION`] payload: `[src, rssi, packet]`.
+    /// Position report: `[src, rssi, packet]`.
     Position([u8; ble::REMOTE_LEN]),
-    /// [`link::msg::PING`] payload: `[src, rssi, flags, uptime]`.
+    /// Node ping: `[src, rssi, flags, uptime]`.
     Ping([u8; link::PING_LEN]),
 }
 

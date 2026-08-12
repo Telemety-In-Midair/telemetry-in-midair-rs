@@ -3,7 +3,7 @@ name = "midair-proto"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Shared protocol for the telemetry-in-midair board: ESP32-C6 <-> WIO-E5 UART link, LoRa payloads, BLE extensions, radio TOML config"
+description = "Shared protocol for the telemetry-in-midair board: LoRa payloads, BLE extensions, radio TOML config, USB bulk framing"
 
 # no_std (except under test). Depends only on gps-proto (also no_std) so both
 # firmwares and host tests can use it.

@@ -1,4 +1,9 @@
-//! Framed UART protocol between the ESP32-C6 and the WIO-E5.
+//! The framed command protocol, and the bulk transfer built on it.
+//!
+//! This was the UART link between the ESP32-C6 and the WIO-E5. The Wio-S3
+//! board has one MCU and no link, but the host tools speak the same framing
+//! over USB (module `usb`) to push a radio config, so the codec outlived
+//! its transport. Command ids are still grouped by the direction they had.
 //!
 //! Frame format (same scheme as the long-range-radio basestation link):
 //!   `[SYNC 0xAA] [LEN_LO] [LEN_HI] [CMD] [PAYLOAD: LEN bytes] [CRC8]`
@@ -13,113 +18,30 @@ pub const SYNC: u8 = 0xAA;
 /// Maximum payload size per frame.
 pub const MAX_PAYLOAD: usize = 256;
 
-/// UART baud rate on the ESP <-> WIO link.
-pub const BAUD: u32 = 115_200;
+// The two-MCU command sets that used to sit here - `cmd` (ESP32-C6 ->
+// WIO-E5, 0x01-0x3F) and `msg` (WIO-E5 -> ESP32-C6, 0x40-0x7F) - are gone
+// with the link itself. Every one of them was a round trip between two
+// chips: PING to prove the link alive, RADIO_BUSY to negotiate who owned
+// the air, WIO_SLEEP because the ESP could not power the WIO down, and the
+// CFG_*/FW_* transfers. On one MCU those are a function call, a mutex, one
+// sleep story, and ESP-IDF OTA. The id ranges stay unallocated so a board
+// still running the old firmware cannot be half-understood by a new tool.
 
-// -- Command ids: ESP32-C6 -> WIO-E5 (0x01-0x3F) ---------------------------
-
-pub mod cmd {
-    /// No payload. WIO answers with [`super::resp::ACK`] (value = fw version).
-    pub const PING: u8 = 0x01;
-
-    /// `[flag u8]` - 1: the ESP radio (BLE) is busy, the WIO should defer
-    /// discretionary LoRa transmissions; 0: clear. The flag expires on the
-    /// WIO after [`super::RADIO_BUSY_TIMEOUT_MS`] in case the clear is lost.
-    pub const RADIO_BUSY: u8 = 0x02;
-
-    /// `[flag u8]` - 1: WIO enters soft sleep (radio to standby, GPS and SD
-    /// idle, slow loop); 0: wake back up.
-    pub const WIO_SLEEP: u8 = 0x03;
-
-    /// `[flag u8]` - 1: put the GPS into backup mode (UBX-RXM-PMREQ);
-    /// 0: wake it (EXTINT pulse + UART traffic).
-    pub const GPS_SLEEP: u8 = 0x04;
-
-    // Radio TOML config transfer (applied on END, also saved to SD).
-    /// `[total_len u16le]` - start a config transfer.
-    pub const CFG_BEGIN: u8 = 0x10;
-    /// `[seq u16le, bytes...]` - config file data, in order.
-    pub const CFG_DATA: u8 = 0x11;
-    /// `[crc32 u32le]` - end of config; WIO verifies, parses and applies.
-    pub const CFG_END: u8 = 0x12;
-    /// No payload. Ask the WIO to report its current radio configuration; it
-    /// answers with [`super::msg::CONFIG`] (there is no ACK - the config blob
-    /// is the reply). Sent when the ESP wants the value fresh, e.g. on a BLE
-    /// connect or when the link first comes up.
-    pub const CFG_READ: u8 = 0x13;
-
-    // Firmware update (written into the WIO DFU partition; the swap
-    // bootloader installs it on the reboot that follows FW_END).
-    /// `[size u32le, crc32 u32le, version u16le]`.
-    pub const FW_BEGIN: u8 = 0x20;
-    /// `[seq u16le, bytes...]` - firmware data, in order.
-    pub const FW_DATA: u8 = 0x21;
-    /// No payload. WIO verifies the CRC, marks the swap and reboots.
-    pub const FW_END: u8 = 0x22;
-    /// No payload. Abandon an in-progress transfer.
-    pub const FW_ABORT: u8 = 0x23;
-}
-
-// -- Command ids: WIO-E5 -> ESP32-C6 (0x40-0x7F) ---------------------------
-
-pub mod msg {
-    /// `[src u8, rssi i16le, PositionPacket 20B]` - a position report.
-    /// `src` 0 is the local GPS; other values are the addresses of nodes
-    /// whose broadcast we received (rssi is then the LoRa RSSI in dBm).
-    pub const POSITION: u8 = 0x40;
-
-    /// [`super::Telemetry`] wire format - periodic link/radio status.
-    pub const STATUS: u8 = 0x41;
-
-    /// `[flag u8]` - 1: LoRa TX in progress or imminent, the ESP should
-    /// defer discretionary BLE traffic; 0: clear. Expires like RADIO_BUSY.
-    pub const RADIO_BUSY: u8 = 0x42;
-
-    /// `[src u8, rssi i16le, payload...]` - a received LoRa payload that is
-    /// not a position, forwarded verbatim.
-    pub const LORA_RX: u8 = 0x43;
-
-    /// `[text: ASCII bytes]` - a human-readable status/log line. The ESP
-    /// prints it to its console and notifies it over BLE (no ACK). Payload
-    /// is at most [`super::LOG_MAX`] bytes.
-    pub const LOG: u8 = 0x44;
-
-    /// `[src u8, rssi i16le, flags u8, uptime_s u16le]` - a remote node
-    /// reporting that it is on the air without a position
-    /// ([`crate::lora::Ping`]), [`super::PING_LEN`] bytes.
-    ///
-    /// Sent alongside the [`LOG`] line that describes it, because the two
-    /// answer different questions: the log line is for a human reading the
-    /// console, this is for an app that has to show which nodes are alive
-    /// and why the ones without a position have none. Without it a node
-    /// that never gets a fix is visible only as prose.
-    pub const PING: u8 = 0x46;
-
-    /// [`crate::radiocfg::RadioConfig::encode`] blob - the WIO's current radio
-    /// configuration. The ESP caches it and serves it on the BLE radio-config
-    /// characteristic ([`crate::ble::RADIO_CONFIG_UUID`]) without parsing it.
-    /// Sent unprompted at boot and after a new config is applied, and in
-    /// reply to [`super::cmd::CFG_READ`], so the ESP re-learns it whether the
-    /// change was local to the WIO or the ESP restarted under a running WIO.
-    pub const CONFIG: u8 = 0x45;
-}
-
-/// Host <-> ESP32-C6 commands carried over the ESP's USB Serial/JTAG port,
-/// framed identically to the ESP <-> WIO link. They let a computer push a
-/// WIO firmware image straight through the ESP without BLE.
+/// Host <-> board commands carried over the USB Serial/JTAG port, framed as
+/// above. They let a computer push a radio config without BLE.
 pub mod usb {
-    /// Host -> ESP, no payload. ESP answers [`super::resp::ACK`]
+    /// Host -> board, no payload. The board answers [`super::resp::ACK`]
     /// (`[PING, 1, 0]`) so a tool can confirm it found the firmware.
     pub const PING: u8 = 0x50;
-    /// Host -> ESP, `[bulk op bytes]` - one bulk op in the [`crate::ble`]
-    /// wire format (`OP_BEGIN`/`OP_DATA`/`OP_END`/`OP_ABORT`). The ESP runs
-    /// it through the same path as a BLE bulk write and replies with
+    /// Host -> board, `[bulk op bytes]` - one bulk op in the [`crate::ble`]
+    /// wire format (`OP_BEGIN`/`OP_DATA`/`OP_END`/`OP_ABORT`). The board
+    /// runs it through the same path as a BLE bulk write and replies with
     /// [`BULK_ACK`].
     pub const BULK: u8 = 0x51;
-    /// ESP -> host, `[id, status, value...]` - the gps-proto ack bytes the
-    /// bulk op produced (status 0 = OK).
+    /// Board -> host, `[id, status, value...]` - the gps-proto ack bytes
+    /// the bulk op produced (status 0 = OK).
     pub const BULK_ACK: u8 = 0x52;
-    /// Host -> ESP, no payload. ESP answers [`super::resp::ACK`]
+    /// Host -> board, no payload. The board answers [`super::resp::ACK`]
     /// (`[INFO, addr[0]..addr[5]]`) with its BLE address most-significant
     /// octet first, so a tool can read a board's address on demand rather
     /// than having to catch the one line it prints at boot.
@@ -147,51 +69,46 @@ pub mod err {
     pub const SD_ERROR: u8 = 0x08;
 }
 
-/// A radio-busy flag from the peer expires after this long without a
-/// refresh, so a lost "clear" frame cannot wedge the other side.
-pub const RADIO_BUSY_TIMEOUT_MS: u32 = 3_000;
-
-/// Data bytes per FW_DATA/CFG_DATA frame. Sized well below [`MAX_PAYLOAD`]
-/// so a frame plus response turnaround stays short at 115200 baud.
+/// Data bytes per bulk-data frame. Sized well below [`MAX_PAYLOAD`] so a
+/// frame plus response turnaround stays short.
 pub const DATA_CHUNK: usize = 192;
 
-/// Maximum bytes in a [`msg::LOG`] status line (and the matching BLE
-/// characteristic value). Longer lines are truncated at the source.
+/// Maximum bytes in a status/log line (and the matching BLE characteristic
+/// value). Longer lines are truncated at the source.
 ///
-/// The longest line the WIO builds is the verbose radio breakdown, which
+/// The longest line the firmware builds is the verbose radio breakdown, which
 /// runs to about 115 bytes once the drop counters reach six digits; 64 cut
 /// it mid-word. A central that never negotiates its ATT MTU up still only
 /// sees the first MTU - 3 bytes of whatever arrives.
 pub const LOG_MAX: usize = 128;
 
-/// Payload length of [`msg::PING`]: src + rssi + the two on-air ping fields.
+/// Length of a node-ping report: src + rssi + the two on-air ping fields,
+/// laid out `[src u8, rssi i16le, flags u8, uptime_s u16le]`.
 ///
 /// Not [`crate::lora::PING_MSG_LEN`], which is the length of the ping as it
 /// travels over LoRa - this one has the receiver's src/rssi in front of it
 /// and no message tag.
 pub const PING_LEN: usize = 1 + 2 + 1 + 2;
 
-// -- Telemetry (WIO -> ESP -> BLE) ------------------------------------------
+// -- Telemetry (served over BLE) --------------------------------------------
 
 /// Set in [`Telemetry::flags`] when the SD card is initialized and logging.
 pub const TELEM_FLAG_SD_OK: u8 = 0x01;
 /// Set when the GPS currently has a fix.
 pub const TELEM_FLAG_GPS_FIX: u8 = 0x02;
-/// Set when the radio config was loaded from SD/UART (not defaults).
+/// Set when the radio config was loaded from SD or BLE (not defaults).
 pub const TELEM_FLAG_CFG_LOADED: u8 = 0x04;
 /// Set when the config asks for verbose console logging.
 ///
-/// The ESP never sees the config file - it streams the bytes through to the
-/// WIO without parsing them - so the WIO relays this one setting back as a
-/// flag bit. Riding on the periodic telemetry rather than a command of its
-/// own means the ESP re-learns it every few seconds, so a bit lost to a
-/// garbled frame corrects itself and a mid-session config push takes effect
-/// without either side tracking whether it was delivered.
+/// A flag bit rather than a value an app can read back: on the two-MCU
+/// board the BLE half never parsed the config file, so this was the one
+/// setting the radio half relayed. It stays because it is still the only
+/// place a connected app learns whether the console is verbose.
 pub const TELEM_FLAG_VERBOSE: u8 = 0x08;
 
 pub const TELEMETRY_LEN: usize = 16;
 
-/// Periodic WIO status, also served over BLE (see [`crate::ble`]).
+/// Periodic radio/GPS status, served over BLE (see [`crate::ble`]).
 ///
 /// Layout (little-endian): `last_rssi: i16, last_snr_cb: i16,
 /// secs_since_rx: u16, rx_count: u32, tx_count: u32, flags: u8, sats: u8`.
@@ -433,7 +350,7 @@ mod tests {
     #[test]
     fn frame_roundtrip() {
         let mut out = FrameBuf::new();
-        let bytes = out.build(cmd::FW_DATA, &[1, 2, 3, 4]);
+        let bytes = out.build(usb::BULK, &[1, 2, 3, 4]);
 
         let mut parser = FrameParser::new();
         let mut got = None;
@@ -443,13 +360,13 @@ mod tests {
                 got = Some((f.cmd, f.payload.to_vec()));
             }
         }
-        assert_eq!(got, Some((cmd::FW_DATA, vec![1, 2, 3, 4])));
+        assert_eq!(got, Some((usb::BULK, vec![1, 2, 3, 4])));
     }
 
     #[test]
     fn frame_resync_after_garbage() {
         let mut out = FrameBuf::new();
-        let bytes = out.build(msg::POSITION, &[9; 23]);
+        let bytes = out.build(usb::BULK_ACK, &[9; 23]);
 
         let mut parser = FrameParser::new();
         let mut hits = 0;
@@ -459,7 +376,7 @@ mod tests {
         for &b in [0x00, 0xAA, 0x02, 0x00, 0x55, 0x66, 0x77, 0x00].iter().chain(bytes) {
             if parser.feed(b) {
                 hits += 1;
-                assert_eq!(parser.frame().cmd, msg::POSITION);
+                assert_eq!(parser.frame().cmd, usb::BULK_ACK);
                 assert_eq!(parser.frame().payload.len(), 23);
             }
         }
@@ -475,13 +392,13 @@ mod tests {
             assert!(!parser.feed(b));
         }
         let mut out = FrameBuf::new();
-        let bytes = out.build(cmd::PING, &[]);
+        let bytes = out.build(usb::PING, &[]);
         let mut ok = false;
         for &b in bytes {
             ok |= parser.feed(b);
         }
         assert!(ok);
-        assert_eq!(parser.frame().cmd, cmd::PING);
+        assert_eq!(parser.frame().cmd, usb::PING);
         assert!(parser.frame().payload.is_empty());
     }
 

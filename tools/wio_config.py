@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Push a radio config to the WIO-E5 through the ESP32-C6's USB port.
+"""Push a radio config to the board over its USB port.
 
 Sets this node's address without editing a file by hand:
 
@@ -10,8 +10,8 @@ Other keys go through --set, repeatably:
     pixi run wio-config --address 3 --set role=tx_only --set interval_s=30
 
 The board applies the config immediately and stores it in two places - the
-SD card's RADIO.CFG and a backup page in the WIO's internal flash - so the
-change survives a power cycle with or without a card. Nothing is reflashed.
+SD card's RADIO.CFG and a backup in internal flash - so the change survives
+a power cycle with or without a card. Nothing is reflashed.
 The board reports which stores it reached, and this exits non-zero if it
 reached neither.
 
@@ -32,7 +32,7 @@ settings, pass the file holding them with --file and edit that instead:
 
 Comments and the `_description`/`_type` documentation keys are stripped
 before sending. They are inert to the firmware, and the reference file is
-several times the 1024-byte ceiling the ESP and WIO both enforce, so this is
+several times the 1024-byte ceiling the firmware enforces, so this is
 what makes a push fit at all. To produce a card-ready RADIO.CFG without
 sending anything:
 
@@ -47,13 +47,13 @@ import wio_link as link
 
 DEFAULT_CONFIG = link.ROOT / "RADIO.example.toml"
 
-# The parser on the WIO accepts 1-255; 0 is reserved to mark a packet as not
+# The firmware's parser accepts 1-255; 0 is reserved to mark a packet as not
 # one of ours (see proto/src/lora.rs).
 ADDRESS_MIN, ADDRESS_MAX = 1, 255
 
 # Largest config the firmware will take, enforced in three places that must
-# agree: the ESP's OP_BEGIN check, wio/src/cfgxfer.rs CONFIG_MAX, and the
-# buffer the WIO reads RADIO.CFG into at boot.
+# agree: the firmware's OP_BEGIN check and the buffer it reads RADIO.CFG
+# into at boot.
 CONFIG_MAX = 1024
 
 
@@ -87,8 +87,8 @@ def strip_docs(text: str) -> str:
 
     The reference file spends most of its bytes documenting itself for an
     editor, and the firmware ignores every one of those keys. That matters
-    because CONFIG_MAX is 1024 bytes on both the ESP's begin check and the
-    WIO's transfer buffer, and the documented file is several times that -
+    because CONFIG_MAX is 1024 bytes on both the begin check and the transfer
+    buffer, and the documented file is several times that -
     so this is what makes a push possible at all, not a size optimization.
     """
     out = []
@@ -189,21 +189,21 @@ def main() -> int:
     print(f"sending {len(data)}/{CONFIG_MAX} bytes based on {args.file}")
     ser = link.open_port(args.port)
     if not link.ping(ser):
-        sys.exit("no PING reply - is the ESP running wio-e5-gps firmware?")
-    print("ESP link alive")
+        sys.exit("no PING reply - is the board running wio-s3-gps firmware?")
+    print("board responding")
 
     try:
         link.send_bulk(ser, link.KIND_TOML, data, version=0)
     except (TimeoutError, RuntimeError) as e:
-        # The WIO parses the file at the end of the transfer, so a value it
+        # The board parses the file at the end of the transfer, so a value it
         # rejects surfaces here rather than at begin - and looks identical to
         # a link fault unless it is spelled out.
         sys.exit(f"\nconfig push failed: {e}\n"
-                 "A WIO NAK at this stage usually means the file itself was "
+                 "A NAK at this stage usually means the file itself was "
                  "rejected: a value out of range or a string that is not one "
                  "of the choices. Check it with --dry-run.")
 
-    # The WIO logs "config applied, node N, <where it was saved>" once it has
+    # The board logs "config applied, node N, <where it was saved>" once it has
     # parsed and adopted the file, which is the only read-back there is: an
     # ack proves the bytes arrived, this proves which address is now live and
     # whether it will still be there after a power cycle.

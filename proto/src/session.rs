@@ -3,7 +3,7 @@
 //! unattended board sleeps between advertising windows.
 //!
 //! These decisions live in the shared crate rather than inline in the
-//! ESP32-C6 connection handler because they are the part where a mistake is
+//! connection handler because they are the part where a mistake is
 //! expensive: a board that mis-clamps an advertising window, or that lets a
 //! retry restart its advertising budget, stops being reachable over the air
 //! at all - and a `no_std` binary cannot be tested on the host.
@@ -25,7 +25,11 @@ use gps_proto::packet;
 /// saved - is a board that powers its GPS, which is what an unconfigured
 /// board should do.
 pub const PFLAG_PWR_OFF: u32 = 1 << 0;
-/// The WIO-E5 was asked to enter soft sleep.
+/// The radio was asked into standby.
+///
+/// Named for the WIO-E5's soft sleep, which existed because the ESP32-C6
+/// could not power the second MCU down mid-session. One MCU has one sleep
+/// story, so what survives is the radio half: standby instead of receive.
 pub const PFLAG_WIO_SLEEP: u32 = 1 << 1;
 /// The GPS was asked to enter backup mode.
 pub const PFLAG_GPS_SLEEP: u32 = 1 << 2;
@@ -83,8 +87,13 @@ impl Stored {
     /// A sleep-interval wake check comes up dark whatever the app asked
     /// for: the question a wake check exists to ask is whether anyone wants
     /// the board back, which needs BLE only, so a wake nobody answers never
-    /// pays for the WIO and the GPS. A connect raises the rail afterwards.
-    /// A cold boot follows the configured setting.
+    /// pays for the GPS. A connect raises the rail afterwards. A cold boot
+    /// follows the configured setting.
+    ///
+    /// The wio-s3-max-gps board has no such rail - the GPS and SD sit on
+    /// +3V3 - so its firmware logs [`Action::Rail`] and does nothing. The
+    /// policy stays here because it is tested, and a board respin could
+    /// bring the switch back.
     pub fn rail_at_boot(&self, woke_from_sleep: bool) -> bool {
         !woke_from_sleep && self.pwr_en()
     }
@@ -185,11 +194,13 @@ const V2_CRC_AT: usize = 16;
 pub enum Action {
     /// Drive the GPS/LoRa rail to this level.
     Rail(bool),
-    /// Ask the WIO to enter (`true`) or leave soft sleep. The ack in the
-    /// [`Outcome`] only holds if the WIO answers; a link failure replaces
-    /// it, and a wake that times out is retried as a reset pulse.
+    /// Put the radio into standby (`true`) or bring it back.
+    ///
+    /// This was a link frame and a wait for the WIO's answer, so the ack
+    /// the policy built was provisional. Same-chip it is a signal the
+    /// hardware loop picks up, and the ack always holds.
     WioSleep(bool),
-    /// Ask the WIO to put the GPS into (`true`) or out of backup mode.
+    /// Put the GPS into (`true`) or out of backup mode.
     GpsSleep(bool),
     /// The deep-sleep wake-check interval is now this many seconds
     /// (0 = sleep off). Already stored and already clamped.

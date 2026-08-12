@@ -4,9 +4,9 @@
 //! of a FAT card, where 8.3 short names allow only a three-character
 //! extension.
 //!
-//! The WIO-E5 loads this from the SD card at boot (`RADIO.CFG`) and/or
-//! receives it over UART from the ESP32-C6 (which in turn gets it over
-//! BLE). No TOML crate runs on these targets, so this is a small no_std
+//! The firmware loads this from the SD card at boot (`RADIO.CFG`) and/or
+//! receives it over BLE. No TOML crate runs on the target, so this is a
+//! small no_std
 //! parser for the subset the file needs: `key = value` pairs with integer,
 //! boolean and quoted-string values, `#` comments, and `[section]` headers
 //! (accepted and ignored - keys are unique across sections).

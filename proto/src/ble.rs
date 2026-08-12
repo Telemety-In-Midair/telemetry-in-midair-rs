@@ -1,4 +1,4 @@
-//! BLE GATT extensions served by the ESP32-C6.
+//! BLE GATT extensions served by the board's firmware.
 //!
 //! The board reuses the gps-proto service and its position/config/ack
 //! characteristics, so the existing gps-gui-rs app connects and streams
@@ -6,19 +6,20 @@
 //! (continuing the same UUID sequence) and new config command ids on the
 //! existing config characteristic.
 
-/// Name the ESP32-C6 advertises under. The service UUID (which the app
-/// filters scans by) stays `gps_proto::packet::SERVICE_UUID`.
-pub const DEVICE_NAME: &str = "GPS-C6";
+/// Name the board advertises under. The service UUID (which the app
+/// filters scans by) stays `gps_proto::packet::SERVICE_UUID`, so this is
+/// display text and renaming it does not break a scan.
+pub const DEVICE_NAME: &str = "GPS-S3";
 
 /// [`crate::link::Telemetry`] wire format, notify + read.
 pub const TELEMETRY_UUID: &str = "c3a10005-9f6e-4b2c-8f5a-2e32c3b1e5d0";
-/// Bulk transfer (radio TOML config / WIO firmware), write.
+/// Bulk transfer (radio TOML config), write.
 pub const BULK_UUID: &str = "c3a10006-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 /// Remote position: `[src u8, rssi i16le, PositionPacket 20B, age_s u16le]`,
 /// notify + read. One notification per report received, not per tick.
 pub const REMOTE_UUID: &str = "c3a10007-9f6e-4b2c-8f5a-2e32c3b1e5d0";
-/// WIO status/log line (ASCII), notify + read. Carries the latest
-/// [`crate::link::msg::LOG`] text, up to [`crate::link::LOG_MAX`] bytes.
+/// Status/log line (ASCII), notify + read. Carries the latest line, up to
+/// [`crate::link::LOG_MAX`] bytes.
 pub const LOG_UUID: &str = "c3a10008-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 
 pub const TELEMETRY_UUID_U128: u128 = 0xc3a10005_9f6e_4b2c_8f5a_2e32c3b1e5d0;
@@ -58,7 +59,7 @@ pub const REMOTE_AGE_OFF: usize = REMOTE_LEN;
 pub const NODE_PING_UUID: &str = "c3a1000b-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 pub const NODE_PING_UUID_U128: u128 = 0xc3a1000b_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 
-/// Node ping value length: the [`crate::link::msg::PING`] payload plus the
+/// Node ping value length: the [`crate::link::PING_LEN`] payload plus the
 /// same age field a remote position carries.
 pub const NODE_PING_LEN: usize = crate::link::PING_LEN + 2;
 
@@ -89,20 +90,17 @@ pub const AGE_MAX_S: u16 = u16::MAX;
 pub const SETTINGS_UUID: &str = "c3a10009-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 pub const SETTINGS_UUID_U128: u128 = 0xc3a10009_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 
-/// The WIO-E5's current radio configuration (the `RADIO.CFG` settings) as one
+/// The board's current radio configuration (the `RADIO.CFG` settings) as one
 /// [`crate::radiocfg::RadioConfig`] read-back blob, read + notify.
 ///
 /// The config only ever travels *to* the board, so this is the sole way to
 /// learn what a board is actually running - an app can populate its radio
-/// editor from the board instead of a local file it has to hope matches. The
-/// ESP never parses the config; it relays a snapshot the WIO encodes and
-/// sends over the link ([`crate::link::msg::CONFIG`]), refreshed on connect,
-/// on the link coming up, and whenever a new config is applied.
+/// editor from the board instead of a local file it has to hope matches.
+/// Refreshed on connect and whenever a new config is applied.
 ///
-/// The value is [`crate::radiocfg::RADIO_CONFIG_LEN`] bytes. It reads back as
-/// all-zero (layout version 0, which decodes to `None`) until the board has
-/// reported one - which, if the GPS/LoRa rail is off, may not happen until a
-/// connect powers the WIO.
+/// The value is [`crate::radiocfg::RADIO_CONFIG_LEN`] bytes, and reads back
+/// as all-zero (layout version 0, which decodes to `None`) until the radio
+/// has been initialized.
 pub const RADIO_CONFIG_UUID: &str = "c3a1000a-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 pub const RADIO_CONFIG_UUID_U128: u128 = 0xc3a1000a_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 
@@ -178,13 +176,15 @@ impl Settings {
     }
 }
 
-/// `u8` 0/1: enable the GPS/LoRa power rail (AP2112K LDO on GPIO2).
-/// 0 powers off both the WIO-E5 and the GPS entirely.
+/// `u8` 0/1: enable the GPS/LoRa power rail.
+///
+/// The wio-s3-max-gps board has no such rail - the GPS and SD sit directly
+/// on +3V3 - so its firmware accepts the write and logs that there is no
+/// hardware behind it. Kept because a board respin could bring it back.
 pub const CFG_PWR_EN: u8 = 0x10;
-/// `u8` 0/1: 1 sends WIO_SLEEP(1) over the link; 0 wakes it (WIO_SLEEP(0),
-/// with a reset pulse as fallback when the WIO does not ack).
+/// `u8` 0/1: 1 puts the radio into standby, 0 brings it back.
 pub const CFG_WIO_SLEEP: u8 = 0x11;
-/// `u8` 0/1: GPS backup mode on/off (forwarded to the WIO).
+/// `u8` 0/1: GPS backup mode on/off.
 pub const CFG_GPS_SLEEP: u8 = 0x12;
 /// `u32` seconds: ESP deep-sleep wake-check interval. While set (non-zero)
 /// the ESP deep-sleeps whenever no central is connected, waking every
@@ -250,10 +250,12 @@ pub const OP_END: u8 = 0x03;
 /// Bulk op: `[OP_ABORT]`.
 pub const OP_ABORT: u8 = 0x04;
 
-/// Bulk kind: radio TOML config, forwarded to the WIO and saved to SD.
+/// Bulk kind: radio TOML config, applied live and saved to SD.
 pub const KIND_TOML: u8 = 1;
-/// Bulk kind: WIO-E5 firmware image for the DFU partition.
-pub const KIND_FIRMWARE: u8 = 2;
+/// Bulk kind 2 was a WIO-E5 firmware image for its DFU partition, streamed
+/// through the ESP32-C6. The Wio-S3 updates itself through ESP-IDF OTA, so
+/// the kind is retired rather than reused - an old tool pushing an STM32
+/// image at this firmware should be rejected, not misread.
 
 /// Ack id used for bulk transfer status on the ack characteristic.
 pub const ACK_ID_BULK: u8 = 0x20;

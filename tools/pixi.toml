@@ -10,37 +10,23 @@ python = ">=3.10"
 pyserial = ">=3.5"
 
 [tasks]
-# Build (cargo objcopy in ../wio), then upload the WIO-E5 image through the
-# ESP32-C6 USB port. Image and ESP port are auto-detected:
-#   pixi run fw-upload
-# --no-build uploads the existing image; --file / --port override.
-wio-upload = "python wio_fw_upload.py"
-
-# Push a radio config to the WIO through the same USB path, applied live and
-# saved to its SD card:
+# Push a radio config to the board over USB, applied live and saved to its
+# SD card:
 #   pixi run wio-config --address 3
 #   pixi run wio-config --address 3 --set role=tx_only
 # Sends a whole file (default ../RADIO.example.toml, i.e. firmware defaults
 # plus the edits given), since the board cannot be read back - use --file to
 # start from settings of your own, and --dry-run to see the result first.
+#
+# Needs the USB console and its bulk handler, which the Wio-S3 firmware has
+# not ported yet (PORT-WIO-S3.md, step 4b). The framing itself is unchanged,
+# so this tool is waiting on the firmware rather than on a rewrite.
 wio-config = "python wio_config.py"
 
-# Build and flash the ESP32-C6 over its USB Serial/JTAG port, then stay
-# attached to the console. Per-frame link and heartbeat logging is on by
-# default; quiet it at runtime with `wio-config --set verbose=false`.
-#
-# The BLE address defaults to one derived from the chip's eFuse MAC (unique
-# per board). --ble-address forces a specific one for this build.
-#   pixi run esp-upload
-#   pixi run esp-upload --ble-address FF:C6:A1:53:50:47
-esp-upload = "python esp_upload.py"
-
-# Read a connected board's BLE address over USB, on demand:
-#   pixi run esp-address
-esp-address = "python esp_address.py"
-
-# Generate a random BLE static-random address in the display format
-# esp-upload / BLE_ADDRESS expect:
+# Generate a random BLE static-random address in the display format the
+# firmware expects:
 #   pixi run gen-ble-address
-#   pixi run esp-upload --ble-address "$(pixi run -q gen-ble-address)"
+#
+# Nothing consumes it yet. The ESP32-C6 build derived each board's address
+# from its eFuse MAC and let this override it; that is still to be ported.
 gen-ble-address = "python gen_ble_address.py"
