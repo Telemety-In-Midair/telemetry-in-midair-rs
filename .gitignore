@@ -6,9 +6,6 @@ target
 # Local working notes
 NOTES.md
 
-# WIO firmware image (objcopy output, e.g. built by tools/fw-upload)
-wio-e5-gps.bin
-
 # pixi environment (tools/)
 .pixi/
 

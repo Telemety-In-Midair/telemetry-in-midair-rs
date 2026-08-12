@@ -1,55 +1,46 @@
 # telemetry-in-midair-rs
 [Kicad Board](https://github.com/tmpk13/telemetry-in-midair) https://github.com/tmpk13/telemetry-in-midair
 
-GPS tracker board firmware: a WIO-E5 (STM32WLE5) reads a MAX-M10 GPS,
-transmits positions over 915 MHz LoRa and logs to SD, while an ESP32-C6
-serves everything over BLE to the gps-gui-rs app and manages power. See
-`PLAN.md` for the intent.
+GPS tracker board firmware: one Seeed Wio-S3 module (ESP32-S3R8 + SX1262)
+reads a MAX-M10 GPS, transmits positions over 915 MHz LoRa, logs to SD, and
+serves everything over BLE to the gps-gui-rs app. See `PLAN.md` for the
+intent and `ARCHITECTURE.md` for the UML views.
+
+This replaced a two-MCU board (ESP32-C6 for BLE and power, WIO-E5 for
+GPS/LoRa/SD, a framed UART link between them). That firmware is gone from
+the tree as of the single-module cleanup; `git log` still has it, and
+`PORT-WIO-S3.md` records what the merge deleted and why.
 
 ## Layout
 
 | Directory | What | Target |
 |-|-|-|
-| `proto/` | Shared no_std protocol crate: ESP<->WIO UART link framing, LoRa payloads, BLE extensions, `radio.cfg` parser. Host-testable (`cargo test`). | any |
-| `wio/` | WIO-E5 application firmware (RTIC). | `thumbv7em-none-eabi` (nightly) |
-| `wio/bootloader/` | Two-partition swap bootloader for UART-fed firmware updates. | `thumbv7em-none-eabi` |
-| `esp/` | ESP32-C6 firmware (embassy + trouble BLE). | `riscv32imac-unknown-none-elf` (stable) |
-| `s3/` | Wio-S3 firmware for the next board, which replaces both MCUs with one module. Skeleton so far - see `PORT-WIO-S3.md`. | `xtensa-esp32s3-none-elf` (`esp` channel) |
-| `tools/` | Host uploader (Python/pixi) to flash the WIO through the ESP USB. | host |
+| `proto/` | Shared no_std protocol crate: LoRa payloads, BLE extensions, `RADIO.CFG` parser, USB bulk framing. Host-testable (`cargo test`). | any |
+| `s3/` | Wio-S3 firmware (embassy + trouble BLE): radio, GPS, SD and the GATT service. | `xtensa-esp32s3-none-elf` (`esp` channel) |
+| `tools/` | Host tools (Python/pixi) for pushing a radio config over USB. | host |
 
 Depends on the sibling repo `../gps-proto` for the BLE position protocol
 and NMEA parsing (shared with `../esp32c3-gps` and `../gps-gui-rs`).
 
 ## Build and flash
 
-**Using Pixi**
-From `tools/` directory run
-`pixi run esp-upload`
-`pixi run esp-upload --ble-address XX:XX:XX:XX:XX:XX`
-`pixi run wio-upload`
+The ESP32-S3 is an Xtensa part, not RISC-V, so it needs the `esp` toolchain
+channel rather than `stable`:
 
-
-**Directly running**
 ```sh
+# once per machine - provides the `esp` channel and the Xtensa target
+espup install
+
 # protocol tests (host)
 cd proto && cargo test
 
-# WIO-E5: bootloader once, then the app (SWD via probe-rs)
-cd wio && cargo run --release -p bootloader   # no RTT output; Ctrl-C once flashed
-cd wio && cargo run --release                 # app, RTT console
-
-# Wio-S3 (next board; Xtensa, so it needs the `esp` toolchain from espup)
-# espup install        # once per machine, provides the `esp` channel
+# firmware: builds, flashes over USB Serial/JTAG, and stays on the console
 cd s3 && cargo run --release
-
-# ESP32-C6 (USB Serial/JTAG; console also lives there)
-# Per-frame link + per-heartbeat logging is on by default.
-cd esp && cargo run --release
-# same thing from the tools env:
-cd tools && pixi run esp-upload
-# compile the verbose call sites out entirely (code size, not logging):
-cd esp && cargo run --release --no-default-features
 ```
+
+The console is on the USB Serial/JTAG port (GPIO19/20 to the USB-C
+connector), not UART0 - GPIO43 is UART0_TX on this board and drives the D5
+LED, so expect the ROM bootloader's own log to flicker it on every reset.
 
 ## Configuring a board
 
@@ -61,7 +52,7 @@ put it well over that, so the tool strips them before sending.
 cd tools
 pixi run wio-config --address 3                  # applied live, saved to SD
 pixi run wio-config --set role=rx_only           # any key, repeatable
-pixi run wio-config --set verbose=false          # quiet the ESP console
+pixi run wio-config --set verbose=false          # quiet the console
 pixi run wio-config --address 3 --dry-run --save ../RADIO.CFG   # card file
 ```
 
@@ -73,22 +64,18 @@ Over BLE the board *does* report its current config (see below), so the
 gps-gui-rs app can read it back - its Radio page has a "Load from board"
 that fills the editor from the board itself.
 
-A pushed config is stored twice - `RADIO.CFG` on the card and a backup page
-in the WIO's internal flash - so it survives a power cycle on a board with
-no SD card. The card wins at boot, so editing `RADIO.CFG` on a computer
-still works. The board reports which stores it reached, and `wio-config`
-exits non-zero if a config went live but reached neither.
+A pushed config is stored twice - `RADIO.CFG` on the card and a backup in
+internal flash - so it survives a power cycle on a board with no SD card.
+The card wins at boot, so editing `RADIO.CFG` on a computer still works.
+The board reports which stores it reached, and `wio-config` exits non-zero
+if a config went live but reached neither.
 
-Note the WIO only has power while the ESP drives the LDO enable
-(GPIO2) high - flash the ESP first or SWD/UART on the WIO will see a
-dead chip.
-
-`FW_VERSION=n` at build time stamps the WIO firmware version reported
-over the link (used for update bookkeeping).
+The GPS and SD sit directly on +3V3 on this board, so there is no rail to
+raise before they answer.
 
 ## Radio configuration
 
-The WIO loads `RADIO.CFG` from the SD card at boot; the same file can be
+The firmware loads `RADIO.CFG` from the SD card at boot; the same file can be
 pushed over BLE (bulk characteristic) at runtime, which also rewrites the
 SD copy. All keys are optional; defaults in parentheses:
 
@@ -120,7 +107,7 @@ fields = "lat,lon"         # what each broadcast carries (lat,lon); also
 sd_enabled = true          # use the SD card at all (true)
 
 [debug]
-verbose = true             # per-frame detail on the ESP console (true)
+verbose = true             # detailed console logging (true)
 
 [gps]                       # MAX-M10 receiver (UBX-CFG-VALSET, RAM layer)
 gps_enabled = true         # (true)
@@ -195,7 +182,7 @@ one that does. `interval_s = 0` and `role = "rx_only"` turn it off along
 with the beacon; there is no separate switch.
 
 A node that hears a ping reports it as a status line (`node 3 ping: rssi
--97, up 214s, gps ok`) rather than a position, so it reaches the ESP
+-97, up 214s, gps ok`) rather than a position, so it reaches the app
 console and the BLE status characteristic without inventing a position
 nobody measured. The same ping also goes over the link as data
 (`msg::PING`) and out on the node-ping characteristic, so an app can show
@@ -264,12 +251,12 @@ sentence.
 ## BLE
 
 Same service UUID as the ESP32-C3 beacon, so gps-gui-rs discovers it
-unchanged (device name `GPS-C6`). On top of the gps-proto position /
-config / ack characteristics the C6 adds telemetry (LoRa RSSI/SNR,
-counters, SD + fix flags), remote node positions and pings, a status/log
-characteristic (notify + read), the WIO's current radio config (read +
-notify), and a bulk write characteristic for TOML config and WIO firmware
-images.
+unchanged (device name `GPS-S3`; the app filters scans by service UUID, so
+the rename from `GPS-C6` is display text only). On top of the gps-proto
+position / config / ack characteristics the firmware adds telemetry (LoRa
+RSSI/SNR, counters, SD + fix flags), remote node positions and pings, a
+status/log characteristic (notify + read), the current radio config (read +
+notify), and a bulk write characteristic for TOML config.
 
 ### Remote nodes
 
@@ -279,7 +266,7 @@ from nodes without a fix on `c3a1000b-...` (`[src, rssi i16le, flags,
 uptime_s u16le, age_s u16le]`).
 
 Both are notified when a report arrives rather than on the position notify
-tick, and the C6 keeps the newest report from each of up to 8 nodes rather
+tick, and the firmware keeps the newest report from each of up to 8 nodes rather
 than one report in total. That combination is what makes the stream
 lossless: sampling one cached value on a timer delivered only whichever
 node reported last before the tick, and silently dropped the rest. A node
@@ -303,25 +290,19 @@ tail.
 
 ## Status updates
 
-The WIO-E5 sends human-readable status lines to the ESP over the UART link
-(`msg::LOG`) on notable events - boot, GPS presence (first NMEA / silent
-module), GPS fix acquired/lost, soft sleep/wake, config applied, firmware
-receive, and a no-fix ping heard from another node. The ESP prints each to its USB console (prefixed `wio:`) and
-notifies it on the status/log characteristic, so gps-gui-rs (or any BLE
-client) sees the same live log. Lines are ASCII, up to `link::LOG_MAX`
-(64) bytes.
+The firmware writes human-readable status lines to the USB console on
+notable events - boot, GPS presence (first NMEA / silent module), GPS fix
+acquired/lost, radio standby/wake, config applied, and a no-fix ping heard
+from another node - and notifies the same text on the status/log
+characteristic, so gps-gui-rs (or any BLE client) sees the live log. Lines
+are ASCII, up to `link::LOG_MAX` (128) bytes.
 
-The WIO also prints a periodic GPS aliveness line to its own RTT console
-(`gps: bytes=.. nmea=.. fix=.. sats=..`); a silent module (`bytes=0`)
-usually means the ESP-controlled GPS/LoRa rail (GPIO2 LDO) is off rather
-than a dead module. Build the WIO with `--features debug` to also dump
-every raw NMEA line over RTT.
-
-The ESP also pings the WIO (`cmd::PING`) every 3 s as a link heartbeat and
-prints `wio link up` / `wio link down` on transitions, so a crashed or
-mis-wired WIO shows on the console instead of just going silent. The
-`verbose` cargo feature adds a line per inbound WIO frame and per heartbeat
-ping (`cargo run --release --features verbose`).
+A periodic status line every 10 s carries the radio's chip mode and latched
+device errors, GPS sentence and byte counts, fix state, and whether the
+card mounted. It exists because a quiet radio and a quiet GPS look
+identical otherwise, and because the radio's status byte reports the mode
+it is in, not whether it got there intact - a TCXO that never started or a
+calibration that failed still reads as a healthy standby.
 
 The settings characteristic (`c3a10009-...`, read + notify) carries the
 device's current power/sleep configuration as one 16-byte blob
@@ -331,30 +312,34 @@ config write - including values the device changed itself, such as a
 clamped interval.
 
 The radio-config characteristic (`c3a1000a-...`, read + notify) does the
-same for the WIO's radio configuration - the `RADIO.CFG` settings as a
-28-byte `midair_proto::radiocfg::RadioConfig` snapshot. Otherwise the
-config only ever travels *to* the board, so this is the one way to see
-what a board is running. The ESP does not parse it: the WIO encodes its
-live config and sends it over the link (`msg::CONFIG`) - at boot, after
-every apply, and on request - and the ESP relays the bytes, refreshing on
-connect and when the link comes up. It reads back all-zero (which decodes
-to nothing) until the WIO has reported one, so with the GPS/LoRa rail off
-it stays empty until a connect powers the WIO.
+same for the radio configuration - the `RADIO.CFG` settings as a 28-byte
+`midair_proto::radiocfg::RadioConfig` snapshot. Otherwise the config only
+ever travels *to* the board, so this is the one way to see what a board is
+running. It is refreshed on connect and after every apply, and reads back
+all-zero (which decodes to nothing) until the radio has been initialized.
 
 Config command ids (config characteristic, `[id, len, value]`):
 
 | Id | Value | Effect |
 |-|-|-|
 | `0x01` | u32 ms | position notify interval (gps-proto) |
-| `0x10` | u8 0/1 | GPS + LoRa power rail (LDO) off/on |
-| `0x11` | u8 0/1 | WIO soft sleep (reset-pulse fallback on wake) |
-| `0x12` | u8 0/1 | GPS backup mode (UBX-RXM-PMREQ / EXTINT wake) |
-| `0x13` | u32 s | ESP deep-sleep wake-check interval, 5 s..5 min, 0 = off |
+| `0x10` | u8 0/1 | GPS + LoRa power rail - no hardware on this board, logged and ignored |
+| `0x11` | u8 0/1 | radio to standby / back to receive |
+| `0x12` | u8 0/1 | GPS backup mode (UBX-RXM-PMREQ / UART wake) |
+| `0x13` | u32 s | deep-sleep wake-check interval, 5 s..5 min, 0 = off (not ported yet) |
 | `0x14` | u32 s | advertising window per wake check, 3 s..60 s (default 15 s) |
 
 ### Low power
 
-`0x13` turns sleep on. While set, the C6 deep-sleeps whenever no central
+**Not ported yet.** Deep sleep and its nvs-backed settings are outstanding
+work (`PORT-WIO-S3.md`, step 5); `Stored` sits in a plain static that
+resets with the board, and the firmware advertises indefinitely. What
+follows is the policy `session::apply` still enforces and clamps - it is
+host-tested and unchanged - described as it will behave once the sleep path
+exists. Two board facts already change it: there is no rail to cut, and
+what the two-MCU board called the WIO's boot time is now nothing at all.
+
+`0x13` turns sleep on. While set, the board deep-sleeps whenever no central
 is connected and wakes every interval to advertise for `0x14` seconds (one
 long D2 blink). Both persist until changed - a connect does not clear
 them, so an unattended board holds its cadence indefinitely and the
@@ -373,20 +358,21 @@ rather than being stored as a window nobody could connect in.
 
 A window changed over BLE applies from the next wake, not the current one.
 
-The GPS/LoRa rail is **off** for the whole sleep and stays off through
-the advertising window - a wake that nobody answers never powers the WIO
-or GPS at all. The rail comes up only when a central actually connects
-(and only if `0x10` has it enabled), so the app should expect the WIO's
-boot time plus a GPS cold TTFF after connecting.
+The rail policy is **inert on this board.** The GPS `VCC`/`V_IO` and the
+SD both sit directly on +3V3, and the only load switch (U3, SiP32431)
+feeds the GPS active antenna and is driven by the GPS's own `LNA_EN`, not
+by a host GPIO. So `0x10` is accepted and logged with nothing behind it,
+and deep sleep leaves a MAX-M10 acquiring beside a sleeping S3 - which is
+the dominant draw. GPS backup mode (`0x12`) is the only real power lever,
+and the app should still expect a GPS cold TTFF after a long sleep.
 
-The interval, the window and the `0x10` rail setting are held in RTC RAM
-and mirrored
-to the ESP's `nvs` flash partition, so they survive deep sleep *and* a
-flat battery - a board put away for transport comes back on the same
+The interval, the window and the `0x10` rail setting will be held in RTC
+RAM and mirrored to the `nvs` flash partition, so they survive deep sleep
+*and* a flat battery - a board put away for transport comes back on the same
 cadence rather than advertising until the cell dies again. Flash is read
 only on a cold boot; wake checks run from the RTC RAM copy.
 
-The wake is timed by the C6's uncalibrated RC slow clock, so the interval
+The wake is timed by the uncalibrated RC slow clock, so the interval
 drifts - it paces a wake-check, not a schedule.
 
 **Deep sleep has no wake source but the timer.** Nothing over the air can
@@ -421,81 +407,70 @@ extension - which is why the config file is `RADIO.CFG` and not
 `RADIO.TOML`. The FAT layer converts a name to 8.3 before looking it up, so
 a longer name is not a missing file but one that can never be opened.
 
-## WIO firmware update
+## Firmware update
 
-The update paths take a raw image (objcopy of the ELF). The ESP-USB
-uploader below builds it for you; to build it by hand (e.g. for the BLE
-path):
+Not ported yet. The ESP-IDF bootloader does two-slot OTA with rollback and
+`esp-bootloader-esp-idf` is already a dependency, but nothing drives it -
+`cargo run --release` over USB is the only path today.
 
-```sh
-cd wio && cargo objcopy --release -- -O binary wio-e5-gps.bin
-```
+What this replaces: the two-MCU board streamed a raw STM32 image over the
+UART link into the WIO-E5's DFU partition, where a swap bootloader
+installed it power-fail-safely and reverted if the new image never
+confirmed boot. Bulk kind 2 carried it, over BLE or the ESP's USB port.
+That kind is retired rather than reused, so an old tool pushing an STM32
+image at this firmware is rejected instead of misread.
 
-Either path streams it over the UART link into the WIO's DFU partition (D2
-blinks rapidly); on a verified CRC the WIO reboots and the swap bootloader
-installs it power-fail-safely, reverting automatically if the new image
-never confirms boot. SWD via the J5 header remains as the recovery path.
+## Wio-S3 module
 
-**Over BLE:** push the `.bin` through the bulk characteristic (`OP_BEGIN`
-kind 2 with size/crc32/version, `OP_DATA` chunks up to 192 bytes,
-`OP_END`).
+`Wio-S3` (SKU 100020327 with IPEX, 100079384 with bare RF pads)
+`ESP32-S3R8 + SX1262 + 32 MHz TCXO`
+`16 MB Flash, 8 MB PSRAM`
 
-**Over the ESP USB:** the same bulk protocol is exposed on the USB
-Serial/JTAG port (framed with the link framing, `link::usb` commands), so a
-computer can flash the WIO through the ESP with no BLE. A host uploader
-lives in `tools/`. It builds the image, auto-detects the ESP port and
-uploads, so no arguments are needed:
-
-```sh
-cd tools && pixi run fw-upload      # --no-build to skip the rebuild
-```
-
-The ESP console shares the USB port; the uploader's frame parser resyncs
-past the console text. Only one transfer (BLE or USB) runs at a time.
-
-## ESP32-C6
-`ESP32-C6-MINI-1U-H4`
-`4MB Flash`
+Board wiring (carrier design, `wio-s3-max-gps`):
 
 | Pin | Function |
 |-|-|
-| I03 | LED D2 |
-| IO2 | PWR EN GPS/Radio (AP2112K-3.3) |
-| IO4 | RX/GPIO |
-| IO5 | TX/GPIO |
-| IO6 | WIO-E5 RST |
-| RXD0 | WIO-E5 PA2 |
-| TXD0 | WIO-E5 PA3 |
-| IO12 | USB D- |
-| IO13 | USB D+ |
+| GPIO1 | GPS UART RX (from GPS TXD) |
+| GPIO2 | GPS UART TX (to GPS RXD) |
+| GPIO3 | SD MISO - strapping pin |
+| GPIO14 | LED D2, active low |
+| GPIO19 / GPIO20 | USB D- / D+ |
+| GPIO43 | LED D5, active low; also UART0_TX |
+| GPIO44 | SD CS |
+| GPIO45 | SD MOSI - strapping pin, R17 DNP as of board V2 |
+| GPIO46 | SD SCK - strapping pin |
+| GPIO10, GPIO11 | J5 JST SH 4-pin, I2C-shaped |
+| GPIO38-41, GPIO47 | J1 header 1x07 |
+| GPIO0 / RST | BOOT / RST test points |
 
-*Boot pad on back*
+Module-internal wiring (datasheet Table 2), which never reaches a pad:
 
-## WIO-E5
-
-| Pin | Function |
+| SX1262 pin | Connected to |
 |-|-|
-| PB6 (TX) | GPS RX |
-| PB7 (RX) | GPS TX |
-| PB10 | EXT INT GPS |
-| PC1 | I2C SCL (JST SH) |
-| PC1 | I2C SDA (JST SH) |
-| PB3 | SD SCK |
-| PB4 | SD CITO |
-| PB5 | SD COTI |
-| PA0 | SD CS |
-| PA4 | RF switch control 1 (module-internal) |
-| PA5 | RF switch control 2 (module-internal) |
-| PA9 | LED D6 |
-| PA10 | LED D5 |
+| NSS | GPIO21 |
+| SCK | GPIO4 |
+| MOSI | GPIO6 |
+| MISO | GPIO5 |
+| NRESET | GPIO7 |
+| BUSY | GPIO8 |
+| DIO1 | GPIO9 |
+| DIO2 | SKY13453-385LF VCTL (RF switch) |
+| DIO3 | SKY13453-385LF VDD (and the TCXO) |
 
-The antenna switch is inside the module and has to be driven by the MCU:
-the radio die has no bonded DIO2, so there is no `SetDio2AsRfSwitchCtrl` to
-hand the job to the radio. Both lines low isolates the antenna; control 1
-high selects the receiver, control 2 high the high-power PA.
+`GPIO26-32` are the flash interface and `GPIO33-37` are the octal PSRAM the
+R8 part uses; neither is available whatever a generic ESP32-S3 pin table
+suggests.
 
-*Reset (RST) pad on back*
+**The two RF-path registers are not tunable.** DIO2 must drive the switch
+and DIO3 must supply it at 2.5 V or more, or the PA transmits into an
+isolated port and the module dies. `RadioConfig` defaults both to this
+board's hardware and the driver enforces them; see `ARCHITECTURE.md`.
 
+**Three of the four SD lines sit on strapping pins.** GPIO45 selects
+VDD_SPI (low 3.3 V, high 1.8 V, sampled at reset), so a pull-up there stops
+the part booting on a module without `VDD_SPI_FORCE` burned - hence R17
+DNP. GPIO46 pulled high disables the ROM boot log and GPIO3 pulled high
+moves the JTAG source; both are survivable.
 
 ## Connectors
 #### JST SH
@@ -520,12 +495,6 @@ high selects the receiver, control 2 high the high-power PA.
 | 1 | GND |
 
 
-Inital WIO wipe:
-`openocd -f interface/cmsis-dap.cfg -f target/stm32wlx.cfg -c "init; reset halt; stm32l4x unlock 0; reset halt; exit"`
-
-Power cycle after wiping before attempting to upload.
-
-
 ## Charging IC 
 
 `MCP73831T-2ACI/OT`
@@ -534,6 +503,10 @@ Adjustable current. 500 mA @ 2k ohm programming resistor.
 
 
 ## Inital power testing 
+
+**Measured on the two-MCU board.** Kept as a baseline to beat, not as a
+description of this one - the single module should come in well under
+these, and nothing has been measured on it yet.
 
 Everything running (BLE connected, Satalite fix, SD logging)
 `75 mA`
@@ -545,6 +518,11 @@ Fully running (BLE connected, Satalite fix, pulse on LoRa TX, SD logging)
 
 ESP only BLE connected
 `46 mA`
+
+For reference, the Wio-S3 datasheet quotes 9.3 uA deep sleep, 1.43 mA
+standby, 5.5 mA LoRa RX and 125 mA LoRa TX at 22 dBm. The 5.5 mA RX figure
+is only reachable with the SX1262's DC-DC, which is how we know the module
+carries the SMPS inductor and why `dcdc_enabled` defaults on.
 
 GPS Board v1
 ![GPS Board v1 diagram](./images/GPSv1.svg)

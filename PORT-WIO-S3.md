@@ -199,16 +199,21 @@ rather than on PA4/PA5, and DIO1 is a real interrupt line to an ESP GPIO
 instead of an internal NVIC vector. Confirm both against the module
 schematic before writing the driver.
 
-The RF switch difference gains a setting rather than losing one. On the
+The RF switch difference does not gain a setting - it removes two. On the
 WL, `SetDio2AsRfSwitchCtrl` (0x9D) is absent from the opcode table
-entirely - the die has no bonded DIO2, so switching is an MCU GPIO job
-and the register could never be a config key. The Wio-S3's SX1262 is
-discrete and DIO2 is a real pin, so it is one now: `dio2_rf_switch`,
-sitting with `dcdc_enabled` and `tcxo_volts` as a board-description key.
-Off is the chip's power-up state and the default; on is for a module
-whose RF port runs into an external switch or front-end. There is no
-middle ground if it is wrong - the antenna is never joined to the PA and
-every transmission goes into a disconnected port.
+entirely: the die has no bonded DIO2, so switching is an MCU GPIO job and
+the register could never be a config key. The Wio-S3's SX1262 is discrete
+and DIO2 is a real pin, so it looked like a board-description key
+alongside `dcdc_enabled` and `tcxo_volts`.
+
+Table 2 of the datasheet says otherwise. DIO2 is the VCTL of an
+SKY13453-385LF and DIO3 is that same switch's VDD, so on this board there
+is exactly one correct value for each, and both defaulted wrong: the key
+was off (the WL had no DIO2 to drive) and DIO3 was set to 1.8 V (the WL's
+TCXO is a 1.8 V part, but the switch is specified 2.5 - 3.5 V and calls
+anything else undefined). Either mistake ramps +22 dBm into an isolated
+port. They are now defaulted to the board's hardware *and* enforced in
+`Sx1262Driver::init`, which logs when it overrides a config.
 
 Note what this is *not*: the module's u.FL-versus-RF-pad choice is two
 SKUs (100020327 with IPEX, 100079384 with bare pads), not a switch, so
@@ -302,10 +307,13 @@ report the LiPo voltage without a board change.
    take. Bench test against an existing board - the air format does not
    change, so a ported node must talk to an unported one.
 
-   Blocked on one fact: the module's internal ESP32-S3-to-SX1262 wiring
-   is not published, so the seven GPIOs in `s3/src/bin/main.rs` are an
-   inference (GPIO4-10 is the only run of pins the module does not bring
-   out to a pad). Nothing else in the crate depends on them.
+   No longer blocked: the module datasheet's Table 2 publishes the
+   internal wiring, and `s3/src/bin/main.rs` runs it. The inference that
+   preceded it (GPIO4-10, the only run of pins the module does not bring
+   out to a pad) was wrong in three places and destroyed a board - see
+   `NOTES.md`. Table 2 also settles the RF path: DIO2 is the antenna
+   switch's VCTL and DIO3 is its VDD, which makes `dio2_rf_switch` and
+   `tcxo_volts` hardware facts rather than settings.
 3. **GPS and SD.** **Written, not yet run.** `s3/src/gps.rs` is the
    MAX-M10 driver - NMEA folding, UBX-CFG-VALSET, backup mode - on an
    esp-hal UART, with the waits awaiting instead of spinning.
@@ -328,8 +336,11 @@ report the LiPo voltage without a board change.
    settings, the remote-node roster replay, and the USB console.
 5. **Sleep and OTA.** Redo the sleep story for one MCU, move firmware
    update to ESP-IDF OTA, retire `wio-upload` and `fw-upload`.
-6. **Cleanup.** Delete `wio/`, `wio/bootloader/`, the UART link, and
-   rewrite `ARCHITECTURE.md` around the single-MCU design.
+6. ~~**Cleanup.**~~ **Done.** `wio/`, `wio/bootloader/` and `esp/` are
+   deleted, along with the `cmd`/`msg` link command sets and the host
+   tools that only served the split. `ARCHITECTURE.md` is rewritten
+   around the single-MCU design. What survives in `proto/src/link.rs` is
+   the framing and the bulk transfer the host tools speak over USB.
 
 Steps 2 and 3 are independently testable against the current fleet,
 which is what makes this tractable.
@@ -340,13 +351,10 @@ which is what makes this tractable.
   needs are listed in `BOARD-REVIEW.md` in the `wio-s3-max-gps` repo.
   GPS EXTINT and the GPIO45 strapping pull-up are the two that firmware
   cannot work around.
-- **Repo shape.** A new crate (`s3/`) built up beside the working `esp/`
-  and `wio/`, deleting them at step 6, or `esp/` mutated in place. The
-  new crate keeps a flashable fleet during the port; in-place keeps the
-  git history on the GATT code.
+- ~~**Repo shape.**~~ **Settled.** A new crate beside the working ones,
+  deleted at step 6, which is what happened.
 - **Wi-Fi in scope now, or later?** It changes the sleep budget and the
   partition table, so it is cheaper to decide before step 5 than after.
-- **Is the SX1262 pin map published?** The introduction page does not
-  give the internal ESP32-S3 to SX1262 assignments. The module datasheet
-  or reference schematic is needed before step 2, and it is the one
-  blocking fact in this plan.
+- ~~**Is the SX1262 pin map published?**~~ **Answered.** Table 2 of the
+  module datasheet (v1.2) gives it, along with the antenna switch part
+  number and its truth table.
