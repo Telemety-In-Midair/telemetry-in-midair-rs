@@ -422,9 +422,18 @@ image at this firmware is rejected instead of misread.
 
 ## Wio-S3 module
 
-`Wio-S3` (SKU 100020327 with IPEX, 100079384 with bare RF pads)
 `ESP32-S3R8 + SX1262 + 32 MHz TCXO`
 `16 MB Flash, 8 MB PSRAM`
+
+**This board requires the -N SKU (100079384, bare RF pads).** The u.FL
+versus RF-pad choice is two parts, not a switch - nothing in firmware or on
+the board selects it - and the pad names carry the difference:
+`LORA_ANT / NC` and `WIFI/BT_ANT / NC` are the RF ports on the bare-pad
+part and *not connected* on the IPEX part (100020327), where the u.FL sits
+on the module itself. The carrier runs pad 37 straight to the SMA J6, so
+an IPEX module leaves that SMA connected to nothing and the PA transmits
+into an open. Check the can before powering a new build: two small gold
+u.FL connectors on the top face is the IPEX part.
 
 Board wiring (carrier design, `wio-s3-max-gps`):
 
