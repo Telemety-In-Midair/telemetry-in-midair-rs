@@ -276,6 +276,21 @@ impl<'d> Sx1262Driver<'d> {
         // Over-current protection: required for the HP PA to reach +22.
         self.radio.write_reg(reg::OCP, reg::OCP_140MA);
 
+        // Drop the errors the power-up sequence latched before this function
+        // had a chance to fix its cause.
+        //
+        // The automatic calibration at reset runs while DIO3 is still low,
+        // so the TCXO has no supply, so the XOSC it needs never starts and
+        // the chip latches XOSC_START_ERR (0x0020). It is not a fault - it
+        // is the state this function exists to correct, and the recalibrate
+        // above is the correction. Leaving it latched means the boot
+        // diagnostic warns every single time, which trains an operator to
+        // ignore the one register that would name a TCXO that really did
+        // fail, a PLL that never locked, or a PA that would not ramp.
+        //
+        // Anything read after this point is real.
+        self.radio.clear_device_errors();
+
         println!(
             "radio init: {} Hz SF{} BW{} CR4/{} {} dBm",
             cfg.frequency_hz,
