@@ -21,6 +21,22 @@ Per-board BLE addresses. The C6 derived one from its eFuse MAC and let
 `--ble-address` override it at build time; `tools/gen_ble_address.py`
 survives and has nothing to feed.
 
+## Before the beacon transmits
+
+**Re-check the radio before keying up.** The SX1262 does not reset with the
+MCU, and nothing re-checks it. If it browns out and restarts on its own it
+comes back with DIO2 and DIO3 at their power-up defaults - antenna switch
+unpowered, switching disabled - and the next `send()` ramps the PA into an
+isolated port with nothing having looked wrong. The beacon should read the
+chip mode and error word before transmitting and re-run `init` if either
+looks like a fresh power-up. Now that `init` clears the boot latch, a
+reappearing `XOSC_START_ERR` (0x0020) on the periodic status line is the
+signal.
+
+There is no beacon at all yet: no `lora.send()` call anywhere, and
+`tx_count` is hardcoded to 0 in the telemetry. So the DIO2/DIO3 fix has
+never been exercised on air.
+
 ## Bench work
 
 Run the radio against an existing node. The air format did not change, so a
