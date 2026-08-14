@@ -150,18 +150,18 @@ impl<'d> Sx1262Driver<'d> {
             .modify_reg(reg::SMPS_C0, |v| v | reg::SMPS_CLK_DET_EN);
         self.radio.set_regulator_mode(cfg.dcdc_enabled);
 
-        // The radio drives this board's antenna switch itself: DIO2 is the
-        // SKY13453-385LF's VCTL. Unconditional, and deliberately not read
-        // from the config - a config that said false would put the PA into
-        // an isolated port on every transmission, and no setting a user can
-        // reach should be able to ask for that.
-        if !cfg.dio2_rf_switch {
-            println!("config: dio2_rf_switch=false ignored, this board needs it on");
-        }
-        self.radio.set_dio2_as_rf_switch(true);
+        // DIO3 first, then DIO2: supply the antenna switch before handing
+        // the radio its control line.
+        //
+        // Ordering matters less than it looks - DIO2 is low in STDBY_RC, so
+        // the switch sees VCTL and VDD both at 0 either way, which its
+        // datasheet specifies as a leakage condition rather than a damaging
+        // one. But VCTL is only allowed to sit at or below VDD, and there
+        // is no reason to write the two commands in the order that needs
+        // that argument made.
 
-        // DIO3 supplies the 32 MHz TCXO *and* that same antenna switch's
-        // VDD, so it is floored at the switch's 2.5 V minimum rather than
+        // DIO3 supplies the 32 MHz TCXO *and* the SKY13453-385LF's VDD, so
+        // the trim is floored at the switch's 2.5 V minimum rather than
         // taken as given. The radio waits `tcxo_startup_ms` for both to
         // come up before it will use the clock.
         let trim = cfg.tcxo_volts.trim();
@@ -176,6 +176,16 @@ impl<'d> Sx1262Driver<'d> {
         };
         self.radio
             .set_tcxo_ctrl(trim, cfg.tcxo_startup_ms as u32);
+
+        // The radio drives this board's antenna switch itself: DIO2 is the
+        // SKY13453-385LF's VCTL. Unconditional, and deliberately not read
+        // from the config - a config that said false would put the PA into
+        // an isolated port on every transmission, and no setting a user can
+        // reach should be able to ask for that.
+        if !cfg.dio2_rf_switch {
+            println!("config: dio2_rf_switch=false ignored, this board needs it on");
+        }
+        self.radio.set_dio2_as_rf_switch(true);
 
         // Recalibrate every block now that there is a 32 MHz clock. The
         // automatic calibration at power-up ran before the TCXO was

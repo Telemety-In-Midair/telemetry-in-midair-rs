@@ -29,7 +29,7 @@ use embassy_time::{Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
-use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig};
+use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
@@ -140,6 +140,47 @@ async fn main(spawner: Spawner) -> ! {
     // D5. Starts dark so the first blink is visibly the firmware's, not a
     // leftover level from the ROM bootloader driving UART0_TX.
     let d5 = Output::new(peripherals.GPIO43, LED_OFF, OutputConfig::default());
+    // D2. Nothing drives it yet, but it is claimed and parked dark rather
+    // than left as a reset-state input: its cathode sits on this pin with
+    // the anode on +3V3 through R20, so an unconfigured pin leaves the LED
+    // biased just under its forward voltage instead of held off.
+    let _d2 = Output::new(peripherals.GPIO14, LED_OFF, OutputConfig::default());
+
+    // Every pin the board brings out but the firmware does not use. A
+    // CMOS input left floating sits wherever leakage puts it, which can be
+    // mid-rail - both halves of the input buffer partly on, drawing current
+    // and coupling noise into everything beside it. That is invisible at
+    // 75 mA and is most of the budget once deep sleep lands.
+    //
+    // Pulled down rather than driven, because five of these leave the board:
+    // GPIO10/11 on the J5 JST-SH and GPIO38-41/47 on the J1 header. A pull
+    // is a defined state that still yields to whatever a user wires up; an
+    // output would fight it. When a real function claims one of these pins,
+    // it takes the pin from here.
+    let idle = InputConfig::default().with_pull(Pull::Down);
+    let _parked = (
+        // J5, I2C-shaped
+        Input::new(peripherals.GPIO10, idle),
+        Input::new(peripherals.GPIO11, idle),
+        // J1 header
+        Input::new(peripherals.GPIO38, idle),
+        Input::new(peripherals.GPIO39, idle),
+        Input::new(peripherals.GPIO40, idle),
+        Input::new(peripherals.GPIO41, idle),
+        Input::new(peripherals.GPIO47, idle),
+        // Module pads with nothing routed to them
+        Input::new(peripherals.GPIO12, idle),
+        Input::new(peripherals.GPIO13, idle),
+        Input::new(peripherals.GPIO15, idle),
+        Input::new(peripherals.GPIO16, idle),
+        Input::new(peripherals.GPIO17, idle),
+        Input::new(peripherals.GPIO18, idle),
+        Input::new(peripherals.GPIO42, idle),
+        Input::new(peripherals.GPIO48, idle),
+    );
+    // GPIO0 (BOOT) is deliberately absent: it has the board's pull-up and a
+    // test point, and driving it would fight whoever holds it low to enter
+    // the ROM loader. GPIO19/20 belong to the USB Serial/JTAG peripheral.
 
     println!("wio-s3-gps v{} up", env!("CARGO_PKG_VERSION"));
 
@@ -163,13 +204,22 @@ async fn main(spawner: Spawner) -> ! {
     .with_mosi(peripherals.GPIO6)
     .with_miso(peripherals.GPIO5);
 
+    // BUSY and DIO1 both idle low, so a pull-down is the level they hold
+    // anyway - and it is what makes an absent radio diagnosable. With no
+    // pull, an unpowered or mis-wired SX1262 leaves BUSY floating, which
+    // reads high as often as not and spends the driver's 50 ms busy timeout
+    // on every single transaction. Pulled down it reads "not busy", the
+    // transfer goes ahead, and the status byte comes back 0x00 - which is
+    // exactly what `print_diagnostics` is written to recognize.
+    let radio_irq_cfg = InputConfig::default().with_pull(Pull::Down);
+
     let lora = Sx1262Driver::new(Sx1262::new(
         lora_spi,
         // NSS and NRESET are ours to drive; BUSY and DIO1 are the radio's,
         // so they are inputs and nothing here may ever drive them.
         Output::new(peripherals.GPIO21, Level::High, OutputConfig::default()),
-        Input::new(peripherals.GPIO8, InputConfig::default()),
-        Input::new(peripherals.GPIO9, InputConfig::default()),
+        Input::new(peripherals.GPIO8, radio_irq_cfg),
+        Input::new(peripherals.GPIO9, radio_irq_cfg),
         Output::new(peripherals.GPIO7, Level::High, OutputConfig::default()),
     ));
 
