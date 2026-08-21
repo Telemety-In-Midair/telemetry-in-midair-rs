@@ -1102,8 +1102,14 @@ async fn hardware_task(
             }
             // Jitter on top of the interval so two nodes that happened to
             // line up do not stay lined up.
+            //
+            // Timed from after the transmit, not from the top of this pass:
+            // the send awaited, and at the slowest settings the config
+            // accepts that is nearly ten seconds. Measuring the interval
+            // from a stale `now` would spend most of it inside the
+            // transmission it is supposed to follow.
             let jitter = node.random(2_000);
-            next_beacon = now
+            next_beacon = (Instant::now().as_millis() as u32)
                 .wrapping_add(cfg.beacon_interval_s as u32 * 1_000)
                 .wrapping_add(jitter);
         }

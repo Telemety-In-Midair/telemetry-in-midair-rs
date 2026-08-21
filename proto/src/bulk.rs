@@ -275,8 +275,15 @@ impl Transfer {
                 }
             }
             ble::KIND_OTA => {
-                if total == 0 || !sink.begin(total) {
+                if total == 0 {
                     return (Event::None, nak(packet::ACK_BAD_VALUE));
+                }
+                // A refusal here is the board's, not the op's: no update
+                // slots, or an image too big for the one it would go in.
+                // Reported as a board error so a host tool can say which of
+                // those it is rather than blaming the bytes it sent.
+                if !sink.begin(total) {
+                    return (Event::None, nak(ble::ACK_WIO_ERROR));
                 }
             }
             _ => return (Event::None, nak(packet::ACK_BAD_VALUE)),
@@ -694,13 +701,17 @@ mod tests {
     }
 
     /// A board with no OTA partitions says so at begin rather than
-    /// accepting an image it has nowhere to put.
+    /// accepting an image it has nowhere to put - and says it as a board
+    /// error, since the bytes the host sent were fine.
     #[test]
     fn firmware_is_refused_where_there_is_no_sink() {
         let mut t = Transfer::new();
         let (_, a) = t.handle(Owner::Ble, 0, &begin_op(ble::KIND_OTA, b"image"), &mut NoFirmware);
-        assert_eq!(status(&a), packet::ACK_BAD_VALUE);
+        assert_eq!(status(&a), ble::ACK_WIO_ERROR);
         assert!(!t.is_active());
+        // An empty image is a bad op, which is a different answer.
+        let (_, a) = t.handle(Owner::Ble, 0, &begin_op(ble::KIND_OTA, b""), &mut NoFirmware);
+        assert_eq!(status(&a), packet::ACK_BAD_VALUE);
     }
 
     #[test]

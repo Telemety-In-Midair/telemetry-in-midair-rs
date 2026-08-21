@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """Generate a random BLE static-random address.
 
-Prints an address in the display format the firmware and loader use
-(most-significant octet first), ready to paste after --ble-address or into
-the BLE_ADDRESS build env var:
+Prints an address in the display format the firmware uses (most-significant
+octet first), ready for the BLE_ADDRESS build env var that s3/build.rs
+validates:
 
   pixi run gen-ble-address
-  pixi run esp-upload --ble-address "$(pixi run -q gen-ble-address)"
+  cd ../s3 && BLE_ADDRESS=FF:C6:A1:53:50:47 cargo run --release
+
+Only needed to pin a board to a fixed address. Left unset, each board
+derives its own from its eFuse MAC, so two boards are already distinct out
+of the box; `pixi run wio-info` reads back whichever it ended up with.
 
 Static-random (Bluetooth Core Spec): the two most-significant bits of the
 address are 1, and the remaining 46 bits are neither all-zero nor all-one.

@@ -40,6 +40,11 @@ OP_END = 0x03
 OP_ABORT = 0x04
 
 KIND_TOML = 1
+# An ESP-IDF application image for the inactive OTA slot. Kind 2 was the
+# WIO-E5's firmware format and is retired, not reused - an STM32 image
+# accepted as an ESP one would be written into an app slot and bootloop the
+# board, so the firmware rejects it outright.
+KIND_OTA = 3
 
 ACK_ID_BULK = 0x20
 ACK_OK = 0
@@ -49,12 +54,15 @@ STATUS_NAMES = {
     0x00: "OK",
     0x01: "unknown id",
     0x02: "bad value",
-    # 0x10 and 0x11 named failures of the ESP32-C6's UART link to the
-    # WIO-E5. One MCU cannot fail that way, but the codes stay reserved so a
-    # board still running the old firmware reports something legible.
-    0x10: "radio error (NAK)",
+    # 0x10 named a WIO-E5 NAK on the ESP32-C6's UART link. One MCU cannot
+    # fail that way; the single-module firmware reuses it for a write that
+    # the board could not carry out - a flash sector that would not take an
+    # OTA chunk, or a slot it could not activate.
+    0x10: "write failed on the board (flash?)",
+    # 0x11 named a link timeout, which no longer exists. Kept reserved so a
+    # board still running the two-MCU firmware reports something legible.
     0x11: "link timeout (no ack) - two-MCU firmware only",
-    0x12: "bad state (a transfer is already active?)",
+    0x12: "bad state (a transfer is already active, or on the other transport?)",
 }
 
 # Data bytes per OP_DATA (link::DATA_CHUNK).

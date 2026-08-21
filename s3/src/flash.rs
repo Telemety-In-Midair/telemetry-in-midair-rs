@@ -317,9 +317,12 @@ impl Sink for OtaSink<'_> {
         // Refuse rather than trust it. Writing an image over the slot the
         // code is executing from does not fail, it destroys the running
         // firmware mid-transfer - so the one check worth making twice is
-        // that the destination is not where we are.
-        if self.0.booted_slot() == Some(slot) {
-            return false;
+        // that the destination is not where we are. A board that cannot say
+        // where it is running from is refused too: "unknown" is not a
+        // difference, and this is the wrong question to answer optimistically.
+        match self.0.booted_slot() {
+            Some(booted) if booted != slot => {}
+            _ => return false,
         }
         let Some(Some(room)) = self.0.with_app(slot, |r| Some(r.partition_size())) else {
             return false;

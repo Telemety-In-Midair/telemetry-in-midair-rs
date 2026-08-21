@@ -15,18 +15,27 @@ pyserial = ">=3.5"
 #   pixi run wio-config --address 3
 #   pixi run wio-config --address 3 --set role=tx_only
 # Sends a whole file (default ../RADIO.example.toml, i.e. firmware defaults
-# plus the edits given), since the board cannot be read back - use --file to
-# start from settings of your own, and --dry-run to see the result first.
-#
-# Needs the USB console and its bulk handler, which the Wio-S3 firmware has
-# not ported yet (PORT-WIO-S3.md, step 4b). The framing itself is unchanged,
-# so this tool is waiting on the firmware rather than on a rewrite.
+# plus the edits given), since this tool cannot read the board back - use
+# --file to start from settings of your own, and --dry-run to see the result
+# first.
 wio-config = "python wio_config.py"
+
+# Update the firmware over USB, into the OTA slot the board is not running
+# from, with no reflash and no BOOT button:
+#   pixi run wio-ota
+#   pixi run wio-ota --image firmware.bin
+# With no --image it builds ../s3 and converts the ELF itself.
+wio-ota = "python wio_ota.py"
+
+# Read the board's protocol version and BLE address:
+#   pixi run wio-info
+wio-info = "python wio_info.py"
 
 # Generate a random BLE static-random address in the display format the
 # firmware expects:
 #   pixi run gen-ble-address
 #
-# Nothing consumes it yet. The ESP32-C6 build derived each board's address
-# from its eFuse MAC and let this override it; that is still to be ported.
+# Only needed to pin a board to a fixed address - `s3/build.rs` validates
+# BLE_ADDRESS and the firmware otherwise derives one per chip from the eFuse
+# MAC, so boards are already distinct without it.
 gen-ble-address = "python gen_ble_address.py"

@@ -9,17 +9,17 @@ Other keys go through --set, repeatably:
 
     pixi run wio-config --address 3 --set role=tx_only --set interval_s=30
 
-The board applies the config immediately and stores it in two places - the
-SD card's RADIO.CFG and a backup in internal flash - so the change survives
-a power cycle with or without a card. Nothing is reflashed.
-The board reports which stores it reached, and this exits non-zero if it
-reached neither.
+The board applies the config immediately and writes it to the SD card as
+RADIO.CFG, which is where it survives a power cycle. Nothing is reflashed.
+The two-MCU board also kept a copy in the WIO-E5's own flash; the Wio-S3
+does not, so a board running without a card keeps the config only until it
+reboots - and says so. This exits non-zero when that happens.
 
 IMPORTANT - this sends a whole file, not a patch. The firmware parses a
 config starting from its own defaults, so any key absent from what is sent
-reverts to its default rather than keeping the board's current value. There
-is no way to read a config back off the board, so the file this tool starts
-from is the whole truth about the resulting settings.
+reverts to its default rather than keeping the board's current value. This
+tool cannot read the board's current config back (an app can, over BLE), so
+the file it starts from is the whole truth about the resulting settings.
 
 That file is RADIO.example.toml by default, which a test in the proto crate
 pins to the firmware defaults - so with no --set the board ends up on stock
@@ -215,10 +215,10 @@ def main() -> int:
 
     print(applied)
     if "NOT SAVED" in applied:
-        print("\nWARNING: the config is live but reached neither the SD card "
-              "nor the flash backup.\nIt will be lost on the next power "
-              "cycle, reverting to firmware defaults.\nCheck that the card is "
-              "seated and readable, or that flash is not worn out.")
+        print("\nWARNING: the config is live but did not reach the SD card.\n"
+              "It will be lost on the next power cycle, reverting to firmware "
+              "defaults.\nCheck that a card is seated, readable, and FAT "
+              "formatted.")
         return 2
     return 0
 
