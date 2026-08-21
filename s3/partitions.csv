@@ -1,0 +1,21 @@
+# Partition table for the Wio-S3, which has 16 MB of flash.
+#
+# Two application slots and an otadata partition, which is what OTA needs -
+# the ESP-IDF bootloader picks whichever slot otadata names and, with
+# rollback enabled, reverts to the other one if a freshly activated image
+# never confirms itself (see s3/src/flash.rs). This replaces the WIO-E5's
+# page-swap bootloader.
+#
+# Two things are load-bearing about the offsets. `nvs` stays where the
+# single-app default put it, so the settings record survives a board being
+# moved onto this table; and ota_0 starts at 0x10000, where the default put
+# `factory`, so an image flashed over USB lands in the slot an erased
+# otadata boots. Under 8 MB in total, leaving the upper half of the part
+# free for whatever comes later.
+#
+# Name,     Type, SubType, Offset,   Size
+nvs,        data, nvs,     0x9000,   0x4000
+otadata,    data, ota,     0xd000,   0x2000
+phy_init,   data, phy,     0xf000,   0x1000
+ota_0,      app,  ota_0,   0x10000,  0x3F0000
+ota_1,      app,  ota_1,   0x400000, 0x400000

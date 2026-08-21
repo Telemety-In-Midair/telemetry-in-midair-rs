@@ -59,6 +59,18 @@ static_cell = "2.1.1"
 
 critical-section = "1.2.0"
 heapless         = "0.9"
+# RTC-RAM statics that survive deep sleep: esp-hal's `Persistable` marker
+# covers atomics, and core's are not available on every target it builds for.
+portable-atomic = "1"
+
+# The USB Serial/JTAG console, which the host tools speak the bulk protocol
+# over.
+embedded-io-async = "0.7.0"
+
+# The `nvs` settings mirror and the OTA slots. 0.8 is the release that
+# matches esp-hal 1.0.
+esp-storage      = { version = "0.8.1", features = ["esp32s3"] }
+embedded-storage = "0.3.1"
 
 # FAT filesystem so the SD card logs are readable on a phone/computer.
 # Unlike the WIO-E5 build this uses the crate's own SPI-mode SD driver:

@@ -7,48 +7,65 @@
 //! firmware image to push. A config write that used to be a link frame and
 //! a wait for an answer is now a signal the hardware loop picks up.
 //!
+//! - Reads a MAX-M10N on UART1 and folds NMEA into a position.
+//! - Broadcasts that position over 915 MHz LoRa on the configured interval,
+//!   or a [`lora::Ping`] while it has no fix, and hears every other node in
+//!   range. A node configured as a repeater forwards what it hears.
+//! - Logs own and remote positions to a FAT SD card, and reads `RADIO.CFG`
+//!   from it at boot.
+//! - Serves the gps-proto GATT service, extended with telemetry, the
+//!   remote-node roster, status lines and bulk transfer.
+//! - Takes a radio config or a firmware image over BLE or the USB console.
+//!
 //! Pin assignments come from the board, not from preference:
 //!
 //! - D5 (GPIO43) and D2 (GPIO14) are **active low** - the LED anodes sit on
-//!   +3V3 through R21/R20, so driving the pin low is what lights them.
+//!   +3V3 through R21/R20, so driving the pin low is what lights them. D5
+//!   blinks on a LoRa receive, D2 on a transmit.
 //! - GPIO43 is also UART0_TX, which is why the console is on the USB
 //!   Serial/JTAG port (GPIO19/20 to the USB-C J3) instead. Expect the ROM
 //!   bootloader's own log to flicker D5 on every reset.
-//!
-//! Not yet ported from the C6 build: bulk transfer (radio TOML over the
-//! bulk characteristic), deep sleep with its nvs-backed settings, the
-//! remote-node roster, and the USB console. See `PORT-WIO-S3.md`.
 
 #![no_std]
 #![no_main]
 
 use bt_hci::controller::ExternalController;
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, Either};
-use embassy_time::{Duration, Instant, Timer};
+use embassy_futures::select::{select, select3};
+use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
+use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
+use esp_hal::rtc_cntl::Rtc;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
 use esp_hal::spi::Mode;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::{Config as UartConfig, Uart};
+use esp_hal::usb_serial_jtag::UsbSerialJtag;
 use esp_println::println;
 use gps_proto::packet;
-use midair_proto::radiocfg::RadioConfig;
-use midair_proto::{ble, link, radiocfg, session};
+use midair_proto::bulk::{self, Owner};
+use midair_proto::radiocfg::{self, RadioConfig};
+use midair_proto::roster::{Report, Value};
+use midair_proto::{ble, link, lora, session};
 use trouble_host::prelude::*;
 use wio_s3_gps::gps::{Gps, BAUD as GPS_BAUD};
+use wio_s3_gps::node::Node;
 use wio_s3_gps::radio::Sx1262Driver;
-use wio_s3_gps::sdlog::SdLog;
+use wio_s3_gps::sdlog::{SdLog, CONFIG_MAX};
 use wio_s3_gps::state::{self, Request};
 use wio_s3_gps::sx1262::Sx1262;
+use wio_s3_gps::{flash, qprintln, settings, status_println, vprintln, xfer};
 
-/// Status LED, cathode on GPIO43. Active low.
+/// Status LEDs, cathodes on GPIO43 and GPIO14. Active low.
 const LED_ON: Level = Level::Low;
 const LED_OFF: Level = Level::High;
+
+/// How long an activity LED stays lit for one packet.
+const BLINK_MS: u32 = 20;
 
 /// The SX1262 SPI clock. The chip takes up to 16 MHz; the bus here is
 /// entirely inside the module, so this is conservative rather than tuned.
@@ -62,18 +79,60 @@ const SD_SPI_HZ: u32 = 400_000;
 const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 2;
 
-/// How often a connected central is sent a fresh position and telemetry.
-const NOTIFY_INTERVAL_MS: u32 = 1_000;
+/// Build-time BLE address override, most-significant octet first (e.g.
+/// "FF:C6:A1:53:50:47"). `Some` only when `BLE_ADDRESS` was set at build
+/// time (build.rs validates and normalizes it, and emits nothing otherwise);
+/// `None` derives a per-chip address from the eFuse MAC instead.
+const BLE_ADDRESS_OVERRIDE: Option<&str> = option_env!("BLE_ADDRESS");
 
-/// Power/sleep settings. The C6 keeps this in RTC RAM with an nvs backup so
-/// it survives deep sleep and a flat cell; deep sleep is not ported yet, so
-/// for now it lives only here and resets with the board.
-static mut STORED: session::Stored = session::Stored::new();
+/// `a` happened at or after deadline `b` in wrapping-u32 time.
+fn due(now: u32, deadline: u32) -> bool {
+    now.wrapping_sub(deadline) < 0x8000_0000
+}
 
-#[allow(static_mut_refs)]
-fn stored() -> &'static mut session::Stored {
-    // Only the GATT session touches this, and there is one at a time.
-    unsafe { &mut STORED }
+/// The board's BLE address as the LSB-first array `Address::random` expects.
+///
+/// With no build-time override it is derived from the chip's factory MAC in
+/// eFuse, so every board is unique out of the box: the MAC's most-
+/// significant octet gets its top two bits set, which is all a static-random
+/// address requires, and the per-chip low bytes keep it distinct.
+fn ble_address() -> [u8; 6] {
+    match BLE_ADDRESS_OVERRIDE {
+        Some(s) => {
+            // build.rs has already validated the override, so a malformed
+            // octet here can only be a bug; fall back to zero rather than
+            // panicking on the device.
+            let mut out = [0u8; 6];
+            for (i, octet) in s.split(':').take(6).enumerate() {
+                out[5 - i] = u8::from_str_radix(octet, 16).unwrap_or(0);
+            }
+            out
+        }
+        None => {
+            // read_base_mac_address is MSB-first; reverse to LSB-first and
+            // set the static-random bits on what becomes the MSB.
+            let mac = esp_hal::efuse::Efuse::read_base_mac_address();
+            let mut out = [0u8; 6];
+            for i in 0..6 {
+                out[i] = mac[5 - i];
+            }
+            out[5] |= 0xC0;
+            out
+        }
+    }
+}
+
+/// Format an LSB-first address array as the MSB-first display string.
+fn fmt_ble_address(a: &[u8; 6]) -> heapless::String<17> {
+    use core::fmt::Write as _;
+    let mut s = heapless::String::new();
+    for i in (0..6).rev() {
+        let _ = write!(s, "{:02X}", a[i]);
+        if i != 0 {
+            let _ = s.push(':');
+        }
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -102,8 +161,7 @@ struct GpsService {
     /// Radio telemetry in the midair-proto wire format.
     #[characteristic(uuid = ble::TELEMETRY_UUID_U128, read, notify)]
     telemetry: [u8; link::TELEMETRY_LEN],
-    /// Bulk transfer ops. Declared so the service shape matches the C6's;
-    /// the handler is not ported yet.
+    /// Bulk transfer ops: a radio config, or a firmware image.
     #[characteristic(uuid = ble::BULK_UUID_U128, write)]
     bulk: heapless::Vec<u8, 200>,
     /// Last remote position heard over LoRa.
@@ -137,20 +195,18 @@ async fn main(spawner: Spawner) -> ! {
     let timg0 = TimerGroup::new(peripherals.TIMG0);
     esp_rtos::start(timg0.timer0);
 
-    // D5. Starts dark so the first blink is visibly the firmware's, not a
-    // leftover level from the ROM bootloader driving UART0_TX.
+    // D5 and D2. Both start dark so the first blink is visibly the
+    // firmware's, not a leftover level from the ROM bootloader driving
+    // UART0_TX - and so an unconfigured pin does not leave an LED biased
+    // just under its forward voltage instead of held off.
     let d5 = Output::new(peripherals.GPIO43, LED_OFF, OutputConfig::default());
-    // D2. Nothing drives it yet, but it is claimed and parked dark rather
-    // than left as a reset-state input: its cathode sits on this pin with
-    // the anode on +3V3 through R20, so an unconfigured pin leaves the LED
-    // biased just under its forward voltage instead of held off.
-    let _d2 = Output::new(peripherals.GPIO14, LED_OFF, OutputConfig::default());
+    let d2 = Output::new(peripherals.GPIO14, LED_OFF, OutputConfig::default());
 
     // Every pin the board brings out but the firmware does not use. A
     // CMOS input left floating sits wherever leakage puts it, which can be
     // mid-rail - both halves of the input buffer partly on, drawing current
     // and coupling noise into everything beside it. That is invisible at
-    // 75 mA and is most of the budget once deep sleep lands.
+    // 75 mA and is most of the budget in deep sleep.
     //
     // Pulled down rather than driven, because five of these leave the board:
     // GPIO10/11 on the J5 JST-SH and GPIO38-41/47 on the J1 header. A pull
@@ -183,6 +239,55 @@ async fn main(spawner: Spawner) -> ! {
     // the ROM loader. GPIO19/20 belong to the USB Serial/JTAG peripheral.
 
     println!("wio-s3-gps v{} up", env!("CARGO_PKG_VERSION"));
+
+    // Was this a deep-sleep wake check, or a real boot? Read before
+    // anything can clear it.
+    let woke_from_sleep = matches!(
+        esp_hal::system::wakeup_cause(),
+        esp_hal::system::SleepSource::Timer
+    );
+
+    // Flash: the settings mirror and the OTA slots.
+    flash::install(flash::Flash::new(peripherals.FLASH)).await;
+    // Point ota-data at the running slot if it names none - the state
+    // every USB flash leaves behind, and the one the slot arithmetic
+    // cannot reason from.
+    if flash::with_flash(|f| f.normalize_otadata()).await == Some(true) {
+        println!("ota: ota-data initialized for the running slot");
+    }
+    // A freshly activated image is on probation until it says otherwise;
+    // getting this far is the assertion. No-op on a board flashed with a
+    // single-app partition table.
+    if flash::with_flash(|f| f.confirm_boot()).await == Some(true) {
+        println!("ota: running image confirmed");
+    }
+    // Booted and selected are read separately on purpose: the first comes
+    // from the MMU and the second from ota-data, and a disagreement is the
+    // bootloader having rolled an image back.
+    match flash::with_flash(|f| (f.ota_available(), f.booted_slot(), f.selected_slot())).await {
+        Some((true, booted, selected)) => {
+            println!("ota: booted {:?}, ota-data selects {:?}", booted, selected);
+            if booted != selected {
+                println!("ota: WARNING - the bootloader did not run the selected image");
+            }
+        }
+        _ => println!("ota: no update slots (single-app partition table)"),
+    }
+    // Only a cold boot pays for the flash read - a wake check still holds
+    // its RTC RAM copy.
+    if let Some(saved) = settings::restore().await {
+        println!(
+            "nvs: restored sleep {} s, adv window {} s, flags {:#x}",
+            saved.sleep_interval_s,
+            saved.adv_window(),
+            saved.flags
+        );
+    }
+
+    // Resolve and publish the BLE address before any task can be asked for
+    // it over USB.
+    let addr_bytes = ble_address();
+    state::set_ble_address(addr_bytes);
 
     // Wio-S3 internal SX1262 wiring, from the module datasheet. Confirmed
     // against hardware - do not guess at these. An earlier build had three
@@ -253,8 +358,15 @@ async fn main(spawner: Spawner) -> ! {
     let sdlog = SdLog::new(embedded_sdmmc::SdCard::new(sd_dev, Delay::new()));
 
     spawner
-        .spawn(hardware_task(lora, gps, sdlog, d5))
+        .spawn(hardware_task(lora, gps, sdlog, d5, d2))
         .expect("spawn hardware task");
+
+    // The USB console: firmware text out, framed host commands in.
+    let usb = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async();
+    let (usb_rx, usb_tx) = usb.split();
+    spawner
+        .spawn(wio_s3_gps::usb::usb_task(usb_rx, usb_tx))
+        .expect("spawn usb task");
 
     // BLE. Same stack the C6 runs.
     let radio = esp_radio::init().expect("radio init");
@@ -263,9 +375,12 @@ async fn main(spawner: Spawner) -> ! {
             .expect("ble connector");
     let controller = ExternalController::<_, 20>::new(transport);
 
+    println!("BLE-ADDR {}", fmt_ble_address(&addr_bytes));
+
     let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
         HostResources::new();
-    let stack = trouble_host::new(controller, &mut resources);
+    let stack = trouble_host::new(controller, &mut resources)
+        .set_random_address(Address::random(addr_bytes));
     let Host {
         mut peripheral,
         mut runner,
@@ -280,20 +395,23 @@ async fn main(spawner: Spawner) -> ! {
 
     // Seed the readable value so a central that reads immediately after
     // discovery cannot beat the first publish in `gatt_session`.
-    let _ = server
-        .gps
-        .settings
-        .set(&server, &stored().settings(NOTIFY_INTERVAL_MS).encode());
+    let _ = server.gps.settings.set(&server, &current_settings().encode());
+
+    let mut rtc = Rtc::new(peripherals.LPWR);
+    if woke_from_sleep {
+        qprintln!("woke from deep sleep for an advertising window");
+    }
 
     let _ = select(
         async {
             loop {
                 if runner.run().await.is_err() {
+                    qprintln!("ble host error, restarting");
                     Timer::after(Duration::from_millis(200)).await;
                 }
             }
         },
-        serve(&mut peripheral, &server),
+        serve(&mut peripheral, &server, &mut rtc),
     )
     .await;
 
@@ -303,15 +421,43 @@ async fn main(spawner: Spawner) -> ! {
     }
 }
 
+/// The settings characteristic value: what an app reads on connect.
+fn current_settings() -> ble::Settings {
+    settings::get().settings(state::notify_interval_ms())
+}
+
+/// Park what a sleeping board cannot use, then deep sleep.
+///
+/// There is no rail to cut on this board - the GPS and SD sit directly on
+/// +3V3 - so the radio is the one load the firmware can actually drop, and
+/// dropping it is worth doing: continuous RX is 5.5 mA against the module's
+/// 9.3 uA asleep. The hardware loop owns the radio, so this asks and waits
+/// rather than reaching for it.
+///
+/// The MAX-M10 keeps acquiring throughout, which is the dominant draw and a
+/// board fact rather than a firmware choice; `CFG_GPS_SLEEP` is the lever
+/// for that and it is the app's to pull.
+async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
+    state::SLEEP_READY.reset();
+    state::request(Request::PrepareSleep);
+    // Far longer than the 10 ms pass the loop takes to notice; if it is
+    // wedged, sleeping anyway beats staying awake at full current.
+    let _ = with_timeout(Duration::from_secs(1), state::SLEEP_READY.wait()).await;
+    println!("deep sleep for {} s (radio parked, gps still acquiring)", interval_s);
+    let timer = TimerWakeupSource::new(core::time::Duration::from_secs(interval_s as u64));
+    rtc.sleep_deep(&[&timer])
+}
+
 /// Advertise, accept one central, serve it, repeat.
 ///
-/// The C6 wraps this in a `session::Window` so an unattended board can give
-/// up and deep sleep. Deep sleep is not ported yet, so for now the board
-/// advertises indefinitely - which is exactly what the C6 does with
-/// `sleep_interval_s = 0`, its default.
+/// With sleep mode active, a bounded advertising window ends in deep sleep
+/// instead of advertising forever. The budget is a deadline rather than a
+/// per-attempt timeout, so no retry path below can extend it - see
+/// [`session::Window`].
 async fn serve<C: Controller>(
     peripheral: &mut Peripheral<'_, C, DefaultPacketPool>,
     server: &Server<'_>,
+    rtc: &mut Rtc<'_>,
 ) {
     let mut adv_data = [0u8; 31];
     let adv_len = AdStructure::encode_slice(
@@ -329,8 +475,17 @@ async fn serve<C: Controller>(
     )
     .expect("scan data fits");
 
+    let mut window = session::Window::new(Instant::now().as_millis(), settings::get().adv_window());
+
     loop {
-        println!("advertising as {}", ble::DEVICE_NAME);
+        let sleep_interval = settings::get().sleep_interval_s;
+        // Budget spent, whatever used it up.
+        if let session::Next::Sleep { interval_s } =
+            window.next(Instant::now().as_millis(), sleep_interval)
+        {
+            enter_deep_sleep(rtc, interval_s).await;
+        }
+        qprintln!("advertising as {}", ble::DEVICE_NAME);
         let advertiser = match peripheral
             .advertise(
                 &AdvertisementParameters::default(),
@@ -343,91 +498,243 @@ async fn serve<C: Controller>(
         {
             Ok(a) => a,
             Err(_) => {
-                println!("advertise failed, retrying");
+                qprintln!("advertise failed, retrying");
                 Timer::after(Duration::from_secs(1)).await;
                 continue;
             }
         };
-        let conn = match advertiser.accept().await {
-            Ok(c) => c,
-            Err(_) => {
-                // A central started a connection and it did not complete.
-                // The pause keeps a repeated failure off a hot spin.
-                println!("connect attempt failed");
-                Timer::after(Duration::from_millis(200)).await;
-                continue;
+
+        let conn = if sleep_interval > 0 {
+            let left = Duration::from_millis(window.remaining_ms(Instant::now().as_millis()));
+            match with_timeout(left, advertiser.accept()).await {
+                Ok(Ok(c)) => c,
+                Ok(Err(_)) => {
+                    // A central started a connection and it did not
+                    // complete. The pause keeps a repeated failure off a
+                    // hot spin, and it comes out of the wake budget like
+                    // everything else.
+                    qprintln!("connect attempt failed");
+                    Timer::after(Duration::from_millis(200)).await;
+                    continue;
+                }
+                // Window expired with nobody interested.
+                Err(_) => enter_deep_sleep(rtc, sleep_interval).await,
+            }
+        } else {
+            match advertiser.accept().await {
+                Ok(c) => c,
+                Err(_) => {
+                    qprintln!("connect attempt failed");
+                    Timer::after(Duration::from_millis(200)).await;
+                    continue;
+                }
             }
         };
+
         let Ok(conn) = conn.with_attribute_server(server) else {
             continue;
         };
-        println!("central connected");
+        qprintln!("central connected");
         gatt_session(&conn, server).await;
-        println!("central disconnected");
+        qprintln!("central disconnected");
+
+        // A transfer the phone was midway through does not outlive it.
+        xfer::abort(Owner::Ble, Instant::now().as_millis()).await;
+
+        // Linger by advertising, not by idling. The point is to let the
+        // phone come straight back, which it cannot do if the board is
+        // awake but not discoverable. Looping back re-advertises, and the
+        // deadline check at the top sends the board down when the linger
+        // runs out.
+        window.linger(Instant::now().as_millis());
     }
+}
+
+/// Refresh the settings characteristic and notify the central. Covers
+/// changes the device makes on its own (a clamped interval, settings
+/// restored from flash), not just ones the app asked for.
+async fn publish_settings<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>) {
+    let value = current_settings().encode();
+    if server.gps.settings.set(server, &value).is_err() {
+        return;
+    }
+    // An unsubscribed central is not an error - the value stays readable.
+    let _ = server.gps.settings.notify(conn, &value).await;
+}
+
+/// Refresh the radio-config characteristic. A no-op until the radio has
+/// been configured, so the characteristic never carries the all-zero
+/// placeholder as if it were a real config.
+async fn publish_radio_config<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>) {
+    let Some(value) = state::radio_config() else {
+        return;
+    };
+    if server.gps.radio_config.set(server, &value).is_err() {
+        return;
+    }
+    let _ = server.gps.radio_config.notify(conn, &value).await;
+}
+
+/// Which characteristic a write landed on, sampled before the reply goes
+/// out so the work can happen after it.
+enum Wrote {
+    Config,
+    Bulk,
+    Other,
 }
 
 /// One connection: publish what an app needs on arrival, then stream.
 async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &Server<'_>) {
+    // Drop status lines buffered while disconnected so the central sees
+    // live events, not a stale backlog.
+    state::drain_log();
+    // Cleared here rather than reacted to: the publish below covers
+    // whatever is cached now.
+    state::RADIO_CONFIG_SIGNAL.reset();
+
     // Publish before anything else, so an app can populate its controls
     // without waiting for a notify interval.
-    let settings = stored().settings(NOTIFY_INTERVAL_MS).encode();
-    let _ = server.gps.settings.set(server, &settings);
-    let _ = server.gps.settings.notify(conn, &settings).await;
+    publish_settings(server, conn).await;
+    publish_radio_config(server, conn).await;
 
-    let mut next_notify = Instant::now();
+    // Hand the new central every node heard from recently. Their ages go
+    // out with them, so a report from before this connection cannot be
+    // read as a live one.
+    state::replay_remotes(Instant::now().as_millis());
 
-    loop {
-        // Either the central said something, or the notify interval came
-        // round. Nothing else can wake this.
-        match select(conn.next(), Timer::at(next_notify)).await {
-            Either::First(event) => match event {
-                GattConnectionEvent::Disconnected { .. } => return,
+    let events = async {
+        loop {
+            match conn.next().await {
+                GattConnectionEvent::Disconnected { .. } => break,
                 GattConnectionEvent::Gatt { event } => {
-                    let is_config = matches!(&event, GattEvent::Write(w) if w.handle() == server.gps.config.handle);
-                    let data_ack = if is_config {
-                        let GattEvent::Write(w) = &event else {
-                            unreachable!()
+                    // Copy the write out and let the attribute server finish
+                    // the transaction before doing any of the work: a config
+                    // apply reaches the SD card and a firmware chunk erases
+                    // a flash sector, either of which is long enough that a
+                    // central would otherwise see its write time out.
+                    let mut data = [0u8; 200];
+                    let mut len = 0usize;
+                    let mut wrote = Wrote::Other;
+                    if let GattEvent::Write(w) = &event {
+                        let d = w.data();
+                        len = d.len().min(data.len());
+                        data[..len].copy_from_slice(&d[..len]);
+                        wrote = if w.handle() == server.gps.config.handle {
+                            Wrote::Config
+                        } else if w.handle() == server.gps.bulk.handle {
+                            Wrote::Bulk
+                        } else {
+                            Wrote::Other
                         };
-                        Some(apply_config(w.data()))
-                    } else {
-                        None
-                    };
-                    let _ = event.accept().map(|reply| reply.send());
-                    if let Some((ack, _len)) = data_ack {
-                        let _ = server.gps.ack.notify(conn, &ack).await;
-                        // The write may have changed something the settings
-                        // characteristic reports.
-                        let settings = stored().settings(NOTIFY_INTERVAL_MS).encode();
-                        let _ = server.gps.settings.set(server, &settings);
-                        let _ = server.gps.settings.notify(conn, &settings).await;
+                    }
+                    if let Ok(reply) = event.accept() {
+                        reply.send().await;
+                    }
+                    match wrote {
+                        Wrote::Config => {
+                            let (ack, _) = apply_config(&data[..len]).await;
+                            let _ = server.gps.ack.notify(conn, &ack).await;
+                            // The write may have changed something the
+                            // settings characteristic reports, including
+                            // through clamping.
+                            publish_settings(server, conn).await;
+                        }
+                        Wrote::Bulk => {
+                            let (ack, _) =
+                                xfer::handle(Owner::Ble, Instant::now().as_millis(), &data[..len])
+                                    .await;
+                            let _ = server.gps.ack.notify(conn, &ack).await;
+                        }
+                        Wrote::Other => {}
                     }
                 }
                 _ => {}
-            },
-            Either::Second(_) => {
-                next_notify += Duration::from_millis(NOTIFY_INTERVAL_MS as u64);
+            }
+        }
+    };
 
-                // Hold notifications while the radio has the air. A LoRa
-                // transmit at 22 dBm beside a 2.4 GHz radio is a supply
-                // problem; on the two-MCU board this was a `RADIO_BUSY`
-                // link message, here it is a bool.
-                if state::radio_busy() {
-                    continue;
-                }
+    let notifier = async {
+        let mut next_notify = Instant::now();
+        loop {
+            Timer::at(next_notify).await;
+            next_notify += Duration::from_millis(u64::from(state::notify_interval_ms()));
+            // A tick that took longer than the interval - a slow notify, or
+            // a shortened interval - would otherwise leave the deadline in
+            // the past, and `Timer::at` on a past instant returns at once.
+            // That is a spin, not a catch-up.
+            next_notify = next_notify.max(Instant::now());
 
-                let (position, dirty) = state::take_position();
-                if let Some(p) = position
-                    && dirty
-                {
-                    let _ = server.gps.position.notify(conn, &p.encode()).await;
-                }
-                if let Some(t) = state::telemetry() {
-                    let _ = server.gps.telemetry.notify(conn, &t.encode()).await;
+            // Hold notifications while the radio has the air. A LoRa
+            // transmit at 22 dBm beside a 2.4 GHz radio is a supply
+            // problem; on the two-MCU board this was a `RADIO_BUSY` link
+            // message, here it is a bool.
+            if state::radio_busy() {
+                continue;
+            }
+
+            let (position, dirty) = state::take_position();
+            if let Some(p) = position
+                && dirty
+                && server.gps.position.notify(conn, &p.encode()).await.is_err()
+            {
+                break;
+            }
+            if let Some(t) = state::telemetry() {
+                let _ = server.gps.telemetry.notify(conn, &t.encode()).await;
+            }
+        }
+    };
+
+    // Remote reports are pushed as they arrive rather than sampled on the
+    // notify tick: a node's report is news exactly once, and two nodes
+    // reporting inside one tick would mean only the second was ever sent.
+    let remotes = async {
+        loop {
+            state::REMOTE_SIGNAL.wait().await;
+            while state::radio_busy() {
+                Timer::after(Duration::from_millis(100)).await;
+            }
+            while let Some(value) = state::take_remote(Instant::now().as_millis()) {
+                // `set` first so the value is readable by a central that
+                // never subscribed; an unsubscribed notify is not an error.
+                match value {
+                    Value::Position(v) => {
+                        if server.gps.remote.set(server, &v).is_ok() {
+                            let _ = server.gps.remote.notify(conn, &v).await;
+                        }
+                    }
+                    Value::Ping(v) => {
+                        if server.gps.node_ping.set(server, &v).is_ok() {
+                            let _ = server.gps.node_ping.notify(conn, &v).await;
+                        }
+                    }
                 }
             }
         }
-    }
+    };
+
+    // Stream status lines to the central as they arrive. Notify errors are
+    // non-fatal (a central that never subscribed just misses them), so this
+    // arm never ends the session on its own.
+    let logger = async {
+        loop {
+            let line = state::LOG_CHANNEL.receive().await;
+            let _ = server.gps.log.notify(conn, &line).await;
+        }
+    };
+
+    // Republish the radio config whenever a new one is adopted, so an app's
+    // radio editor updates without a reconnect.
+    let config_pub = async {
+        loop {
+            state::RADIO_CONFIG_SIGNAL.wait().await;
+            publish_radio_config(server, conn).await;
+        }
+    };
+
+    // Any arm ending (disconnect, or a position notify that failed) ends
+    // the session.
+    select3(select3(events, notifier, logger), config_pub, remotes).await;
 }
 
 /// Apply a config-characteristic write.
@@ -437,8 +744,13 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
 /// changed is the far side: an action that used to be a link frame and a
 /// wait for the WIO's answer is now a signal to the hardware loop, so the
 /// ack the policy built always holds.
-fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
-    let outcome = session::apply(stored(), data);
+async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
+    let mut stored = settings::get();
+    let outcome = session::apply(&mut stored, data);
+    settings::set(stored);
+    if outcome.save {
+        settings::save().await;
+    }
     match outcome.action {
         session::Action::GpsSleep(on) => state::request(Request::GpsSleep(on)),
         // No second MCU to put to sleep; the nearest thing is parking the
@@ -446,11 +758,64 @@ fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
         session::Action::WioSleep(on) => state::request(Request::RadioStandby(on)),
         // No host-controlled rail on this board - the GPS and SD sit
         // directly on +3V3. See BOARD-REVIEW.md in the board repo.
-        session::Action::Rail(_) => println!("config: rail control has no hardware here"),
-        _ => {}
+        session::Action::Rail(_) => qprintln!("config: rail control has no hardware here"),
+        session::Action::NotifyInterval(ms) => {
+            state::set_notify_interval_ms(ms);
+            qprintln!("config: notify interval set to {} ms", ms);
+        }
+        session::Action::SleepInterval(secs) => {
+            qprintln!("config: sleep interval {} s", secs);
+        }
+        session::Action::AdvWindow(secs) => {
+            qprintln!("config: advertising window {} s", secs);
+        }
+        session::Action::None => {
+            qprintln!("config: rejected write (status {})", outcome.ack[1]);
+        }
     }
     (outcome.ack, outcome.ack_len)
 }
+
+// ---------------------------------------------------------------------------
+// Hardware
+// ---------------------------------------------------------------------------
+
+/// An activity LED that is lit from the loop rather than by blocking in it.
+///
+/// The obvious `set_high(); Timer::after(20ms); set_low()` costs the receive
+/// path twenty milliseconds it should be spending polling the radio, which
+/// at the default settings is most of a packet.
+struct Blinker {
+    pin: Output<'static>,
+    off_at: u32,
+    lit: bool,
+}
+
+impl Blinker {
+    fn new(pin: Output<'static>) -> Self {
+        Self {
+            pin,
+            off_at: 0,
+            lit: false,
+        }
+    }
+
+    fn pulse(&mut self, now: u32) {
+        self.pin.set_level(LED_ON);
+        self.off_at = now.wrapping_add(BLINK_MS);
+        self.lit = true;
+    }
+
+    fn update(&mut self, now: u32) {
+        if self.lit && due(now, self.off_at) {
+            self.pin.set_level(LED_OFF);
+            self.lit = false;
+        }
+    }
+}
+
+/// How many times a settings push is retried before the loop stops asking.
+const GPS_CFG_TRIES: u8 = 5;
 
 /// Everything that is not BLE: the radio, the GPS and the card.
 ///
@@ -459,88 +824,459 @@ fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
 /// and signals back through [`state::Request`].
 #[embassy_executor::task]
 async fn hardware_task(
-    mut lora: Sx1262Driver<'static>,
+    lora: Sx1262Driver<'static>,
     mut gps: Gps<'static>,
     mut sdlog: SdLog<'static>,
-    mut d5: Output<'static>,
+    d5: Output<'static>,
+    d2: Output<'static>,
 ) {
-    // The module wires SX1262 DIO2 to the SKY13453 RF switch's VCTL and
-    // DIO3 to its VDD, so the radio owns its own antenna path. Both are
-    // enforced inside `init` rather than set here: this config is the
-    // firmware's own, but the one that arrives over BLE is not.
-    let cfg = RadioConfig::default();
-    lora.init(&cfg).await;
-    if !lora.print_diagnostics() {
+    let mut rx_led = Blinker::new(d5);
+    let mut tx_led = Blinker::new(d2);
+
+    // Give the card a chance to mount before its config is asked for.
+    sdlog.poll(0);
+
+    // Radio config: the SD file, else defaults. Unlike the two-MCU board
+    // there is no second copy in the MCU's own flash - the card is the
+    // store, and a config pushed over BLE or USB is written back to it.
+    let mut cfg_buf = [0u8; CONFIG_MAX];
+    let from_sd = sdlog
+        .read_config(&mut cfg_buf)
+        .and_then(|n| match radiocfg::parse_bytes(&cfg_buf[..n]) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                println!("config: RADIO.CFG invalid ({:?}), using defaults", e);
+                None
+            }
+        });
+    let (mut cfg, mut cfg_loaded) = match from_sd {
+        Some(c) => {
+            println!("config: RADIO.CFG loaded (address {})", c.address);
+            (c, true)
+        }
+        None => {
+            println!("config: none stored, using defaults");
+            (RadioConfig::default(), false)
+        }
+    };
+    // Honor sd_enabled only now: the setting itself lives on the card, so
+    // the card has to be read before it can say to stop using it.
+    if !cfg.sd_enabled {
+        println!("SD: disabled by config");
+        sdlog.disable(0);
+    }
+    state::set_verbose(cfg.verbose);
+    state::set_radio_config(cfg.encode());
+
+    let mut node = Node::new(lora, &cfg);
+    node.radio_mut().init(&cfg).await;
+    if !node.radio_mut().print_diagnostics() {
         println!("radio did not answer - check the pin map in main");
     }
     gps.configure(&cfg.gps).await;
 
-    let mut buf = [0u8; 255];
+    // The settings that survive a deep sleep are re-applied here, because
+    // the wake that restored them is a fresh boot to everything else.
+    let stored = settings::get();
+    if stored.gps_sleep() {
+        gps.sleep();
+    }
+    if stored.wio_sleep() {
+        node.radio_mut().standby();
+    }
+    let mut standby = stored.wio_sleep();
+
+    status_println!(
+        "node {} up ({}), {} Hz SF{} BW{}",
+        cfg.address,
+        cfg.role.as_str(),
+        cfg.frequency_hz,
+        cfg.spreading_factor,
+        cfg.bandwidth_khz
+    );
+
     let mut rx_count: u32 = 0;
-    let mut last_rssi: i16 = 0;
-    let mut last_status_s: u64 = u64::MAX;
-    let start = Instant::now();
+    let mut tx_count: u32 = 0;
+    let mut had_fix = false;
+    // Whether a fix has ever held since boot, which is what separates a fix
+    // lost from one never acquired in the no-fix ping below.
+    let mut ever_had_fix = false;
+
+    let boot = Instant::now().as_millis() as u32;
+    // Stagger the first beacon so a fleet powered up together does not
+    // transmit as one. Folded into eight slots rather than scaled by the
+    // address itself, which made node 200 sit silent for three and a half
+    // minutes after boot with nothing on the console to explain it.
+    let mut next_beacon = boot
+        .wrapping_add((cfg.address as u32 % 8) * 1_000)
+        .wrapping_add(2_000);
+    let mut next_status = boot.wrapping_add(5_000);
+    let mut next_pos = boot;
+    let mut next_gps_cfg = boot;
+    let mut gps_cfg_tries: u8 = 0;
+    let mut gps_nmea_seen = false;
+    let mut gps_checked = false;
+    let gps_grace_until = boot.wrapping_add(5_000);
 
     loop {
-        if let Some(r) = state::take_request() {
+        let now_ms = Instant::now().as_millis();
+        let now = now_ms as u32;
+        rx_led.update(now);
+        tx_led.update(now);
+
+        // ---- Requests from the BLE session and the host tools -----------
+        while let Some(r) = state::take_request() {
             match r {
-                Request::GpsSleep(true) => gps.sleep(),
-                Request::GpsSleep(false) => gps.wake().await,
-                Request::RadioStandby(true) => lora.standby(),
-                Request::RadioStandby(false) => lora.init(&cfg).await,
+                Request::GpsSleep(true) => {
+                    gps.sleep();
+                    status_println!("gps: backup mode");
+                }
+                Request::GpsSleep(false) => {
+                    gps.wake().await;
+                    // `wake` marks the module unconfigured: backup mode
+                    // loses the RAM layer the settings live in. Re-arm the
+                    // retry so the loop pushes them again once the receiver
+                    // is talking.
+                    gps_cfg_tries = 0;
+                    next_gps_cfg = now;
+                    status_println!("gps: woken");
+                }
+                Request::RadioStandby(true) => {
+                    node.radio_mut().standby();
+                    standby = true;
+                    status_println!("radio: standby");
+                }
+                Request::RadioStandby(false) => {
+                    node.radio_mut().init(&cfg).await;
+                    standby = false;
+                    status_println!("radio: back from standby");
+                }
+                Request::ApplyConfig => {
+                    apply_radio_config(&mut node, &mut gps, &mut sdlog, &mut cfg, now).await;
+                    cfg_loaded = true;
+                    gps_cfg_tries = 0;
+                    next_gps_cfg = now.wrapping_add(2_000);
+                }
+                Request::PrepareSleep => {
+                    // Cold sleep, not standby: `init` runs again on the
+                    // wake, which is a full reset anyway.
+                    node.radio_mut().sleep();
+                    standby = true;
+                    state::SLEEP_READY.signal(());
+                }
+                Request::Reboot => {
+                    // Long enough for the ack that asked for this to leave
+                    // the USB FIFO or the BLE connection.
+                    Timer::after(Duration::from_millis(500)).await;
+                    esp_hal::system::software_reset();
+                }
             }
         }
 
+        // A bulk transfer whose host walked away must not hold the board
+        // off the air; the USB task bounds its own read, and this covers a
+        // transfer that arrived over BLE. Gated on the flag so the common
+        // case does not queue behind whoever holds the transfer lock.
+        if state::transfer_active() {
+            xfer::expire(now_ms).await;
+        }
+
+        if standby {
+            // Only BLE and the console stay alive.
+            Timer::after(Duration::from_millis(50)).await;
+            continue;
+        }
+
+        // ---- GPS ---------------------------------------------------------
         gps.poll();
-        if gps.take_updated() {
+        let fix = gps.has_fix();
+        if fix != had_fix {
+            had_fix = fix;
+            if fix {
+                ever_had_fix = true;
+                status_println!("gps fix acquired ({} sats)", gps.packet().sats);
+            } else {
+                status_println!("gps fix lost");
+            }
+        }
+        if !gps_nmea_seen && gps.present() {
+            gps_nmea_seen = true;
+            status_println!("gps: NMEA up ({} bytes)", gps.rx_bytes());
+        }
+        // Settings retry. Two things leave the module running its own
+        // defaults while the firmware reports the ones it asked for: a
+        // boot-time push that landed before the receiver had finished
+        // starting, and a wake from backup mode, which cuts power to the
+        // receiver core and takes the whole RAM configuration layer with it
+        // - including the four NMEA sentences this firmware silences to fit
+        // 9600 baud. Driving the retry off `configured` rather than off the
+        // first sentence covers both, since `wake` clears it.
+        if !gps.configured
+            && !gps.sleeping
+            && gps.present()
+            && gps_cfg_tries < GPS_CFG_TRIES
+            && due(now, next_gps_cfg)
+        {
+            next_gps_cfg = now.wrapping_add(2_000);
+            gps_cfg_tries += 1;
+            if gps.configure(&cfg.gps).await {
+                status_println!("gps: settings applied");
+            } else if gps_cfg_tries == GPS_CFG_TRIES {
+                status_println!("gps: settings still not accepted, giving up");
+            }
+        }
+        if !gps_checked && due(now, gps_grace_until) {
+            gps_checked = true;
+            if !gps.present() {
+                if gps.rx_bytes() == 0 {
+                    status_println!("gps: silent on UART1 (power/wiring?)");
+                } else {
+                    status_println!("gps: {} bytes but no NMEA (baud?)", gps.rx_bytes());
+                }
+            }
+        }
+        if gps.take_updated() && due(now, next_pos) {
+            next_pos = now.wrapping_add(1_000);
             let p = gps.packet();
             state::set_position(p);
-            sdlog.log_position(start.elapsed().as_millis() as u32, 0, 0, &p);
+            if gps.has_fix() {
+                sdlog.log_position(now, 0, 0, &p);
+            }
         }
 
-        if let Some((len, rssi)) = lora.poll_recv(&mut buf) {
+        // ---- LoRa beacon: a position, or a ping without a fix ------------
+        //
+        // Gated on the role here rather than inside the transmit, so a
+        // receive-only node never claims the air for a broadcast it was
+        // never going to send.
+        //
+        // One transmission per interval either way. A fix goes out as a
+        // position; without one the slot carries a ping, so a node
+        // searching for the sky is a node a receiver can hear rather than
+        // one indistinguishable from out of range or dead. A ping is the
+        // smaller of the two on air, so this cannot push a node past the
+        // duty cycle its beacon already fits in.
+        if cfg.role.transmits()
+            && cfg.beacon_interval_s != 0
+            && due(now, next_beacon)
+            && !state::transfer_active()
+        {
+            // The SX1262 does not reset with the MCU. If it browned out and
+            // restarted on its own it is back at its power-up defaults -
+            // antenna switch unpowered, DIO2 not switching - and keying up
+            // into that ramps +22 dBm into an isolated port. Nothing about
+            // it looks wrong from the counters, so this is the only place
+            // it can be caught.
+            if node.radio_mut().looks_reset() {
+                status_println!("radio restarted underneath us, re-initializing");
+                node.radio_mut().init(&cfg).await;
+            }
+            let payload_is_fix = gps.has_fix();
+            state::set_radio_busy(true);
+            tx_led.pulse(now);
+            let sent = if payload_is_fix {
+                let (pos, n) = lora::encode_position(&gps.packet(), cfg.beacon_fields);
+                node.broadcast(&pos[..n]).await
+            } else {
+                node.broadcast(
+                    &lora::Ping {
+                        uptime_s: (now_ms / 1_000).min(u16::MAX as u64) as u16,
+                        gps_present: gps.present(),
+                        had_fix: ever_had_fix,
+                    }
+                    .encode(),
+                )
+                .await
+            };
+            state::set_radio_busy(false);
+            match sent {
+                Ok(()) => {
+                    tx_count = tx_count.saturating_add(1);
+                    vprintln!(
+                        "beacon {} ({} bytes on air)",
+                        if payload_is_fix { "position" } else { "ping" },
+                        cfg.beacon_airtime_us() / 1000
+                    );
+                }
+                Err(e) => vprintln!("beacon TX failed: {:?}", e),
+            }
+            // Jitter on top of the interval so two nodes that happened to
+            // line up do not stay lined up.
+            let jitter = node.random(2_000);
+            next_beacon = now
+                .wrapping_add(cfg.beacon_interval_s as u32 * 1_000)
+                .wrapping_add(jitter);
+        }
+
+        // ---- LoRa receive -------------------------------------------------
+        if let Some(rx) = node.poll(now) {
             rx_count = rx_count.saturating_add(1);
-            last_rssi = rssi;
-            println!("rx {} bytes, {} dBm", len, rssi);
-            // Blink D5 on receive, as the WIO did on D6.
-            d5.set_level(LED_ON);
-            Timer::after(Duration::from_millis(20)).await;
-            d5.set_level(LED_OFF);
+            rx_led.pulse(now);
+            if let Some(p) = lora::decode_position(rx.payload) {
+                vprintln!("position from node {} rssi {}", rx.src, rx.rssi);
+                let mut v = [0u8; ble::REMOTE_LEN];
+                v[0] = rx.src;
+                v[1..3].copy_from_slice(&rx.rssi.to_le_bytes());
+                v[3..].copy_from_slice(&p.encode());
+                state::record_remote(now_ms, Report::Position(v));
+                sdlog.log_position(now, rx.src, rx.rssi, &p);
+            } else if let Some(ping) = lora::Ping::decode(rx.payload) {
+                // A node on the air with no fix to report. Nothing to log
+                // to SD - there is no position - but an app gets it as data
+                // as well as prose, so it can show the node as
+                // alive-without-a-fix rather than parse the line below.
+                let mut v = [0u8; link::PING_LEN];
+                v[0] = rx.src;
+                v[1..3].copy_from_slice(&rx.rssi.to_le_bytes());
+                v[3] = ping.flags();
+                v[4..6].copy_from_slice(&ping.uptime_s.to_le_bytes());
+                state::record_remote(now_ms, Report::Ping(v));
+                status_println!(
+                    "node {} ping: rssi {}, up {}s, gps {}{}",
+                    rx.src,
+                    rx.rssi,
+                    ping.uptime_s,
+                    if ping.gps_present { "ok" } else { "silent" },
+                    if ping.had_fix { ", fix lost" } else { "" }
+                );
+            } else {
+                vprintln!(
+                    "node {} sent {} bytes this build does not decode",
+                    rx.src,
+                    rx.payload.len()
+                );
+            }
         }
 
+        // ---- Repeat forwarding --------------------------------------------
+        // Only a node configured as a repeater ever has one of these
+        // queued; a leaf-only network never enters this branch.
+        if node.repeat_due(now) && !state::transfer_active() {
+            state::set_radio_busy(true);
+            tx_led.pulse(now);
+            let went = node.send_due_repeat(now).await;
+            state::set_radio_busy(false);
+            if went {
+                tx_count = tx_count.saturating_add(1);
+            }
+        }
+
+        // ---- Telemetry -----------------------------------------------------
+        let secs_since_rx = match node.last_rx_ms() {
+            Some(t) => (now.wrapping_sub(t) / 1000).min(0xFFFE) as u16,
+            None => 0xFFFF,
+        };
+        let mut flags = 0u8;
+        if sdlog.ready() {
+            flags |= link::TELEM_FLAG_SD_OK;
+        }
+        if gps.has_fix() {
+            flags |= link::TELEM_FLAG_GPS_FIX;
+        }
+        if cfg_loaded {
+            flags |= link::TELEM_FLAG_CFG_LOADED;
+        }
+        if cfg.verbose {
+            flags |= link::TELEM_FLAG_VERBOSE;
+        }
         state::set_telemetry(link::Telemetry {
-            last_rssi,
-            last_snr_cb: lora.last_snr_cb(),
-            secs_since_rx: 0,
+            last_rssi: node.last_rssi(),
+            last_snr_cb: node.radio().last_snr_cb(),
+            secs_since_rx,
             rx_count,
-            tx_count: 0,
-            flags: 0,
+            tx_count,
+            flags,
             sats: gps.packet().sats,
         });
 
-        sdlog.poll(start.elapsed().as_millis() as u32);
+        sdlog.poll(now);
 
-        // Periodic status. Without this a quiet radio and a quiet GPS look
-        // identical from the console, which is exactly the state the board
-        // is in until the pin map is confirmed.
-        let secs = start.elapsed().as_secs();
-        if secs != last_status_s && secs % 10 == 0 {
-            last_status_s = secs;
-            let (mode, err) = lora.health();
-            println!(
-                "t={}s radio {} err 0x{:04X} rx {} | gps {} sentences ({} B) fix {} sats {} | sd {}",
-                secs,
+        // ---- Periodic status ------------------------------------------------
+        // Without this a quiet radio and a quiet GPS look identical from the
+        // console.
+        if due(now, next_status) {
+            next_status = now.wrapping_add(10_000);
+            let (mode, err) = node.radio_mut().health();
+            status_println!(
+                "t={}s radio {} err {:04x} rx {} tx {} | gps {} nmea fix {} sats {} | sd {} | nodes {}",
+                now_ms / 1000,
                 mode,
                 err,
                 rx_count,
+                tx_count,
                 gps.rx_sentences(),
-                gps.rx_bytes(),
-                gps.has_fix(),
+                gps.has_fix() as u8,
                 gps.packet().sats,
-                if sdlog.ready() { "mounted" } else { "absent" }
+                if sdlog.ready() { "mounted" } else { "absent" },
+                state::remote_count()
+            );
+            // Verbose only: break down what the radio heard but did not
+            // deliver, so "a couple of random RXs" can be read as mostly
+            // CRC failures (weak signal / parameter mismatch), duplicates,
+            // or this node's own echoes rather than a mystery. Counts are
+            // cumulative since boot.
+            let d = node.rx_drops();
+            vprintln!(
+                "dropped: crc {} dup {} echo {} malformed {} oversize {} repeat-full {}",
+                node.radio().rx_crc_errors(),
+                d.duplicate,
+                d.own_echo,
+                d.malformed,
+                node.radio().rx_oversize(),
+                d.repeat_full
             );
         }
 
         Timer::after(Duration::from_millis(10)).await;
+    }
+}
+
+/// Adopt a radio config that arrived over BLE or USB.
+///
+/// The transfer already parsed it - a config that would not parse never
+/// reaches here, and the host was told so in the ack. What is left is the
+/// hardware: the radio, the node's own addressing, the GPS, and the card
+/// copy that has to survive a reboot.
+async fn apply_radio_config(
+    node: &mut Node<'static>,
+    gps: &mut Gps<'static>,
+    sdlog: &mut SdLog<'static>,
+    cfg: &mut RadioConfig,
+    now: u32,
+) {
+    let mut raw = [0u8; bulk::CONFIG_MAX];
+    let Some((new_cfg, len)) = xfer::take_pending(&mut raw) else {
+        return;
+    };
+    let regps = new_cfg.gps != cfg.gps;
+    *cfg = new_cfg;
+    node.radio_mut().init(cfg).await;
+    node.reconfigure(cfg);
+    state::set_verbose(cfg.verbose);
+    state::set_radio_config(cfg.encode());
+    if !cfg.sd_enabled {
+        sdlog.disable(now);
+    }
+    // The card is the only place this survives a reboot, so a write that
+    // did not land has to reach the operator rather than sit in a console
+    // nobody is reading - it is the difference between a config that is
+    // applied and one that is applied until the next power cycle.
+    let stored = sdlog.write_config(now, &raw[..len]);
+    status_println!(
+        "config applied, node {} ({}), {}",
+        cfg.address,
+        cfg.role.as_str(),
+        if stored {
+            "saved to SD"
+        } else {
+            "NOT SAVED - lost on reboot"
+        }
+    );
+    if regps && !gps.sleeping {
+        if gps.configure(&cfg.gps).await {
+            status_println!("gps reconfigured");
+        } else {
+            status_println!("gps did not accept settings");
+        }
     }
 }

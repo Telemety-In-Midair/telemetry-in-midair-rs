@@ -312,7 +312,6 @@ impl<'d> Gps<'d> {
         put(CFG_MSGOUT_GSA, &[0]);
         put(CFG_MSGOUT_GSV, &[0]);
         put(CFG_MSGOUT_VTG, &[0]);
-        drop(put);
         self.ubx(0x06, 0x8A, &p[..n]);
         self.configured = self.wait_ack(0x06, 0x8A).await;
         self.configured

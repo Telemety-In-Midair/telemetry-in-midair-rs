@@ -1,5 +1,14 @@
 [target.xtensa-esp32s3-none-elf]
-runner = "espflash flash --monitor --chip esp32s3"
+# The partition table has two OTA slots rather than one factory app, so it
+# has to be named here - espflash defaults to a single-app table that has
+# nowhere to put an update.
+#
+# `--erase-parts otadata` is what keeps a USB flash authoritative. Without
+# it, a board that took an over-the-air update is booting ota_1, and the
+# image this writes into ota_0 would sit unused until the next OTA - which
+# looks exactly like a flash that did not take. Erased otadata falls back to
+# the first app slot, which is the one just written.
+runner = """espflash flash --monitor --chip esp32s3 --flash-size 16mb --partition-table partitions.csv --target-app-partition ota_0 --erase-parts otadata"""
 
 [env]
 

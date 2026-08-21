@@ -23,7 +23,7 @@ use embassy_time::{Duration, Instant, Timer};
 use esp_println::println;
 use midair_proto::radiocfg::RadioConfig;
 
-use crate::sx1262::{irq, reg, FallbackMode, StandbyClk, Sx1262, RX_CONTINUOUS};
+use crate::sx1262::{dev_err, irq, mode, reg, FallbackMode, StandbyClk, Sx1262, RX_CONTINUOUS};
 
 #[derive(Debug)]
 pub enum Sx1262Error {
@@ -319,15 +319,54 @@ impl<'d> Sx1262Driver<'d> {
     /// particular - is a radio burning current between transmissions rather
     /// than listening.
     pub fn health(&mut self) -> (&'static str, u16) {
-        let mode = match (self.radio.status() >> 4) & 0x07 {
-            0x02 => "standby",
-            0x03 => "standby-xosc",
-            0x04 => "fs",
-            0x05 => "rx",
-            0x06 => "tx",
+        let name = match self.chip_mode() {
+            mode::STDBY_RC => "standby",
+            mode::STDBY_XOSC => "standby-xosc",
+            mode::FS => "fs",
+            mode::RX => "rx",
+            mode::TX => "tx",
             _ => "?",
         };
-        (mode, self.radio.device_errors())
+        (name, self.radio.device_errors())
+    }
+
+    /// The chip mode from bits 6:4 of the status byte.
+    fn chip_mode(&mut self) -> u8 {
+        (self.radio.status() >> 4) & 0x07
+    }
+
+    /// Whether the radio looks like it restarted underneath the firmware.
+    ///
+    /// The SX1262 is a separate chip with its own supply, so it can brown
+    /// out and come back without the MCU noticing. What it comes back as is
+    /// the problem: DIO2 and DIO3 return to their power-up defaults, which
+    /// on this board means the antenna switch is unpowered and not
+    /// switching, and the next transmit ramps +22 dBm into an isolated
+    /// port. Nothing about that looks wrong from the packet counters.
+    ///
+    /// Two signals, either of which is enough:
+    ///
+    /// - `XOSC_START_ERR` latched again. [`init`](Self::init) clears it on
+    ///   the way out, precisely so that seeing it afterwards means the chip
+    ///   ran its power-up calibration a second time.
+    /// - A listening node whose radio is not in RX. Continuous receive is
+    ///   armed once and persists; standby is where a reset leaves it.
+    pub fn looks_reset(&mut self) -> bool {
+        let status = self.radio.status();
+        // Nothing on the bus at all - not a restart, but equally not a
+        // radio that should be keyed up.
+        if status == 0x00 || status == 0xFF {
+            return true;
+        }
+        if self.radio.device_errors() & dev_err::XOSC_START != 0 {
+            return true;
+        }
+        self.listen && self.rx_active && (status >> 4) & 0x07 != mode::RX
+    }
+
+    /// Whether this node's receiver is enabled at all.
+    pub fn listens(&self) -> bool {
+        self.listen
     }
 
     /// Print radio diagnostics. Returns `true` if the radio responds.
@@ -403,6 +442,11 @@ impl<'d> Sx1262Driver<'d> {
 
         let status = self.radio.irq_status();
         if status & irq::RX_DONE == 0 {
+            // Something else is latched - a TxDone or a timeout left over
+            // from a transmit whose clear did not land. Clear it, or DIO1
+            // stays asserted and every future poll pays for an SPI read
+            // that can only answer the same way.
+            self.radio.clear_irq_status(irq::ALL);
             return None;
         }
 

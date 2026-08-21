@@ -97,6 +97,34 @@ pub mod reg {
     pub const SYNC_WORD_PRIVATE: (u8, u8) = (0x14, 0x24);
 }
 
+/// Latched operational errors, as returned by `GetDeviceErrors`.
+///
+/// These are the only report of a radio that reached a healthy-looking mode
+/// without working: a TCXO that never started, a calibration or PLL lock
+/// that failed, a PA that would not ramp.
+pub mod dev_err {
+    pub const RC64K_CALIB: u16 = 1 << 0;
+    pub const RC13M_CALIB: u16 = 1 << 1;
+    pub const PLL_CALIB: u16 = 1 << 2;
+    pub const ADC_CALIB: u16 = 1 << 3;
+    pub const IMG_CALIB: u16 = 1 << 4;
+    /// The 32 MHz oscillator did not start. On this board that means DIO3
+    /// is not supplying the TCXO - which is also the antenna switch's VDD,
+    /// so it is a transmit-into-an-isolated-port condition, not a range one.
+    pub const XOSC_START: u16 = 1 << 5;
+    pub const PLL_LOCK: u16 = 1 << 6;
+    pub const PA_RAMP: u16 = 1 << 8;
+}
+
+/// Chip modes, as they appear in bits 6:4 of the status byte.
+pub mod mode {
+    pub const STDBY_RC: u8 = 0x02;
+    pub const STDBY_XOSC: u8 = 0x03;
+    pub const FS: u8 = 0x04;
+    pub const RX: u8 = 0x05;
+    pub const TX: u8 = 0x06;
+}
+
 /// IRQ bits, as returned by `GetIrqStatus`.
 pub mod irq {
     pub const TX_DONE: u16 = 1 << 0;
