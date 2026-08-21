@@ -132,6 +132,15 @@ pub struct Transfer {
     /// this a config that was applied and saved comes back as a failure.
     last_crc: u32,
     applied: bool,
+    /// Set when the last completed transfer verified but the caller would
+    /// not adopt it - a config whose bytes arrived intact and then failed
+    /// to parse.
+    ///
+    /// Kept apart from `applied` because a repeated `OP_END` has to answer
+    /// differently for each: the host reads "no such transfer" on a retry as
+    /// work that is already committed, so a rejected config would come back
+    /// as a success if it could not say otherwise.
+    rejected: bool,
     buf: [u8; CONFIG_MAX],
 }
 
@@ -155,6 +164,7 @@ impl Transfer {
             last_ms: 0,
             last_crc: 0,
             applied: false,
+            rejected: false,
             buf: [0; CONFIG_MAX],
         }
     }
@@ -183,6 +193,16 @@ impl Transfer {
     /// retry of that one keeps failing - which is the truth.
     pub fn mark_applied(&mut self) {
         self.applied = true;
+        self.rejected = false;
+    }
+
+    /// Record that the completed transfer verified but could not be used -
+    /// a config whose bytes were intact and whose contents were not. A
+    /// repeated `OP_END` then reports the rejection rather than an absent
+    /// transfer, which a host reads as success.
+    pub fn mark_rejected(&mut self) {
+        self.rejected = true;
+        self.applied = false;
     }
 
     /// Drop an in-flight transfer, e.g. because the connection carrying it
@@ -297,6 +317,7 @@ impl Transfer {
         self.want_crc = want_crc;
         self.running_crc = 0;
         self.applied = false;
+        self.rejected = false;
         self.last_ms = now_ms;
         (Event::None, ack(packet::ACK_OK, &0u32.to_le_bytes()))
     }
@@ -349,10 +370,13 @@ impl Transfer {
     fn end(&mut self, owner: Owner, sink: &mut dyn Sink) -> (Event, Ack) {
         if !self.active || self.owner != owner {
             // Either a retry of an END that already landed, or a stray op.
-            // Whether the last transfer was applied is what tells them
-            // apart, and the host reads OK as "the work is committed".
+            // What the last transfer came to is what tells them apart: the
+            // host reads OK as "the work is committed", and a rejection has
+            // to keep reading as a rejection however many times it is asked.
             return if self.applied {
                 (Event::None, ack(packet::ACK_OK, &[]))
+            } else if self.rejected {
+                (Event::None, nak(packet::ACK_BAD_VALUE))
             } else {
                 (Event::None, nak(ble::ACK_BAD_STATE))
             };
@@ -614,6 +638,26 @@ mod tests {
         assert_eq!(status(&a), packet::ACK_OK);
         // And it does not re-fire the work.
         assert_eq!(event, Event::None);
+    }
+
+    /// A config that arrived intact and then would not parse must keep
+    /// answering as a rejection. A host retries an END whose ack went
+    /// missing, and reads "no such transfer" on a retry as work that is
+    /// already committed - so without this the board reports a config it
+    /// refused as one it adopted.
+    #[test]
+    fn a_rejected_config_stays_rejected() {
+        let mut t = Transfer::new();
+        assert_eq!(push(&mut t, ble::KIND_TOML, TOML, &mut NoFirmware), Event::Config);
+        t.mark_rejected();
+        let (event, a) = t.handle(Owner::Ble, 0, &[ble::OP_END], &mut NoFirmware);
+        assert_eq!(event, Event::None);
+        assert_eq!(status(&a), packet::ACK_BAD_VALUE);
+        // And the next transfer starts clean rather than inheriting it.
+        assert_eq!(push(&mut t, ble::KIND_TOML, TOML, &mut NoFirmware), Event::Config);
+        t.mark_applied();
+        let (_, a) = t.handle(Owner::Ble, 0, &[ble::OP_END], &mut NoFirmware);
+        assert_eq!(status(&a), packet::ACK_OK);
     }
 
     /// Two transports cannot interleave into one buffer.

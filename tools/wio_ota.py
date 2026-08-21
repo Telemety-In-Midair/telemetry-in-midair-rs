@@ -129,20 +129,47 @@ def main() -> int:
         sys.exit(f"\nfirmware push failed: {e}")
     print(f"transfer complete in {time.monotonic() - started:.1f}s")
 
-    # The board reboots about half a second after acking the final step, so
-    # the next thing on the console is a fresh boot line. Seeing it is what
-    # separates "the image was accepted" from "the image runs".
-    booted = link.read_console(ser, "wio-s3-gps v", timeout=15.0)
-    if not booted:
-        print("image installed, but no boot line seen within 15 s.\n"
-              "If the board does not come back, a bootloader built with "
-              "rollback will revert to the previous slot on its own.")
+    # The board reboots about half a second after acking the final step.
+    # Its USB Serial/JTAG port is part of the chip, not a separate bridge,
+    # so the reset takes the port down with it and the OS hands back a new
+    # one - the handle open here goes stale rather than going quiet.
+    print("rebooting into the new image")
+    ser.close()
+    booted = wait_for_boot(args.port)
+    if booted is None:
+        print("image installed, but the board did not come back with a boot "
+              "line within 20 s.\nIf it does not, a bootloader built with "
+              "rollback reverts to the previous slot on its own.")
         return 2
-    print(booted)
-    slot = link.read_console(ser, "ota: booted", timeout=5.0)
-    if slot:
-        print(slot)
+    for line in booted:
+        print(line)
     return 0
+
+
+def wait_for_boot(port: str | None, timeout: float = 20.0) -> list[str] | None:
+    """Re-open the port after the reboot and read the board's boot lines.
+
+    Returns the version line and the OTA slot line, or None if the board did
+    not announce itself in time.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.5)
+        try:
+            ser = link.open_port(port)
+        except (OSError, SystemExit):
+            continue
+        version = link.read_console(ser, "wio-s3-gps v", timeout=max(1.0, deadline - time.monotonic()))
+        if version is None:
+            ser.close()
+            continue
+        lines = [version]
+        slot = link.read_console(ser, "ota: booted", timeout=3.0)
+        if slot:
+            lines.append(slot)
+        ser.close()
+        return lines
+    return None
 
 
 if __name__ == "__main__":

@@ -90,6 +90,10 @@ pub async fn handle(owner: Owner, now_ms: u64, data: &[u8]) -> Ack {
                 ack
             }
             Err(e) => {
+                // Recorded on the transfer, not just answered here: the
+                // host retries an END whose ack went missing, and a retry
+                // has to keep reading as a rejection.
+                t.mark_rejected();
                 crate::status_println!("config: rejected, {:?}", e);
                 packet::encode_ack(ble::ACK_ID_BULK, packet::ACK_BAD_VALUE, &[])
             }
