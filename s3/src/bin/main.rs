@@ -782,7 +782,7 @@ async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
 
 /// An activity LED that is lit from the loop rather than by blocking in it.
 ///
-/// The obvious `set_high(); Timer::after(20ms); set_low()` costs the receive
+/// The obvious light-it, `Timer::after(20ms)`, dark-it costs the receive
 /// path twenty milliseconds it should be spending polling the radio, which
 /// at the default settings is most of a packet.
 struct Blinker {
@@ -952,10 +952,11 @@ async fn hardware_task(
                     status_println!("radio: back from standby");
                 }
                 Request::ApplyConfig => {
-                    apply_radio_config(&mut node, &mut gps, &mut sdlog, &mut cfg, now).await;
-                    cfg_loaded = true;
-                    gps_cfg_tries = 0;
-                    next_gps_cfg = now.wrapping_add(2_000);
+                    if apply_radio_config(&mut node, &mut gps, &mut sdlog, &mut cfg, now).await {
+                        cfg_loaded = true;
+                        gps_cfg_tries = 0;
+                        next_gps_cfg = now.wrapping_add(2_000);
+                    }
                 }
                 Request::PrepareSleep => {
                     // Cold sleep, not standby: `init` runs again on the
@@ -1249,10 +1250,10 @@ async fn apply_radio_config(
     sdlog: &mut SdLog<'static>,
     cfg: &mut RadioConfig,
     now: u32,
-) {
+) -> bool {
     let mut raw = [0u8; bulk::CONFIG_MAX];
     let Some((new_cfg, len)) = xfer::take_pending(&mut raw) else {
-        return;
+        return false;
     };
     let regps = new_cfg.gps != cfg.gps;
     *cfg = new_cfg;
@@ -1260,14 +1261,19 @@ async fn apply_radio_config(
     node.reconfigure(cfg);
     state::set_verbose(cfg.verbose);
     state::set_radio_config(cfg.encode());
-    if !cfg.sd_enabled {
-        sdlog.disable(now);
-    }
     // The card is the only place this survives a reboot, so a write that
     // did not land has to reach the operator rather than sit in a console
     // nobody is reading - it is the difference between a config that is
     // applied and one that is applied until the next power cycle.
+    //
+    // Written before `sd_enabled` is honored, and deliberately: a config
+    // that turns the card off still has to be *on* the card, or the next
+    // boot reads nothing and comes up with the card enabled again.
     let stored = sdlog.write_config(now, &raw[..len]);
+    if !cfg.sd_enabled {
+        status_println!("SD: disabled by config");
+        sdlog.disable(now);
+    }
     status_println!(
         "config applied, node {} ({}), {}",
         cfg.address,
@@ -1285,4 +1291,5 @@ async fn apply_radio_config(
             status_println!("gps did not accept settings");
         }
     }
+    true
 }

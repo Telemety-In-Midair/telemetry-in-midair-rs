@@ -1,54 +1,39 @@
-## Port parity (PORT-WIO-S3.md, steps 4b and 5)
-
-The single-module firmware does not yet do everything the two-MCU pair did.
-
-Bulk transfer handler. The BLE characteristic is declared so the service
-shape matches, but nothing handles a write, and the USB console it shares a
-path with is not up either - which is what `pixi run wio-config` needs.
-
-Deep sleep, with settings that survive it. `Stored` is a plain static that
-resets with the board; it needs RTC RAM plus the nvs mirror. Note the board
-changes the sums: there is no rail to cut, so a sleeping S3 sits beside a
-MAX-M10 that is still acquiring, and GPS backup mode is the only real lever.
-
-Remote-node roster replay on connect.
-
-OTA. `esp-bootloader-esp-idf` is already a dependency and the ESP-IDF
-bootloader does two-slot OTA with rollback; nothing drives it. This is what
-replaces the WIO's swap bootloader and `fw-upload`.
-
-Per-board BLE addresses. The C6 derived one from its eFuse MAC and let
-`--ble-address` override it at build time; `tools/gen_ble_address.py`
-survives and has nothing to feed.
-
 ## Before the beacon transmits
 
-**Re-check the radio before keying up.** The SX1262 does not reset with the
-MCU, and nothing re-checks it. If it browns out and restarts on its own it
-comes back with DIO2 and DIO3 at their power-up defaults - antenna switch
-unpowered, switching disabled - and the next `send()` ramps the PA into an
-isolated port with nothing having looked wrong. The beacon should read the
-chip mode and error word before transmitting and re-run `init` if either
-looks like a fresh power-up. Now that `init` clears the boot latch, a
-reappearing `XOSC_START_ERR` (0x0020) on the periodic status line is the
-signal.
+Everything below is written and builds; almost none of it has been run.
+That is now the whole of the remaining risk, and the radio is where it
+concentrates.
 
-There is no beacon at all yet: no `lora.send()` call anywhere, and
-`tx_count` is hardcoded to 0 in the telemetry. So the DIO2/DIO3 fix has
-never been exercised on air.
+**Run the radio against an existing node.** The air format did not change,
+so a ported board has to talk to an unported one - that is the test that
+says the port is real. The beacon exists now, so the DIO2/DIO3 fix is
+finally exercisable: a wrong value there transmits into an isolated port
+and destroys the module, and no amount of reading the code substitutes for
+watching the first transmission on a spectrum analyzer or a dummy load.
+
+Note the sync word is a flag day. Nodes on different sync words cannot hear
+each other at all, so reflash every node before testing - a partially
+updated fleet looks exactly like a range problem.
+
+**Confirm the eFuse state on a real module**, particularly `VDD_SPI_FORCE`:
+three of the four SD lines sit on ESP32-S3 strapping pins.
+
+**Watch the first OTA on a board you can reach.** The write path is guarded
+twice against targeting the running slot, but `partitions.csv` and the
+rollback behavior of espflash's bundled bootloader are both unverified.
+Keep a USB cable on the first one.
 
 ## Bench work
 
-Run the radio against an existing node. The air format did not change, so a
-ported board has to talk to an unported one - that is the test that says the
-port is real. Everything in `s3/` is written and builds; almost none of it
-has been run.
-
-Confirm the eFuse state on a real module, particularly `VDD_SPI_FORCE` -
-three of the four SD lines sit on ESP32-S3 strapping pins.
-
 Measure power. The numbers in `README.md` are the old board's, kept only as
-a baseline to beat.
+a baseline to beat. Deep sleep is worth measuring first: the radio is
+parked before the board sleeps, but the MAX-M10 keeps acquiring, and the
+whole question is how much the 9.3 uA module matters beside it.
+
+Check whether an OTA over BLE survives its own flash writes. Each sector
+takes tens of milliseconds with interrupts off, which should cost a
+connection event rather than the connection - "should" being the word doing
+the work.
 
 ## Radio
 
@@ -79,8 +64,9 @@ timer.
 ## Ideas
 
 Wi-Fi server, hotspot style. The C6 had Wi-Fi too, but with one MCU and 8 MB
-of PSRAM it no longer competes with the link task for room. Decide before
-the sleep work - it changes the sleep budget and the partition table.
+of PSRAM it no longer competes with the link task for room. It would want a
+partition of its own, which is a `partitions.csv` change and so a reflash
+rather than an OTA - worth deciding before a fleet is deployed.
 
 A listener dongle, possibly with a USB bridge.
 
@@ -89,7 +75,8 @@ Beeper.
 ## Open questions
 
 Will flashing the firmware with a `RADIO.CFG` present overwrite flags such
-as the node address?
+as the node address? (It should not: the card is read at boot and the card
+wins. Untested.)
 
 Will a sleeping board ever be connected to if an awake board is nearby?
 
@@ -101,6 +88,19 @@ no longer an A/B to run, so this is settled unless RM0453 says otherwise.
 
 ## Done
 
+Port parity with the two-MCU pair. The bulk transfer handler and the USB
+console `wio-config` needs; deep sleep with settings in RTC RAM and an nvs
+mirror; the remote-node roster replay on connect; OTA through the ESP-IDF
+bootloader's two slots; per-board BLE addresses from the eFuse MAC with a
+`BLE_ADDRESS` build override.
+
+The beacon itself, which the port never had: a position on the configured
+interval, a ping while there is no fix, `(src, id)` dedup, jittered
+repeating, and the radio re-checked before it keys up.
+
+`RADIO.CFG` read from the card at boot and honored, rather than compiled-in
+defaults with the file sitting unread.
+
 Antenna for BLE - the module brings the Wi-Fi/BT RF port out on its own
 connector. Note the board as drawn routes it to test point BLE1 and stops
 there, so a 2.4 GHz antenna is still a board change.
@@ -111,7 +111,3 @@ Try a slow preset now that nothing caps the listen window - defaults are
 SF12/BW500.
 
 Reduce packet size: payloads go out at their true length.
-
-Note the sync word is a flag day. Nodes on different sync words cannot hear
-each other at all, so reflash every node before testing - a partially
-updated fleet looks exactly like a range problem.

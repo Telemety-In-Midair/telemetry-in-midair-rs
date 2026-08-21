@@ -30,6 +30,8 @@ classDiagram
         <<pixi, USB serial>>
         cargo run flashes
         wio-config pushes a radio config
+        wio-ota pushes a firmware image
+        wio-info reads the BLE address
     }
     class RemoteNode {
         <<other board, 915 MHz>>
@@ -46,19 +48,38 @@ classDiagram
         accept one central()
     }
     class GattSession {
-        publish settings on connect
-        notify position and telemetry
-        apply_config()
+        publish settings and radio config
+        replay the roster on connect
+        notify position, telemetry, remotes, log
+        apply_config() bulk writes
+    }
+    class UsbTask {
+        <<USB Serial/JTAG>>
+        PING INFO BULK
     }
     class HardwareTask {
         owns radio, gps and card
-        poll_recv() beacon() log()
+        beacon() poll() repeat() log()
+        applies a pushed config
     }
     class State {
         <<snapshot, not a channel>>
         set_position() take_position()
-        radio_busy()
-        request() take_request()
+        radio_busy() transfer_active()
+        roster, log lines, request queue
+    }
+    class Xfer {
+        <<one transfer, either transport>>
+        handle(owner, op)
+    }
+    class FlashStore {
+        <<one peripheral, two users>>
+        nvs settings record
+        OtaSink into the idle slot
+    }
+    class Settings {
+        <<RTC RAM + nvs mirror>>
+        survives deep sleep and a flat cell
     }
 
     class MidairProto {
@@ -79,9 +100,19 @@ classDiagram
     class LinkCodec {
         USB bulk framing only
     }
+    class BulkTransfer {
+        ops, sequencing, crc
+        Sink for firmware images
+    }
 
+    class Node {
+        address, role, max hops
+        dedup by (src, id)
+        jittered repeat queue
+    }
     class Sx1262Driver {
         init() send() poll_recv()
+        looks_reset()
     }
     class Sx1262Cmds {
         <<SPI + NSS + BUSY + DIO1 + NRST>>
@@ -103,25 +134,38 @@ classDiagram
 
     Firmware *-- ServeTask
     Firmware *-- GattSession
+    Firmware *-- UsbTask
     Firmware *-- HardwareTask
+    Firmware *-- FlashStore
     ServeTask --> GattSession
+    ServeTask --> Settings : sleep interval, window
     GattSession <--> State
     HardwareTask <--> State
+    UsbTask --> Xfer
+    GattSession --> Xfer
+    Xfer --> BulkTransfer
+    Xfer --> FlashStore : OtaSink
+    Xfer ..> State : request(ApplyConfig)
+    Settings --> FlashStore : nvs mirror
+    GattSession --> Settings
 
     MidairProto *-- SessionPolicy
     MidairProto *-- Roster
     MidairProto *-- LoraCodec
     MidairProto *-- RadioConfig
     MidairProto *-- LinkCodec
+    MidairProto *-- BulkTransfer
 
     GattSession --> SessionPolicy
-    GattSession --> Roster
-    HardwareTask --> Sx1262Driver
+    State --> Roster
+    HardwareTask --> Node
     HardwareTask --> MaxM10
     HardwareTask --> SdCardHw
-    Sx1262Driver ..> LoraCodec
+    Node --> Sx1262Driver
+    Node ..> LoraCodec
     Sx1262Driver --> Sx1262Cmds
     Sx1262Driver --> RadioConfig : live settings
+    SdCardHw ..> RadioConfig : RADIO.CFG
     Sx1262Cmds --> RfSwitch : DIO2, DIO3
     RfSwitch <..> RemoteNode : broadcasts and hops
 ```
@@ -189,9 +233,11 @@ sequenceDiagram
     Serve->>Serve: advertise (service uuid + name)
     App->>Serve: connect
     Serve->>Gatt: hand over the connection
-    Gatt->>App: notify settings (so controls populate)
+    Gatt->>App: notify settings, radio config
+    Gatt->>St: replay_remotes()
+    St->>App: every node still inside the TTL, aged
 
-    loop every NOTIFY_INTERVAL_MS
+    loop every notify interval
         Gatt->>St: radio_busy()?
         alt radio has the air
             Gatt-->>Gatt: skip this tick
@@ -201,6 +247,10 @@ sequenceDiagram
         end
     end
 
+    Hw->>St: record_remote() when a node is heard
+    St->>Gatt: REMOTE_SIGNAL
+    Gatt->>App: notify remote or node_ping, once per report
+
     App->>Gatt: write config id
     Gatt->>Gatt: session::apply (host-tested policy)
     Gatt->>St: request(GpsSleep | RadioStandby)
@@ -208,8 +258,15 @@ sequenceDiagram
     St->>Hw: take_request() on the next loop
     Note over Gatt,Hw: the ack always holds - there is no<br/>second chip that can fail to answer
 
+    App->>Gatt: bulk ops (a radio config)
+    Gatt->>Gatt: reassemble, check the crc, parse
+    Gatt->>App: ack per op
+    Gatt->>St: request(ApplyConfig)
+    St->>Hw: re-init the radio, rewrite RADIO.CFG
+    Hw->>App: status line, then the new radio config
+
     App->>Serve: disconnect
-    Serve->>Serve: advertise again
+    Serve->>Serve: advertise again, then sleep if the window is spent
 ```
 
 Notifications hold while the radio has the air. A LoRa transmit at 22 dBm
@@ -261,23 +318,93 @@ Receive polling checks DIO1 as a GPIO before paying for an SPI round trip,
 which is most of what an idle node does. On the WIO-E5 there was no such
 pin - DIO1 was an internal NVIC vector - so every poll cost a transaction.
 
-## What is not ported yet
+## Where the config and the firmware live
 
-The single-MCU firmware is not yet at parity with what the two-MCU pair did.
-Outstanding, from `PORT-WIO-S3.md`:
+Both arrive the same way - a bulk transfer over BLE or the USB console -
+and the shared `midair_proto::bulk` state machine is what makes "one at a
+time" a property of the object rather than a flag someone has to check.
+Where they end up is what differs: a config is small, has to be parsed
+whole, and belongs on the card; an image is hundreds of kilobytes and goes
+straight to flash as it arrives.
 
-- **Bulk transfer.** The characteristic is declared so the service shape
-  matches, but the handler is not written, and neither is the USB console
-  that `wio-config` needs.
-- **Deep sleep**, with its nvs-backed settings. `Stored` sits in a plain
-  static that resets with the board.
-- **The remote-node roster replay** on connect.
-- **OTA.** The ESP-IDF bootloader does two-slot OTA with rollback and
-  `esp-bootloader-esp-idf` is already a dependency; nothing drives it.
-- **Per-board BLE addresses.** The C6 derived one from its eFuse MAC.
+```mermaid
+flowchart TB
+    App["gps-gui-rs<br/>(BLE)"] --> Xfer
+    Host["wio-config / wio-ota<br/>(USB)"] --> Xfer
+
+    Xfer{{"bulk::Transfer<br/>ops, sequencing, crc32<br/>owned by one transport"}}
+
+    Xfer -->|KIND_TOML| Parse["radiocfg::parse_bytes"]
+    Parse -->|Err| Nak["NAK the op<br/>(the host hears about it)"]
+    Parse -->|Ok| Pending["pending config"]
+    Pending --> Hw["HardwareTask"]
+    Hw --> Radio["re-init the radio<br/>reconfigure the node<br/>re-push GPS settings"]
+    Hw --> Card["write RADIO.CFG<br/>(the only copy that survives a reboot)"]
+
+    Xfer -->|KIND_OTA| Sink["OtaSink<br/>stage a sector, write it"]
+    Sink --> Slot["the app slot that is NOT running"]
+    Slot --> Activate["crc matched:<br/>point ota-data at it, mark New"]
+    Activate --> Boot["reboot"]
+    Boot --> Confirm["boots, reaches main:<br/>mark Valid"]
+    Boot -.->|never gets there| Rollback["bootloader reverts<br/>to the previous slot"]
+```
+
+Two things about the OTA path are load-bearing rather than incidental. The
+destination is checked against the slot the code is *executing* from, read
+from the MMU rather than from ota-data - the two disagree on every board
+just flashed over USB, and writing an image over the running slot destroys
+the firmware mid-transfer rather than failing. And ota-data is normalized at
+boot when it names no slot at all, which is the state a USB flash leaves it
+in, because the arithmetic that picks the *other* slot has nothing to work
+from otherwise.
+
+## The wake / advertise / sleep cycle
+
+```mermaid
+stateDiagram-v2
+    [*] --> Boot
+    Boot --> Advertise : window = adv_window_s
+
+    Advertise --> Connected : a central accepts
+    Connected --> Advertise : disconnect (linger 5 s)
+
+    Advertise --> Advertise : sleep_interval_s = 0<br/>(the default: never sleep)
+    Advertise --> Park : window spent and sleep_interval_s > 0
+    Park --> DeepSleep : radio in cold sleep
+    DeepSleep --> Boot : timer wake
+
+    note right of Park
+        There is no rail to cut on this
+        board, so the radio is the one load
+        the firmware can drop. The MAX-M10
+        keeps acquiring throughout - which
+        is the dominant draw, and a board
+        fact rather than a firmware choice.
+    end note
+
+    note left of Advertise
+        The budget is a deadline, not a
+        per-attempt timeout. A central that
+        keeps failing to connect cannot
+        restart it, which is what kept a
+        board awake at full current forever.
+    end note
+```
+
+Settings live in RTC fast RAM so a wake check costs no flash read, and are
+mirrored into the `nvs` partition so they also survive a flat cell. Only the
+settings that decide whether a board is reachable at all are mirrored; the
+GPS and radio sleep flags are not, because a board that cold-boots with its
+GPS running is the safer of the two failures.
+
+## What the board forces on the firmware
 
 Board facts that firmware cannot work around, from the carrier design:
 there is no rail to cut (GPS and SD sit on +3V3, so `Action::Rail` logs and
 does nothing), GPS `EXTINT` is not routed (backup mode wakes on UART traffic
 instead), `TIMEPULSE` is unconnected so there is no PPS discipline, and
 there is no battery sense divider so telemetry cannot report cell voltage.
+
+The Wi-Fi/BT RF port reaches test point BLE1 and stops there, so the 2.4 GHz
+side has no antenna on the board as drawn - BLE works at bench range on
+board parasitics.

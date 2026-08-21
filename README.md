@@ -17,7 +17,7 @@ the tree as of the single-module cleanup; `git log` still has it, and
 |-|-|-|
 | `proto/` | Shared no_std protocol crate: LoRa payloads, BLE extensions, `RADIO.CFG` parser, USB bulk framing. Host-testable (`cargo test`). | any |
 | `s3/` | Wio-S3 firmware (embassy + trouble BLE): radio, GPS, SD and the GATT service. | `xtensa-esp32s3-none-elf` (`esp` channel) |
-| `tools/` | Host tools (Python/pixi) for pushing a radio config over USB. | host |
+| `tools/` | Host tools (Python/pixi): push a radio config, push a firmware image, read a board's BLE address. | host |
 
 Depends on the sibling repo `../gps-proto` for the BLE position protocol
 and NMEA parsing (shared with `../esp32c3-gps` and `../gps-gui-rs`).
@@ -42,6 +42,24 @@ The console is on the USB Serial/JTAG port (GPIO19/20 to the USB-C
 connector), not UART0 - GPIO43 is UART0_TX on this board and drives the D5
 LED, so expect the ROM bootloader's own log to flicker it on every reset.
 
+`cargo run` flashes through `s3/partitions.csv`, which has two application
+slots rather than one factory app - that is what OTA needs somewhere to
+write. It also erases `otadata` on every flash, so the image just written is
+the one that boots; without that, a board that had taken an over-the-air
+update would keep booting the other slot and a fresh flash would look like
+it had not taken.
+
+To give a board a fixed BLE address instead of the per-chip one it derives
+from its eFuse MAC:
+
+```sh
+cd tools && pixi run gen-ble-address        # prints e.g. FF:C6:A1:53:50:47
+cd ../s3 && BLE_ADDRESS=FF:C6:A1:53:50:47 cargo run --release
+```
+
+`build.rs` rejects anything that is not a static-random address, so a bad
+one fails the build rather than flashing a radio that will not advertise.
+
 ## Configuring a board
 
 `RADIO.example.toml` documents every setting. It is a reference, not a card
@@ -64,11 +82,12 @@ Over BLE the board *does* report its current config (see below), so the
 gps-gui-rs app can read it back - its Radio page has a "Load from board"
 that fills the editor from the board itself.
 
-A pushed config is stored twice - `RADIO.CFG` on the card and a backup in
-internal flash - so it survives a power cycle on a board with no SD card.
-The card wins at boot, so editing `RADIO.CFG` on a computer still works.
-The board reports which stores it reached, and `wio-config` exits non-zero
-if a config went live but reached neither.
+A pushed config is written back to the card as `RADIO.CFG`, which is where
+it survives a power cycle - so editing that file on a computer and pushing
+over USB are the same thing arriving two ways. The two-MCU board also kept a
+backup in the WIO-E5's own flash; this one does not, so a board running
+without a card keeps a pushed config only until it reboots. It says so on
+the status line, and `wio-config` exits non-zero when that happens.
 
 The GPS and SD sit directly on +3V3 on this board, so there is no rail to
 raise before they answer.
@@ -88,7 +107,8 @@ coding_rate = 5            # 4/5..4/8 (5)
 power_dbm = 22             # -9..22 (22)
 rx_boost = true            # boosted RX gain (true)
 dcdc_enabled = true        # internal DC-DC instead of LDO (true)
-tcxo_volts = "1.8"         # TCXO supply; board hardware, not a tuning knob
+tcxo_volts = "3.3"         # TCXO supply; board hardware, not a tuning knob
+                           #   (also the antenna switch VDD - floored at 2.7)
 tcxo_startup_ms = 10       # TCXO settling wait, 1-1000 (10)
 
 [network]
@@ -256,7 +276,8 @@ the rename from `GPS-C6` is display text only). On top of the gps-proto
 position / config / ack characteristics the firmware adds telemetry (LoRa
 RSSI/SNR, counters, SD + fix flags), remote node positions and pings, a
 status/log characteristic (notify + read), the current radio config (read +
-notify), and a bulk write characteristic for TOML config.
+notify), and a bulk write characteristic carrying either a TOML config or a
+firmware image.
 
 ### Remote nodes
 
@@ -292,8 +313,8 @@ tail.
 
 The firmware writes human-readable status lines to the USB console on
 notable events - boot, GPS presence (first NMEA / silent module), GPS fix
-acquired/lost, radio standby/wake, config applied, and a no-fix ping heard
-from another node - and notifies the same text on the status/log
+acquired/lost, radio standby/wake, config applied, a radio that restarted
+underneath the firmware, and a no-fix ping heard from another node - and notifies the same text on the status/log
 characteristic, so gps-gui-rs (or any BLE client) sees the live log. Lines
 are ASCII, up to `link::LOG_MAX` (128) bytes.
 
@@ -326,18 +347,15 @@ Config command ids (config characteristic, `[id, len, value]`):
 | `0x10` | u8 0/1 | GPS + LoRa power rail - no hardware on this board, logged and ignored |
 | `0x11` | u8 0/1 | radio to standby / back to receive |
 | `0x12` | u8 0/1 | GPS backup mode (UBX-RXM-PMREQ / UART wake) |
-| `0x13` | u32 s | deep-sleep wake-check interval, 5 s..5 min, 0 = off (not ported yet) |
-| `0x14` | u32 s | advertising window per wake check, 3 s..60 s (default 15 s) |
+| `0x13` | u32 s | deep-sleep wake-check interval, 5 s..5 min, 0 = off (the default) |
+| `0x14` | u32 s | advertising window per wake check, 1 s..60 s (default 15 s) |
 
 ### Low power
 
-**Not ported yet.** Deep sleep and its nvs-backed settings are outstanding
-work (`PORT-WIO-S3.md`, step 5); `Stored` sits in a plain static that
-resets with the board, and the firmware advertises indefinitely. What
-follows is the policy `session::apply` still enforces and clamps - it is
-host-tested and unchanged - described as it will behave once the sleep path
-exists. Two board facts already change it: there is no rail to cut, and
-what the two-MCU board called the WIO's boot time is now nothing at all.
+Sleep is off by default (`0x13` = 0), which is what an unconfigured board
+does: advertise continuously. Two board facts shape everything below -
+there is no rail to cut, and what the two-MCU board called the WIO's boot
+time is now nothing at all.
 
 `0x13` turns sleep on. While set, the board deep-sleeps whenever no central
 is connected and wakes every interval to advertise for `0x14` seconds (one
@@ -353,8 +371,10 @@ slower to reach - a 5 s window at a 60 s interval is still four times the
 battery life of the 15 s default, and still gets you a wake every minute.
 What it costs is margin: the window has to overlap a phone's scan, and a
 phone that only scans intermittently can miss several short windows in a
-row. Unlike the interval, `0x14` has no "off" - a 0 clamps up to 3 s
-rather than being stored as a window nobody could connect in.
+row. Unlike the interval, `0x14` has no "off" - a 0 clamps up to 1 s
+rather than being stored as a window nobody could connect in. One second is
+a deliberate duty-cycle choice or a bench setting, not a comfortable connect
+time.
 
 A window changed over BLE applies from the next wake, not the current one.
 
@@ -366,11 +386,18 @@ and deep sleep leaves a MAX-M10 acquiring beside a sleeping S3 - which is
 the dominant draw. GPS backup mode (`0x12`) is the only real power lever,
 and the app should still expect a GPS cold TTFF after a long sleep.
 
-The interval, the window and the `0x10` rail setting will be held in RTC
+Before it sleeps the board puts the radio into cold sleep - the one load it
+can actually drop, 5.5 mA of continuous RX against the module's 9.3 uA
+asleep. The GPS keeps acquiring unless `0x12` says otherwise, because that
+is the app's call to make and a cold TTFF is what it costs.
+
+The interval, the window and the `0x10` rail setting are held in RTC fast
 RAM and mirrored to the `nvs` flash partition, so they survive deep sleep
 *and* a flat battery - a board put away for transport comes back on the same
 cadence rather than advertising until the cell dies again. Flash is read
-only on a cold boot; wake checks run from the RTC RAM copy.
+only on a cold boot; wake checks run from the RTC RAM copy. The two sleep
+flags are deliberately not mirrored: a board that cold-boots with its GPS
+running is the safer of the two failures.
 
 The wake is timed by the uncalibrated RC slow clock, so the interval
 drifts - it paces a wake-check, not a schedule.
@@ -409,16 +436,40 @@ a longer name is not a missing file but one that can never be opened.
 
 ## Firmware update
 
-Not ported yet. The ESP-IDF bootloader does two-slot OTA with rollback and
-`esp-bootloader-esp-idf` is already a dependency, but nothing drives it -
-`cargo run --release` over USB is the only path today.
+```sh
+cd tools && pixi run wio-ota          # builds ../s3 and pushes the image
+pixi run wio-ota --image firmware.bin # or send one you already have
+```
+
+The image goes into whichever of the two application slots the board is not
+running from, streamed a flash sector at a time. Nothing is pointed at it
+until the whole transfer has arrived and its CRC matched; then `otadata` is
+moved, the board reboots, and the new firmware marks itself confirmed once
+it has booted far enough to run `main`. A bootloader built with rollback
+enabled reverts to the previous slot if that never happens, so an image that
+cannot start costs a reboot rather than a board.
+
+An image must be an ESP-IDF *application image*, not the ELF - `wio-ota`
+checks the 0xE9 magic and refuses the ELF rather than letting the board
+write something it cannot boot. With no `--image` it runs the conversion
+(`espflash save-image`) itself.
+
+The same transfer works over BLE, on the bulk characteristic with
+`kind = 3`. Each sector write holds interrupts off for tens of milliseconds,
+which a BLE connection rides out but does notice; USB is the smoother path
+and the one the tool takes.
+
+`cargo run --release` over USB still works and is what puts a board onto the
+two-slot partition table in the first place. It erases `otadata`, so it
+always wins over whatever an OTA left selected.
 
 What this replaces: the two-MCU board streamed a raw STM32 image over the
 UART link into the WIO-E5's DFU partition, where a swap bootloader
 installed it power-fail-safely and reverted if the new image never
 confirmed boot. Bulk kind 2 carried it, over BLE or the ESP's USB port.
-That kind is retired rather than reused, so an old tool pushing an STM32
-image at this firmware is rejected instead of misread.
+That kind is retired rather than reused - kind 3 is the ESP image - so an
+old tool pushing an STM32 image at this firmware is rejected instead of
+misread into an app slot.
 
 ## Wio-S3 module
 

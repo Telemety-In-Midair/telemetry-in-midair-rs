@@ -45,7 +45,8 @@ classDiagram
     }
     class HostTools {
         <<pixi, USB serial>>
-        esp-upload becomes the only flash path
+        cargo run flashes over USB
+        wio-config, wio-ota, wio-info
         wio-upload and fw-upload retire
     }
     class RemoteNode {
@@ -322,8 +323,8 @@ report the LiPo voltage without a board change.
    `stm32wlxx-hal` stopped at embedded-hal 0.2, which ruled out
    `embedded-sdmmc`'s own driver. esp-hal implements 1.0, so the upstream
    driver does the job and that file is simply deleted.
-4. **BLE and session.** **Core written, not yet run.** The GATT service
-   is byte-identical to the C6's - same UUIDs from the shared crates - so
+4. **BLE and session.** **Written, not yet run.** The GATT service is
+   byte-identical to the C6's - same UUIDs from the shared crates - so
    gps-gui-rs needs no change. Advertising, connect, the settings publish
    and the position/telemetry stream are in, and config writes go through
    the same host-tested `session::apply`. The link is gone: an action
@@ -331,19 +332,49 @@ report the LiPo voltage without a board change.
    hardware loop picks up, so the ack the policy built always holds.
    `RADIO_BUSY` went the same way - it is a bool, not two frames.
 
-   Deferred to a 4b: the bulk transfer handler (the characteristic is
-   declared so the service shape matches), deep sleep with its nvs-backed
-   settings, the remote-node roster replay, and the USB console.
-5. **Sleep and OTA.** Redo the sleep story for one MCU, move firmware
-   update to ESP-IDF OTA, retire `wio-upload` and `fw-upload`.
+   4b is done too: the bulk transfer handler, the remote-node roster
+   replay on connect, the status/log stream, the radio-config read-back,
+   and the USB console `wio-config` speaks. The transfer state machine
+   moved into `proto/src/bulk.rs`, where `cargo test` can drive it - on
+   the two-MCU board it was split across two firmwares and neither half
+   could be tested at all.
+
+   The beacon was never part of any step and turned out to be missing
+   outright: the board could hear the network but had no `send()` call
+   anywhere, so the DIO2/DIO3 work had never been exercised on air.
+   `s3/src/node.rs` is the WIO's broadcast node ported over, and the
+   hardware loop beacons a position or a no-fix ping on the configured
+   interval - re-checking the radio first, since an SX1262 that browned
+   out comes back with its antenna switch unpowered.
+5. **Sleep and OTA.** **Written, not yet run.** Settings live in RTC fast
+   RAM with an `nvs` mirror, so they survive a deep sleep and a flat cell,
+   and a spent advertising window ends in a real `sleep_deep`. The radio is
+   parked first - there is no rail to cut on this board, so it is the one
+   load the firmware can drop.
+
+   Firmware update is the ESP-IDF bootloader's two slots, driven by
+   `s3/src/flash.rs` and `tools/wio_ota.py`; `partitions.csv` replaces the
+   single-app default and the flash runner erases `otadata` so a USB flash
+   always wins over whatever an OTA left selected. `wio-upload` and
+   `fw-upload` were already gone with step 6.
+
+   Two hazards found on the way in. `OtaUpdater::next_partition` picks the
+   *running* slot when `otadata` is erased, because `Factory` has no OTA
+   app number and the subtraction underflows - `otadata` is normalized at
+   boot and the destination is checked against the booted slot regardless.
+   And writing an image at the transfer's 192-byte chunk size would erase
+   each flash sector twenty-one times over, so writes are staged a sector
+   at a time.
 6. ~~**Cleanup.**~~ **Done.** `wio/`, `wio/bootloader/` and `esp/` are
    deleted, along with the `cmd`/`msg` link command sets and the host
    tools that only served the split. `ARCHITECTURE.md` is rewritten
    around the single-MCU design. What survives in `proto/src/link.rs` is
    the framing and the bulk transfer the host tools speak over USB.
 
-Steps 2 and 3 are independently testable against the current fleet,
-which is what makes this tractable.
+Every step is written. What is left is bench work: nothing in `s3/` has
+been run on hardware, and the first transmission is the one that proves the
+antenna switch is being driven rather than the PA being ramped into an
+isolated port.
 
 ## Open questions
 
