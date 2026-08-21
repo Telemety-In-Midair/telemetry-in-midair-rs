@@ -3,6 +3,8 @@
 //! Two consumers depend on this crate so the wire formats cannot drift: the
 //! Wio-S3 firmware (`s3/`) and host tests (`cargo test` in this directory).
 //!
+//! - [`bulk`]: the transfer a radio config or a firmware image arrives in,
+//!   over either BLE or the USB console.
 //! - [`link`]: the frame format. It was the UART protocol between the
 //!   ESP32-C6 and the WIO-E5 on the two-MCU board; one module has nothing
 //!   to link to, so what survives is the framing the host tools speak over
@@ -24,6 +26,7 @@
 pub use gps_proto;
 
 pub mod ble;
+pub mod bulk;
 pub mod link;
 pub mod lora;
 pub mod radiocfg;

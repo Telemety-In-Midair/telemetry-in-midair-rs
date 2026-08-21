@@ -257,6 +257,14 @@ pub const KIND_TOML: u8 = 1;
 /// the kind is retired rather than reused - an old tool pushing an STM32
 /// image at this firmware should be rejected, not misread.
 
+/// Bulk kind: an ESP-IDF application image for the inactive OTA slot.
+///
+/// The image is written straight through to flash as it arrives rather than
+/// buffered, and the next boot runs it (see [`crate::bulk::Sink`]). Kind 3
+/// rather than 2 so the two firmware formats can never be confused: an STM32
+/// image accepted here would be written into an app slot and bootlooped.
+pub const KIND_OTA: u8 = 3;
+
 /// Ack id used for bulk transfer status on the ack characteristic.
 pub const ACK_ID_BULK: u8 = 0x20;
 
