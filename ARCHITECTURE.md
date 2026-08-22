@@ -46,6 +46,7 @@ classDiagram
     class ServeTask {
         advertise()
         accept one central()
+        enter_deep_sleep()
     }
     class GattSession {
         publish settings and radio config
@@ -370,16 +371,32 @@ stateDiagram-v2
 
     Advertise --> Advertise : sleep_interval_s = 0<br/>(the default: never sleep)
     Advertise --> Park : window spent and sleep_interval_s > 0
-    Park --> DeepSleep : radio in cold sleep
-    DeepSleep --> Boot : timer wake
+
+    Advertise --> Park : CFG_SLEEP_NOW / USB SLEEP
+    Connected --> Park : CFG_SLEEP_NOW<br/>(after the ack has left)
+
+    Park --> DeepSleep : radio in cold sleep,<br/>NSS pad-held
+    DeepSleep --> Boot : timer wake, wake count += 1
 
     note right of Park
         There is no rail to cut on this
         board, so the radio is the one load
-        the firmware can drop. The MAX-M10
-        keeps acquiring throughout - which
-        is the dominant draw, and a board
-        fact rather than a firmware choice.
+        the firmware can drop - and holding
+        NSS is what keeps it dropped, since
+        the S3 releases unheld pads and the
+        SX1262 wakes on a falling NSS edge.
+        The MAX-M10 keeps acquiring: V_BCKP
+        is unconnected, so backup mode costs
+        a cold start on every wake.
+    end note
+
+    note right of Connected
+        A commanded sleep ends the session
+        rather than sleeping under it: the
+        board stops being contactable, and
+        a connection left open would show
+        the phone a timeout instead of a
+        disconnect.
     end note
 
     note left of Advertise
@@ -390,6 +407,13 @@ stateDiagram-v2
         board awake at full current forever.
     end note
 ```
+
+The two commanded transitions exist because the timed ones only fire when a
+window expires with nobody connected - so without them the only way to sleep
+a board in front of you is to disconnect and wait. Sleeping is asked for
+through `state::SLEEP_NOW_SIGNAL` rather than done where it is requested:
+`apply_config` runs inside the GATT session with the ack still unbuilt, and
+the loop that owns the `Rtc` is the one that can wait for the link to finish.
 
 Settings live in RTC fast RAM so a wake check costs no flash read, and are
 mirrored into the `nvs` partition so they also survive a flat cell. Only the
