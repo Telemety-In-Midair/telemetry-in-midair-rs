@@ -31,6 +31,14 @@ wio-ota = "python wio_ota.py"
 #   pixi run wio-info
 wio-info = "python wio_info.py"
 
+# Put the board into deep sleep now, rather than waiting out an advertising
+# window with nothing connected - which is otherwise the only way in:
+#   pixi run wio-sleep
+#   pixi run wio-sleep --seconds 30
+# With no --seconds the board uses its configured wake-check interval. The
+# port disappears while it sleeps; that is the command working.
+wio-sleep = "python wio_sleep.py"
+
 # Generate a random BLE static-random address in the display format the
 # firmware expects:
 #   pixi run gen-ble-address

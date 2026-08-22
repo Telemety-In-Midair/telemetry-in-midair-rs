@@ -15,6 +15,7 @@ The console shares this port, so firmware text is interleaved with the reply
 frames; the frame parser resyncs past it by sync byte and CRC.
 """
 
+import struct
 import time
 from pathlib import Path
 
@@ -33,6 +34,7 @@ USB_PING = 0x50
 USB_BULK = 0x51
 USB_BULK_ACK = 0x52
 USB_INFO = 0x53
+USB_SLEEP = 0x54
 
 OP_BEGIN = 0x01
 OP_DATA = 0x02
@@ -307,6 +309,30 @@ def query_ble_address(ser: serial.Serial, timeout: float = 2.0) -> str | None:
     if len(payload) < 7 or payload[0] != USB_INFO:
         return None
     return ":".join(f"{b:02X}" for b in payload[1:7])
+
+
+def sleep_now(ser: serial.Serial, secs: int, timeout: float = 2.0) -> int | None:
+    """Tell the board to deep sleep for `secs`; return the seconds it agreed to.
+
+    0 means "for the configured wake-check interval", which the board
+    resolves (and falls back to a default for when sleep mode is off) - so
+    the ack is the answer, not an echo of the request. `None` means the
+    board never acked.
+
+    The port disappears immediately afterwards. That is the command working:
+    deep sleep takes the USB device down with the rest of the chip, and it
+    comes back as a fresh device when the board wakes.
+    """
+    ser.reset_input_buffer()
+    ser.write(build_frame(USB_SLEEP, struct.pack("<I", secs)))
+    ser.flush()
+    frame, _ = read_frame(ser, {RESP_ACK}, timeout)
+    if frame is None:
+        return None
+    payload = frame[1]
+    if len(payload) < 3 or payload[0] != USB_SLEEP:
+        return None
+    return int(struct.unpack("<H", payload[1:3])[0])
 
 
 def send_bulk(ser: serial.Serial, kind: int, data: bytes, version: int = 0,
