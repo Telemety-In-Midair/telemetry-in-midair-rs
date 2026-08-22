@@ -655,7 +655,12 @@ async fn serve<C: Controller>(
             Either::First(None) => enter_deep_sleep(rtc, sleep_interval).await,
             // Told to sleep while advertising to nobody.
             Either::Second(()) => {
-                let secs = state::take_sleep_now().unwrap_or(sleep_interval.max(1));
+                // The cell is always set before the signal is raised, so the
+                // fallback is for a shape that should not occur - and it
+                // resolves the same way a request of 0 would rather than
+                // inventing a duration nothing else in the system uses.
+                let secs = state::take_sleep_now()
+                    .unwrap_or_else(|| ble::resolve_sleep_now(0, sleep_interval));
                 status_println!("sleep on command: {} s, from advertising", secs);
                 enter_deep_sleep(rtc, secs).await
             }
