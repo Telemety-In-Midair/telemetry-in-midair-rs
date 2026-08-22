@@ -95,7 +95,8 @@ time between windows. It is also the only way to get a useful "LoRa node,
 no BLE" mode, which is what a deployed tracker actually is most of the
 time.
 
-Smaller, free, same file: the BLE config is `Default::default()`, and
+Same file, and it looked free until it was tried: the BLE config is
+`Default::default()`, and
 
 ```rust
     /// 9 dBm
@@ -105,35 +106,57 @@ Smaller, free, same file: the BLE config is `Default::default()`, and
 
 BLE TX power defaults to **+9 dBm**. A phone at arm's length does not need
 that, and it is the worst possible current spike to have beside a LoRa PA -
-which is exactly what `state::radio_busy()` exists to keep apart. Set
-`default_tx_power` to `TxPower::N0` or `N3` in the `ble::Config` at
-[main.rs:365](s3/src/bin/main.rs#L365).
+which is exactly what `state::radio_busy()` exists to keep apart.
 
-## 2. The GPS is the whole deep-sleep budget, and sleep does not park it
+**It cannot be lowered.** `esp-radio` re-exports `Config` but not the
+`TxPower` enum its own `with_default_tx_power` builder takes: both
+`ble::npl` and `ble_os_adapter_chip_specific` are `pub(crate)`, so the
+setter is public and its argument is unnameable from outside the crate.
+Recorded in a comment at the construction site rather than worked around;
+the workaround available is a raw vendor HCI command, which is not worth
+its fragility for a spike this size.
 
-[`enter_deep_sleep`](s3/src/bin/main.rs#L406-L426) parks the radio and
-nothing else. The comment is honest about it:
+## 2. The GPS is the whole deep-sleep budget, and V_BCKP is why it stays
 
-> The MAX-M10 keeps acquiring throughout, which is the dominant draw and a
-> board fact rather than a firmware choice; `CFG_GPS_SLEEP` is the lever
-> for that and it is the app's to pull.
+[`enter_deep_sleep`](s3/src/bin/main.rs#L494) parks the radio and nothing
+else, so a deep sleep measures around 25-31 mA rather than the datasheet's
+9.3 uA. That is the number behind "not sleeping properly".
 
-It is a board fact that there is no rail to cut. It is not a board fact
-that the receiver has to stay awake: `Gps::sleep` already sends UBX-RXM-PMREQ
-with the backup flag, which takes the M10 to tens of uA, and `Gps::wake`
-already brings it back with UART traffic. The machinery exists and the
-deep-sleep path just does not use it.
+**The first draft of this report called that a defect and it is not.** The
+obvious fix - send `Gps::sleep` (UBX-RXM-PMREQ backup) alongside the
+existing `PrepareSleep`, since the machinery is already there - is wrong on
+*this* board, and the board repo says why:
 
-So today a "deep sleep" measures ~25-31 mA, not 9.3 uA - a 3000x miss
-against the datasheet, which is almost certainly what "not sleeping
-properly" is. Sending `Request::GpsSleep(true)` alongside `PrepareSleep`,
-and waking the receiver on the next boot, is the fix. The cost is
-acquisition time on each wake: a warm start from BBR is a few seconds, and
-BBR survives backup mode, so it is not a cold start every window.
+> **U5 V_BCKP** goes only to test point BCKP1. No 3V3 feed, no coin cell, so
+> every power-up is a cold start with no almanac - minutes of TTFF instead
+> of seconds. u-blox recommends tying it to 3V3.
+>
+> -- `wio-s3-max-gps/BOARD-REVIEW.md`
 
-If the wake budget cannot absorb that, `PowerMode::PsmOnOff` (already in
-`GpsConfig`, defaulted to `Full`) is the middle option and helps the awake
-case too.
+The M10's backup domain - the RTC, the BBR that holds the ephemeris, and the
+UART-RX wake source itself - is supplied by V_BCKP. Unconnected, backup mode
+has nothing keeping it alive. Two consequences, and the second is worse than
+the power it would save:
+
+- Every wake would be a **cold start**, minutes of TTFF. On a 60 s wake
+  cadence a tracker that backs its GPS up between windows never gets a fix
+  at all. Leaving the receiver running is what keeps it tracking across the
+  MCU's sleep, and that is the trade the existing comment is describing when
+  it calls the draw "a board fact rather than a firmware choice".
+- The UART-RX wake source lives in that same unpowered domain, so it is not
+  established that a board told to back its GPS up can wake it again without
+  a power cycle. `CFG_GPS_SLEEP` (0x12) already exposes this and is the right
+  place for it: an explicit lever someone chooses, not something the sleep
+  path does on everyone's behalf.
+
+**So the firmware change here is: none.** The fix is the board's - tie V_BCKP
+to +3V3, already open in `BOARD-REVIEW.md`. This investigation raises its
+priority sharply: it is not only "minutes of TTFF instead of seconds", it is
+the gate on the entire sleep story. With V_BCKP fed, backing the GPS up
+during deep sleep becomes both safe and obviously correct (BBR survives, so
+wakes are warm starts), and deep sleep goes from ~30 mA to something near
+the datasheet's 9.3 uA. Until then the ~30 mA is the floor and no amount of
+firmware moves it.
 
 ## 3. Nothing is held across deep sleep, so two chips wake themselves up
 
@@ -230,19 +253,42 @@ the pins the peripherals had already claimed. Cost is small, sub-mA to a
 few mA if the pad picks up enough noise to switch, but it is the cheapest
 item on this list and the argument for fixing it is already written down.
 
+## What has landed
+
+Findings 3, 4, 5 and 7 are fixed, and sleep is now something a board can be
+*told* to do rather than only left to:
+
+| | |
+|-|-|
+| 3 | SX1262 NSS is pad-held through the sleep (GPIO21 is an RTC pin). SD CS on GPIO44 is not fixable this way - the S3's RTC pins stop at 21 - and is still open. |
+| 4 | The park budget is the running config's own transmit deadline, and the hardware loop declines to start a beacon with a sleep pending. |
+| 5 | 240 -> 160 MHz. |
+| 7 | Both MISO pads pulled up, through a frozen `InputSignal` because `with_miso` overwrites the pull otherwise. |
+| new | `CFG_SLEEP_NOW` (BLE), `SLEEP` (USB console), `pixi run wio-sleep`, and a Sleep now control on the app's Beacon page. |
+| new | A wake counter in RTC RAM. A deep sleep is a full reset, so from the console a board on its cadence and a board resetting in a loop print the same banner - the wake number is what separates them. |
+
+Finding 6 stands as designed - an unconfigured board never sleeping on its
+own is the right default for something you have to be able to reach - but
+finding a board that will not sleep no longer means reading the policy: the
+sleep-now command works regardless of it.
+
 ## Order to work in
 
 1. **Resolve the measurement path first.** +3V3 rail or 5 V USB input? The
    estimate above only closes to ~130-150 mA, and the gap is most likely
    upstream of the module.
-2. Read the periodic status line while measuring. `radio rx` is the
-   expected mode; `radio tx` or an `err` word with 0x0020 set would change
-   this whole analysis.
-3. Findings 1 (BLE TX power, one line) and 5 (CPU clock, one line) - both
-   free, both measurable immediately.
-4. Finding 2 (GPS backup before sleep) - the deep-sleep number is
-   meaningless until this lands.
-5. Finding 3 (pad holds) - needed for finding 2's number to hold up.
-6. Finding 1's larger half: duty-cycle the BLE controller. Biggest win,
-   biggest change, and it wants the cheap measurements above first so the
-   ~90 mA claim is confirmed on this board rather than assumed.
+2. Re-measure awake with the CPU at 160 MHz, and read the periodic status
+   line while doing it. `radio rx` is the expected mode; `radio tx` or an
+   `err` word with 0x0020 set would change this whole analysis.
+3. **Measure a sleep, now that one can be asked for.** `pixi run wio-sleep
+   --seconds 60` on the bench, or the app's Sleep now button. The console
+   line on the far side (`woke from deep sleep #N`) is the confirmation
+   that it was a sleep and not a reset. Expect ~30 mA, not 9.3 uA, and see
+   finding 2 for why.
+4. **Tie V_BCKP to +3V3 on the next board spin.** It is the gate on the
+   whole sleep story, not just on TTFF, and no firmware change substitutes
+   for it.
+5. Finding 1's larger half: duty-cycle the BLE controller by dropping the
+   `BleConnector` outside the advertising window. Biggest remaining win,
+   biggest change, and it wants the measurements above first so the ~90 mA
+   claim is confirmed on this board rather than assumed.

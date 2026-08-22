@@ -349,6 +349,7 @@ Config command ids (config characteristic, `[id, len, value]`):
 | `0x12` | u8 0/1 | GPS backup mode (UBX-RXM-PMREQ / UART wake) |
 | `0x13` | u32 s | deep-sleep wake-check interval, 5 s..5 min, 0 = off (the default) |
 | `0x14` | u32 s | advertising window per wake check, 1 s..60 s (default 15 s) |
+| `0x15` | u32 s | deep sleep **now** for this long, 5 s..5 min; 0 = use `0x13`. A command, not a setting |
 
 ### Low power
 
@@ -378,13 +379,52 @@ time.
 
 A window changed over BLE applies from the next wake, not the current one.
 
+#### Sleeping on command
+
+`0x13` and `0x14` describe when the board sleeps *on its own*, and both only
+fire when an advertising window expires with nobody connected. That leaves
+no way to sleep a board you are looking at: you would have to disconnect and
+wait the window out, on a board that has been given a cadence in the first
+place.
+
+`0x15` is the direct one. The board acks, finishes paying out what it owes
+the connection, and goes. It stores nothing, does not touch `0x13`, and
+comes back to exactly what it was configured for - so a board with sleep
+mode off takes one nap and resumes advertising continuously. A value of 0
+means "for the `0x13` interval", falling back to 60 s when sleep is off, and
+the ack carries the resolved seconds so an app reports what the board will
+actually do rather than what it was asked for.
+
+**The disconnect is the command working.** The board stops being contactable
+the moment it sleeps; the app's Beacon page says so before the link drops
+and again after it does.
+
+The same command is on the USB console (`pixi run wio-sleep`, optionally
+`--seconds N`), which is the bench answer - the serial port disappearing and
+coming back is a whole sleep cycle observed without a phone.
+
+A wake from deep sleep prints `woke from deep sleep #N (slept M s)`, counted
+in RTC RAM since the last cold boot. That line is the difference between a
+board on its cadence and a board resetting in a loop: deep sleep is a full
+reset, so without the counter the two produce an identical boot banner.
+
 The rail policy is **inert on this board.** The GPS `VCC`/`V_IO` and the
 SD both sit directly on +3V3, and the only load switch (U3, SiP32431)
 feeds the GPS active antenna and is driven by the GPS's own `LNA_EN`, not
 by a host GPIO. So `0x10` is accepted and logged with nothing behind it,
 and deep sleep leaves a MAX-M10 acquiring beside a sleeping S3 - which is
-the dominant draw. GPS backup mode (`0x12`) is the only real power lever,
-and the app should still expect a GPS cold TTFF after a long sleep.
+the dominant draw at roughly 25-31 mA. GPS backup mode (`0x12`) is the only
+firmware lever on it, and on this board it is a poor one: `V_BCKP` goes to a
+test point and nothing else, so the M10's backup domain - the RTC, the BBR
+holding the ephemeris, and the UART-RX wake source itself - has no supply.
+Backup mode there means a cold start on every wake rather than a warm one,
+which on a short cadence is a board that never gets a fix. That is why the
+sleep path does not reach for it on its own: it stays an explicit choice.
+
+Tying `V_BCKP` to +3V3 is the fix, and it is a board change (see
+`BOARD-REVIEW.md` in the board repo). It is worth more than the TTFF it is
+usually filed under - it is what would let a sleeping board park its GPS and
+approach the module's 9.3 uA instead of sitting at 30 mA.
 
 Before it sleeps the board puts the radio into cold sleep - the one load it
 can actually drop, 5.5 mA of continuous RX against the module's 9.3 uA
