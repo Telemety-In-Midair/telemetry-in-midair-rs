@@ -56,6 +56,16 @@ struct Shared {
     /// here because the USB info query answers from a different task than
     /// the one that worked it out.
     ble_address: Cell<[u8; 6]>,
+    /// Seconds a `CFG_SLEEP_NOW` asked the board to deep sleep for, until
+    /// the serve loop picks it up. A cell rather than the signal's payload
+    /// because two places wait on the signal - the advertising accept and
+    /// the connected session - and only one of them is the one that sleeps.
+    sleep_now_s: Cell<Option<u32>>,
+    /// Longest a single LoRa transmit can hold the hardware loop, from the
+    /// running config. Published so the sleep path can wait out a beacon
+    /// already in flight instead of guessing a constant that the slowest
+    /// settings the config accepts would be forty times too small for.
+    tx_worst_case_ms: Cell<u32>,
 }
 
 // SAFETY-adjacent note: every field is only ever touched inside
@@ -78,6 +88,9 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
     radio_config_known: Cell::new(false),
     roster: RefCell::new(Roster::new()),
     ble_address: Cell::new([0; 6]),
+    sleep_now_s: Cell::new(None),
+    // The default config's SF12/BW500 beacon, until one is adopted.
+    tx_worst_case_ms: Cell::new(1_000),
 });
 
 pub fn set_position(p: PositionPacket) {
@@ -285,6 +298,63 @@ pub enum Request {
     /// The board is about to deep sleep. Park what a sleeping board cannot
     /// use and raise [`SLEEP_READY`].
     PrepareSleep,
+}
+
+// ---------------------------------------------------------------------------
+// Sleep on command
+// ---------------------------------------------------------------------------
+
+/// Raised when something has asked the board to deep sleep right now - a
+/// `CFG_SLEEP_NOW` write over BLE, or the USB console's `SLEEP`.
+///
+/// Separate from [`Request`], which goes to the hardware loop: this one is
+/// for the serve loop, because deep sleep is entered from the side that
+/// owns the `Rtc` and the advertising. Two places wait on it and they are
+/// never concurrent - a board is either advertising or in a session.
+pub static SLEEP_NOW_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Publish the running config's transmit deadline, in ms.
+pub fn set_tx_worst_case_ms(ms: u32) {
+    critical_section::with(|cs| SHARED.borrow(cs).tx_worst_case_ms.set(ms));
+}
+
+/// The longest a beacon already in flight can keep the hardware loop from
+/// answering a request.
+pub fn tx_worst_case_ms() -> u32 {
+    critical_section::with(|cs| SHARED.borrow(cs).tx_worst_case_ms.get())
+}
+
+/// Ask the serve loop to deep sleep for `secs`, already resolved and
+/// clamped by [`midair_proto::ble::resolve_sleep_now`].
+pub fn request_sleep_now(secs: u32) {
+    critical_section::with(|cs| SHARED.borrow(cs).sleep_now_s.set(Some(secs)));
+    SLEEP_NOW_SIGNAL.signal(());
+}
+
+/// Take the pending sleep request, if any. The serve loop calls this at the
+/// points where it can actually act on one.
+pub fn take_sleep_now() -> Option<u32> {
+    critical_section::with(|cs| SHARED.borrow(cs).sleep_now_s.take())
+}
+
+/// Whether a sleep has been asked for and not yet acted on.
+///
+/// Read by the hardware loop, which uses it to decline to start a beacon it
+/// would then make the sleep wait out - at the slowest settings the config
+/// accepts a transmit runs to nearly ten seconds.
+pub fn sleep_now_pending() -> bool {
+    critical_section::with(|cs| SHARED.borrow(cs).sleep_now_s.get().is_some())
+}
+
+/// Drop a pending sleep request without acting on it.
+///
+/// The serve loop does this when it is about to sleep for a *different*
+/// reason (a wake-check window that expired first), so a command that was
+/// overtaken by the cadence cannot fire again on the far side of the sleep
+/// it was already satisfied by.
+pub fn clear_sleep_now() {
+    critical_section::with(|cs| SHARED.borrow(cs).sleep_now_s.set(None));
+    SLEEP_NOW_SIGNAL.reset();
 }
 
 /// Raised once the hardware loop has parked the radio for a deep sleep.

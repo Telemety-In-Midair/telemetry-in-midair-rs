@@ -31,11 +31,12 @@
 
 use bt_hci::controller::ExternalController;
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, select3};
+use embassy_futures::select::{select, select3, Either};
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
+use esp_hal::gpio::interconnect::{InputSignal, PeripheralInput};
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
 use esp_hal::rtc_cntl::Rtc;
@@ -84,6 +85,30 @@ const L2CAP_CHANNELS_MAX: usize = 2;
 /// time (build.rs validates and normalizes it, and emits nothing otherwise);
 /// `None` derives a per-chip address from the eFuse MAC instead.
 const BLE_ADDRESS_OVERRIDE: Option<&str> = option_env!("BLE_ADDRESS");
+
+/// Claim a pin as an SPI MISO that holds a level when nothing is driving it.
+///
+/// MISO is only driven while the peripheral's CS is low, which is a small
+/// fraction of the time on both of this board's buses and none of it when
+/// the SD slot is empty or the radio is asleep. The rest of the time the pad
+/// floats, and esp-hal's `with_miso` is why it floats *and* has its input
+/// buffer on: it applies `InputConfig::default()` (`Pull::None`)
+/// unconditionally, overwriting anything configured beforehand. A floating
+/// enabled input sits wherever leakage puts it, which can be mid-rail with
+/// both halves of the buffer partly on - the same condition the pin sweep in
+/// `NOTES.md` went through the unrouted pads to remove, on two pins that
+/// sweep could not reach because a peripheral already owned them.
+///
+/// `freeze` is the way through: a frozen signal makes the driver's own
+/// `apply_input_config` a no-op, so the pull configured here survives being
+/// handed to the SPI. Pulled up rather than down because idle-high is what
+/// both an SD card's DO and the SX1262's MISO leave the line at.
+fn miso_with_pullup<'d>(pin: impl PeripheralInput<'d>) -> InputSignal<'d> {
+    let signal: InputSignal<'d> = pin.into();
+    signal.apply_input_config(&InputConfig::default().with_pull(Pull::Up));
+    signal.set_input_enable(true);
+    signal.freeze()
+}
 
 /// `a` happened at or after deadline `b` in wrapping-u32 time.
 fn due(now: u32, deadline: u32) -> bool {
@@ -187,7 +212,17 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
+    // Not `CpuClock::max()`, which on the S3 is 240 MHz. Nothing here needs
+    // it: the hardware loop runs at 100 Hz, the GPS link is 9600 baud, the
+    // SD bus is 400 kHz and the radio sees one 8 MHz burst per beacon. The
+    // clock is a standing cost the whole time the board is awake, and 240
+    // against 160 is on the order of 10 mA for headroom nothing claims.
+    //
+    // 160 rather than 80 because it is what ESP-IDF defaults the S3 to, and
+    // so what the BLE controller inside `esp-radio` is validated at. 80 MHz
+    // is the next step down if a measurement says the difference is worth
+    // finding out.
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_160MHz);
     let peripherals = esp_hal::init(config);
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
@@ -307,7 +342,7 @@ async fn main(spawner: Spawner) -> ! {
     .expect("lora spi")
     .with_sck(peripherals.GPIO4)
     .with_mosi(peripherals.GPIO6)
-    .with_miso(peripherals.GPIO5);
+    .with_miso(miso_with_pullup(peripherals.GPIO5));
 
     // BUSY and DIO1 both idle low, so a pull-down is the level they hold
     // anyway - and it is what makes an absent radio diagnosable. With no
@@ -327,6 +362,20 @@ async fn main(spawner: Spawner) -> ! {
         Input::new(peripherals.GPIO9, radio_irq_cfg),
         Output::new(peripherals.GPIO7, Level::High, OutputConfig::default()),
     ));
+
+    // Release the NSS pad hold that `enter_deep_sleep` set, now that the
+    // pin has been reconfigured as the output that drives it.
+    //
+    // The hold outlives the sleep *and* the reset, which is the point - it
+    // is what keeps NSS high while the digital domain is down, so a floating
+    // edge cannot wake the SX1262 out of the sleep it was put into. The
+    // order is what the C6 firmware learned the hard way: reconfigure first,
+    // then release, or the pad glitches through whatever state it had
+    // between the two. Unconditional because a cold boot's hold bit is
+    // already clear, so releasing it is a write of the value it holds.
+    unsafe {
+        esp_hal::gpio::RtcPin::rtcio_pad_hold(&esp_hal::peripherals::GPIO21::steal(), false);
+    }
 
     // GPS on UART1: GPIO1 is RX (module TX), GPIO2 is TX. 9600 8N1 is the
     // u-blox M10 factory default.
@@ -351,7 +400,7 @@ async fn main(spawner: Spawner) -> ! {
     .expect("sd spi")
     .with_sck(peripherals.GPIO46)
     .with_mosi(peripherals.GPIO45)
-    .with_miso(peripherals.GPIO3);
+    .with_miso(miso_with_pullup(peripherals.GPIO3));
     let sd_cs = Output::new(peripherals.GPIO44, Level::High, OutputConfig::default());
     let sd_dev = embedded_hal_bus::spi::ExclusiveDevice::new(sd_spi, sd_cs, Delay::new())
         .expect("sd spi device");
@@ -369,6 +418,17 @@ async fn main(spawner: Spawner) -> ! {
         .expect("spawn usb task");
 
     // BLE. Same stack the C6 runs.
+    //
+    // `Default::default()` is not a preference here, it is the only thing
+    // that can be written. The config's transmit power defaults to +9 dBm -
+    // far more than a phone a few meters away needs, and the worst current
+    // spike to put beside a LoRa PA that can be keying 22 dBm at the same
+    // time, which is the conflict `state::radio_busy` exists to keep apart.
+    // It cannot be lowered from here: esp-radio 0.17 re-exports `Config` but
+    // not the `TxPower` enum its `with_default_tx_power` builder takes
+    // (`ble_os_adapter_chip_specific` is `pub(crate)`), so the setter is
+    // public and its argument is unnameable. Revisit when the crate exports
+    // the enum.
     let radio = esp_radio::init().expect("radio init");
     let transport =
         esp_radio::ble::controller::BleConnector::new(&radio, peripherals.BT, Default::default())
@@ -399,7 +459,15 @@ async fn main(spawner: Spawner) -> ! {
 
     let mut rtc = Rtc::new(peripherals.LPWR);
     if woke_from_sleep {
-        qprintln!("woke from deep sleep for an advertising window");
+        // Counted, because a deep sleep is a full reset and from the console
+        // a board that sleeps on its cadence and a board that resets in a
+        // loop produce exactly the same boot banner. The wake number is what
+        // tells them apart, and it is the first thing to read when the
+        // question is whether sleep is working at all.
+        let (n, asked_s) = settings::note_wake();
+        status_println!("woke from deep sleep #{} (slept {} s)", n, asked_s);
+    } else {
+        status_println!("cold boot (not a deep-sleep wake)");
     }
 
     let _ = select(
@@ -438,12 +506,55 @@ fn current_settings() -> ble::Settings {
 /// board fact rather than a firmware choice; `CFG_GPS_SLEEP` is the lever
 /// for that and it is the app's to pull.
 async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
+    // A command that got this far has been acted on; nothing on the far
+    // side of the sleep should find it still pending and sleep again.
+    state::clear_sleep_now();
     state::SLEEP_READY.reset();
     state::request(Request::PrepareSleep);
-    // Far longer than the 10 ms pass the loop takes to notice; if it is
-    // wedged, sleeping anyway beats staying awake at full current.
-    let _ = with_timeout(Duration::from_secs(1), state::SLEEP_READY.wait()).await;
-    println!("deep sleep for {} s (radio parked, gps still acquiring)", interval_s);
+    // The loop notices within its 10 ms pass *unless* it is inside a
+    // transmit, which awaits for the length of the frame on air - 289 ms at
+    // the SF12/BW500 default and up to about 9.7 s at the slowest settings
+    // the config accepts. The old budget here was one second, so a sleep
+    // that landed during a beacon timed out and slept with the SX1262 still
+    // in continuous receive: 5.7 mA for the whole interval, and nothing
+    // visible afterwards because the wake re-inits the radio anyway. The
+    // hardware loop also declines to start a beacon while a sleep is
+    // pending, so this only has to cover one already in flight.
+    let park = Duration::from_millis(u64::from(state::tx_worst_case_ms()) + 500);
+    if with_timeout(park, state::SLEEP_READY.wait()).await.is_err() {
+        // Worth saying: it means the sleep is about to cost more than it
+        // should, and it is otherwise undetectable from the far side.
+        println!("sleep: radio did not park in time, sleeping with it awake");
+    }
+
+    // Hold what the sleeping board still needs held.
+    //
+    // The S3 releases every pad that is not explicitly held when the digital
+    // domain drops (esp-hal clears `dg_pad_force_unhold` in its sleep prep),
+    // and the SX1262 leaves sleep on a *falling* edge of NSS. A floating NSS
+    // on an otherwise quiet board will produce one, so the radio that
+    // `PrepareSleep` just put into cold sleep wakes itself back to STDBY_RC
+    // and sits there for the whole interval - which is the same 5.7 mA the
+    // parking was for. GPIO21 is inside the S3's RTC GPIO range (0-21), so
+    // the pad hold reaches it.
+    //
+    // The pin belongs to the SX1262 driver in the hardware task, so the
+    // singleton is stolen for the hold exactly as the C6 firmware does for
+    // its rail and reset lines. Nothing races: the driver is parked and this
+    // function does not return.
+    //
+    // SD CS (GPIO44) has the same problem and is not fixable the same way -
+    // the S3's RTC pins stop at 21, so a digital pad needs the
+    // `RTC_CNTL_DIG_PAD_HOLD` register that esp-hal 1.0 does not expose.
+    unsafe {
+        esp_hal::gpio::RtcPin::rtcio_pad_hold(&esp_hal::peripherals::GPIO21::steal(), true);
+    }
+
+    settings::note_sleep(interval_s);
+    println!(
+        "deep sleep for {} s (radio parked, gps still acquiring)",
+        interval_s
+    );
     let timer = TimerWakeupSource::new(core::time::Duration::from_secs(interval_s as u64));
     rtc.sleep_deep(&[&timer])
 }
@@ -504,30 +615,49 @@ async fn serve<C: Controller>(
             }
         };
 
-        let conn = if sleep_interval > 0 {
-            let left = Duration::from_millis(window.remaining_ms(Instant::now().as_millis()));
-            match with_timeout(left, advertiser.accept()).await {
-                Ok(Ok(c)) => c,
-                Ok(Err(_)) => {
-                    // A central started a connection and it did not
-                    // complete. The pause keeps a repeated failure off a
-                    // hot spin, and it comes out of the wake budget like
-                    // everything else.
-                    qprintln!("connect attempt failed");
-                    Timer::after(Duration::from_millis(200)).await;
-                    continue;
+        // Waiting for a central is also waiting for a `SLEEP_NOW`, which is
+        // how a board told to sleep over the USB console with nobody
+        // connected goes down without first having to be connected to. The
+        // BLE path signals this too, but from inside a session, where
+        // `gatt_session` is the arm that picks it up.
+        let accepted = {
+            let commanded = async {
+                state::SLEEP_NOW_SIGNAL.wait().await;
+            };
+            let accept = async {
+                if sleep_interval > 0 {
+                    let left =
+                        Duration::from_millis(window.remaining_ms(Instant::now().as_millis()));
+                    match with_timeout(left, advertiser.accept()).await {
+                        Ok(r) => Some(r),
+                        // Window expired with nobody interested.
+                        Err(_) => None,
+                    }
+                } else {
+                    Some(advertiser.accept().await)
                 }
-                // Window expired with nobody interested.
-                Err(_) => enter_deep_sleep(rtc, sleep_interval).await,
+            };
+            select(accept, commanded).await
+        };
+
+        let conn = match accepted {
+            Either::First(Some(Ok(c))) => c,
+            Either::First(Some(Err(_))) => {
+                // A central started a connection and it did not complete.
+                // The pause keeps a repeated failure off a hot spin, and it
+                // comes out of the wake budget like everything else.
+                qprintln!("connect attempt failed");
+                Timer::after(Duration::from_millis(200)).await;
+                continue;
             }
-        } else {
-            match advertiser.accept().await {
-                Ok(c) => c,
-                Err(_) => {
-                    qprintln!("connect attempt failed");
-                    Timer::after(Duration::from_millis(200)).await;
-                    continue;
-                }
+            // The advertising budget ran out. Only reachable with sleep mode
+            // on, since the branch above only bounds the wait when it is.
+            Either::First(None) => enter_deep_sleep(rtc, sleep_interval).await,
+            // Told to sleep while advertising to nobody.
+            Either::Second(()) => {
+                let secs = state::take_sleep_now().unwrap_or(sleep_interval.max(1));
+                status_println!("sleep on command: {} s, from advertising", secs);
+                enter_deep_sleep(rtc, secs).await
             }
         };
 
@@ -540,6 +670,17 @@ async fn serve<C: Controller>(
 
         // A transfer the phone was midway through does not outlive it.
         xfer::abort(Owner::Ble, Instant::now().as_millis()).await;
+
+        // The session may have ended because the app asked for a sleep
+        // rather than because the phone went away. Checked here rather than
+        // inside `gatt_session` so the ack, the settings republish and the
+        // link teardown have all already happened - the board is gone the
+        // moment this runs, and anything still owed to the central has to
+        // have left first.
+        if let Some(secs) = state::take_sleep_now() {
+            status_println!("sleep on command: {} s", secs);
+            enter_deep_sleep(rtc, secs).await;
+        }
 
         // Linger by advertising, not by idling. The point is to let the
         // phone come straight back, which it cannot do if the board is
@@ -732,9 +873,29 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
         }
     };
 
-    // Any arm ending (disconnect, or a position notify that failed) ends
-    // the session.
-    select3(select3(events, notifier, logger), config_pub, remotes).await;
+    // A `CFG_SLEEP_NOW` write ends the session, because the board is about
+    // to stop being contactable and a connection left open would show the
+    // phone a supervision timeout instead of a disconnect.
+    //
+    // The pause is what makes the ack useful. `events` sends the ack and
+    // republishes the settings *after* it has already applied the write, so
+    // the signal this waits on is raised while the notification that
+    // explains it is still queued. Ending the session immediately would
+    // drop that notification and leave the app with a write it never heard
+    // back from, which is indistinguishable from a board that crashed.
+    let commanded_sleep = async {
+        state::SLEEP_NOW_SIGNAL.wait().await;
+        Timer::after(Duration::from_millis(400)).await;
+    };
+
+    // Any arm ending (disconnect, a position notify that failed, or a
+    // commanded sleep) ends the session.
+    select3(
+        select3(events, notifier, logger),
+        select(config_pub, commanded_sleep),
+        remotes,
+    )
+    .await;
 }
 
 /// Apply a config-characteristic write.
@@ -765,6 +926,14 @@ async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
         }
         session::Action::SleepInterval(secs) => {
             qprintln!("config: sleep interval {} s", secs);
+        }
+        // Handed to the serve loop rather than acted on here: this function
+        // runs inside the GATT session, and the ack it is building has not
+        // been sent yet. The loop that owns the `Rtc` sleeps once the
+        // session has finished paying out what it owes the central.
+        session::Action::SleepNow(secs) => {
+            status_println!("config: sleep now for {} s", secs);
+            state::request_sleep_now(secs);
         }
         session::Action::AdvWindow(secs) => {
             qprintln!("config: advertising window {} s", secs);
@@ -867,6 +1036,7 @@ async fn hardware_task(
     }
     state::set_verbose(cfg.verbose);
     state::set_radio_config(cfg.encode());
+    state::set_tx_worst_case_ms(cfg.tx_poll_timeout_ms());
 
     let mut node = Node::new(lora, &cfg);
     node.radio_mut().init(&cfg).await;
@@ -1057,10 +1227,17 @@ async fn hardware_task(
         // one indistinguishable from out of range or dead. A ping is the
         // smaller of the two on air, so this cannot push a node past the
         // duty cycle its beacon already fits in.
+        // The sleep gate is not politeness: a transmit awaits for the frame's
+        // time on air, which at the slowest settings the config accepts is
+        // nearly ten seconds, and a sleep that arrives just after one starts
+        // waits all of it out. Declining to start one keeps the sleep path's
+        // parking budget covering a beacon already in flight rather than one
+        // this pass was about to begin.
         if cfg.role.transmits()
             && cfg.beacon_interval_s != 0
             && due(now, next_beacon)
             && !state::transfer_active()
+            && !state::sleep_now_pending()
         {
             // The SX1262 does not reset with the MCU. If it browned out and
             // restarted on its own it is back at its power-up defaults -
@@ -1261,6 +1438,7 @@ async fn apply_radio_config(
     node.reconfigure(cfg);
     state::set_verbose(cfg.verbose);
     state::set_radio_config(cfg.encode());
+    state::set_tx_worst_case_ms(cfg.tx_poll_timeout_ms());
     // The card is the only place this survives a reboot, so a write that
     // did not land has to reach the operator rather than sit in a console
     // nobody is reading - it is the difference between a config that is

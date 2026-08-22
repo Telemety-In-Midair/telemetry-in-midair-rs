@@ -101,6 +101,28 @@ pub async fn usb_task(
                     out.build(link::resp::ACK, &reply);
                     send_frame(&mut tx, out.as_bytes()).await;
                 }
+                link::usb::SLEEP => {
+                    // Same meaning as the BLE `CFG_SLEEP_NOW` write, and the
+                    // same resolver, so a board naps for the length the tool
+                    // printed rather than one the firmware worked out
+                    // separately. A short payload is a nap of 0, which
+                    // resolves to the configured cadence.
+                    let asked = payload
+                        .get(..4)
+                        .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                        .map(u32::from_le_bytes)
+                        .unwrap_or(0);
+                    let secs = midair_proto::ble::resolve_sleep_now(
+                        asked,
+                        crate::settings::get().sleep_interval_s,
+                    );
+                    // The ack goes out before the request, because the
+                    // request takes the port down with it.
+                    let v = (secs.min(u32::from(u16::MAX)) as u16).to_le_bytes();
+                    out.build(link::resp::ACK, &[link::usb::SLEEP, v[0], v[1]]);
+                    send_frame(&mut tx, out.as_bytes()).await;
+                    state::request_sleep_now(secs);
+                }
                 link::usb::BULK => {
                     let (ack, alen) =
                         xfer::handle(Owner::Usb, Instant::now().as_millis(), &payload[..len]).await;

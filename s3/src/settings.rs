@@ -32,6 +32,20 @@ static FLAGS: AtomicU32 = AtomicU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static ADV_WINDOW: AtomicU32 = AtomicU32::new(0);
 
+/// How many deep sleeps this board has woken from since its last cold
+/// boot, and the seconds it was last told to sleep for.
+///
+/// Pure instrumentation, and it earns its two words: a deep sleep is a full
+/// reset, so from the console a board that sleeps and a board that resets in
+/// a loop produce the same boot banner. The counter is what separates them,
+/// and it is the first thing to look at when the question is whether sleep
+/// is working at all. Both are inside the magic-word guard, so a cold boot
+/// reads zero rather than whatever was in that memory.
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static WAKE_COUNT: AtomicU32 = AtomicU32::new(0);
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static LAST_SLEEP_S: AtomicU32 = AtomicU32::new(0);
+
 /// The current settings. An unconfigured board reads back
 /// [`Stored::new`], which is awake, powered and never sleeping.
 pub fn get() -> Stored {
@@ -51,6 +65,38 @@ pub fn set(s: Stored) {
     FLAGS.store(s.flags, Ordering::Relaxed);
     ADV_WINDOW.store(s.adv_window_s, Ordering::Relaxed);
     MAGIC_WORD.store(MAGIC, Ordering::Relaxed);
+}
+
+/// Note the sleep that is about to happen, so the wake on the far side can
+/// report it. Called immediately before `sleep_deep`.
+pub fn note_sleep(interval_s: u32) {
+    LAST_SLEEP_S.store(interval_s, Ordering::Relaxed);
+    // A board that has never taken a config write has no magic word, and
+    // without one the wake on the far side reads as a cold boot and does
+    // not count. Stamping it needs the settings written alongside, not the
+    // word on its own: persistent RTC RAM is not zero-initialized, so a
+    // magic word in front of never-written interval/flags words would hand
+    // the next boot cold-boot garbage as if it were a stored config.
+    // `set(get())` resolves to the RTC copy or to `Stored::new`, and writes
+    // whichever it was.
+    set(get());
+}
+
+/// Count a wake from deep sleep and return `(wake number, seconds asked
+/// for)`. Called once at boot, and only when the wake cause says timer.
+pub fn note_wake() -> (u32, u32) {
+    let n = WAKE_COUNT.load(Ordering::Relaxed).saturating_add(1);
+    WAKE_COUNT.store(n, Ordering::Relaxed);
+    (n, LAST_SLEEP_S.load(Ordering::Relaxed))
+}
+
+/// Wakes counted since the last cold boot.
+pub fn wake_count() -> u32 {
+    if MAGIC_WORD.load(Ordering::Relaxed) == MAGIC {
+        WAKE_COUNT.load(Ordering::Relaxed)
+    } else {
+        0
+    }
 }
 
 /// Whether RTC RAM holds no copy, i.e. this is a cold boot rather than a
