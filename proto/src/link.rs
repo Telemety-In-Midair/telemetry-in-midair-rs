@@ -46,6 +46,13 @@ pub mod usb {
     /// octet first, so a tool can read a board's address on demand rather
     /// than having to catch the one line it prints at boot.
     pub const INFO: u8 = 0x53;
+    /// Host -> board, `[secs u32le]` - deep sleep now for that long, with
+    /// the same meaning as the BLE `CFG_SLEEP_NOW` write (0 borrows the
+    /// configured wake-check cadence). The board answers
+    /// [`super::resp::ACK`] (`[SLEEP, secs u16le]`, saturating, so a tool
+    /// can say when to expect the port back) and then goes, which drops the
+    /// USB device - the port vanishing is the command working.
+    pub const SLEEP: u8 = 0x54;
 }
 
 /// Responses (either direction, follow a command).

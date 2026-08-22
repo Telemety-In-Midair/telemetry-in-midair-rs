@@ -234,6 +234,53 @@ pub const ESP_ADV_MIN_S: u32 = 1;
 pub const ESP_ADV_MAX_S: u32 = 60;
 pub const ESP_ADV_DEFAULT_S: u32 = 15;
 
+/// `u32` seconds: sleep *now*, for this long, and then come back.
+///
+/// A command, not a setting. Nothing about it is stored, it does not touch
+/// the wake-check cadence, and the board resumes its configured behavior on
+/// the far side - so a board with sleep mode off takes one nap and goes
+/// back to advertising continuously.
+///
+/// This exists because every other way into deep sleep is indirect. The
+/// wake-check interval sleeps a board when an advertising window expires
+/// with nobody connected, which means the only way to put a board you are
+/// *looking at* to sleep is to disconnect and wait out the window. That is
+/// the wrong shape for the two cases that matter: packing a tracker away,
+/// and confirming on a bench that sleep works at all.
+///
+/// The value is clamped to the [`ESP_SLEEP_MIN_S`]..=[`ESP_SLEEP_MAX_S`]
+/// range the wake-check interval uses, with one exception: 0 means "for the
+/// configured wake-check interval", falling back to [`SLEEP_NOW_DEFAULT_S`]
+/// on a board that has sleep mode off and so has no cadence to borrow. The
+/// ack echoes the resolved seconds, so an app can say how long the board
+/// will be gone rather than repeating what it asked for.
+///
+/// The board acks before it sleeps and the link then drops. That
+/// disconnect is the command working, not a failure.
+pub const CFG_SLEEP_NOW: u8 = 0x15;
+
+/// What [`CFG_SLEEP_NOW`] with a value of 0 resolves to when sleep mode is
+/// off. Long enough to be an unmistakable sleep on a bench and short enough
+/// that nobody is waiting on a board they put down by accident.
+pub const SLEEP_NOW_DEFAULT_S: u32 = 60;
+
+/// Resolve a [`CFG_SLEEP_NOW`] request into the seconds the board will
+/// actually sleep for.
+///
+/// Shared rather than inlined at the one call site because the app shows
+/// this number *before* the ack comes back - a control that says "sleeps
+/// for 5 minutes" and a board that sleeps for 60 s would be the app's
+/// arithmetic disagreeing with the firmware's, which is exactly the class
+/// of drift the settings characteristic exists to prevent.
+pub fn resolve_sleep_now(requested_s: u32, sleep_interval_s: u32) -> u32 {
+    let secs = match (requested_s, sleep_interval_s) {
+        (0, 0) => SLEEP_NOW_DEFAULT_S,
+        (0, cadence) => cadence,
+        (asked, _) => asked,
+    };
+    secs.clamp(ESP_SLEEP_MIN_S, ESP_SLEEP_MAX_S)
+}
+
 // -- Bulk transfer protocol (writes on [`BULK_UUID`]) -------------------------
 //
 // Each write is one op. Status comes back on the ack characteristic with

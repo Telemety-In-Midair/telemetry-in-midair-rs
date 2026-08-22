@@ -208,6 +208,13 @@ pub enum Action {
     /// The advertising window per wake check is now this many seconds.
     /// Takes effect on the next wake, not the window already running.
     AdvWindow(u32),
+    /// Deep sleep now, for this many seconds, then resume as configured.
+    ///
+    /// Unlike every other variant here this is a command rather than a
+    /// settings change: nothing was stored, so nothing survives the sleep
+    /// but the cadence the board already had. The firmware must get the
+    /// ack out before it acts - the link does not survive the action.
+    SleepNow(u32),
     /// Set the position notify interval, in ms, already clamped. Not
     /// persisted: it is per-session state.
     NotifyInterval(u32),
@@ -332,6 +339,26 @@ pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
                 return Outcome::new(
                     Action::AdvWindow(secs),
                     true,
+                    id,
+                    packet::ACK_OK,
+                    &secs.to_le_bytes(),
+                );
+            }
+            ble::CFG_SLEEP_NOW => {
+                let Ok(bytes) = <[u8; 4]>::try_from(value) else {
+                    return Outcome::reject(id, packet::ACK_BAD_VALUE);
+                };
+                // Deliberately leaves `stored` alone. A nap is not a
+                // cadence, and a board told to sleep once must come back
+                // to whatever it was doing - including advertising
+                // continuously, if that is what it was configured for.
+                let secs = ble::resolve_sleep_now(
+                    u32::from_le_bytes(bytes),
+                    stored.sleep_interval_s,
+                );
+                return Outcome::new(
+                    Action::SleepNow(secs),
+                    false,
                     id,
                     packet::ACK_OK,
                     &secs.to_le_bytes(),
@@ -922,6 +949,89 @@ mod tests {
                 Next::Sleep { interval_s: 120 }
             );
             now += 120_000;
+        }
+    }
+
+    // -- sleep now ---------------------------------------------------------
+
+    /// The whole point of the command: it sleeps a board that is connected
+    /// and configured never to sleep, and it changes nothing about that
+    /// configuration.
+    #[test]
+    fn sleep_now_is_a_command_and_not_a_setting() {
+        let mut s = Stored::new();
+        assert_eq!(s.sleep_interval_s, 0, "sleep mode is off");
+
+        let before = s;
+        let o = apply(&mut s, &u32_write(ble::CFG_SLEEP_NOW, 30));
+
+        assert_eq!(o.action, Action::SleepNow(30));
+        assert_eq!(ack_u32(&o), 30, "the ack says how long the board is gone");
+        assert_eq!(s, before, "a nap stores nothing, not even the duration");
+        assert!(!o.save, "and so nothing needs to reach flash");
+    }
+
+    /// 0 borrows the wake-check cadence, which is what makes "Sleep now"
+    /// mean "start the next cycle early" on a board that already sleeps.
+    #[test]
+    fn sleep_now_zero_borrows_the_wake_check_interval() {
+        let mut s = Stored::new();
+        apply(&mut s, &u32_write(ble::CFG_ESP_SLEEP_S, 120));
+
+        let o = apply(&mut s, &u32_write(ble::CFG_SLEEP_NOW, 0));
+        assert_eq!(o.action, Action::SleepNow(120));
+        assert_eq!(s.sleep_interval_s, 120, "and does not disturb it");
+    }
+
+    /// With no cadence to borrow there is still a defined answer, because
+    /// the alternative is a button that does nothing on exactly the boards
+    /// most likely to be sitting on a bench.
+    #[test]
+    fn sleep_now_zero_falls_back_when_sleep_mode_is_off() {
+        let mut s = Stored::new();
+        let o = apply(&mut s, &u32_write(ble::CFG_SLEEP_NOW, 0));
+        assert_eq!(o.action, Action::SleepNow(ble::SLEEP_NOW_DEFAULT_S));
+    }
+
+    /// Clamped to the same range as the wake-check interval - including the
+    /// floor, which the interval itself exempts 0 from. Here 0 already
+    /// means something else, so nothing reaches the clamp as a zero.
+    #[test]
+    fn sleep_now_is_clamped_like_the_wake_check_interval() {
+        let mut s = Stored::new();
+        assert_eq!(
+            apply(&mut s, &u32_write(ble::CFG_SLEEP_NOW, 1)).action,
+            Action::SleepNow(ble::ESP_SLEEP_MIN_S)
+        );
+        assert_eq!(
+            apply(&mut s, &u32_write(ble::CFG_SLEEP_NOW, 99_999)).action,
+            Action::SleepNow(ble::ESP_SLEEP_MAX_S)
+        );
+    }
+
+    /// A short write is rejected rather than read as some other duration.
+    #[test]
+    fn sleep_now_needs_a_full_u32() {
+        let mut s = Stored::new();
+        let o = apply(&mut s, &write(ble::CFG_SLEEP_NOW, &[30, 0]));
+        assert_eq!(o.action, Action::None);
+        assert_eq!(ack_status(&o), packet::ACK_BAD_VALUE);
+        assert_eq!(ack_id(&o), ble::CFG_SLEEP_NOW);
+    }
+
+    /// The resolver the app shares with the firmware agrees with what
+    /// `apply` does, which is the only reason it is shared.
+    #[test]
+    fn the_app_can_predict_the_duration_before_the_ack() {
+        for (asked, cadence) in [(0, 0), (0, 120), (30, 0), (1, 90), (99_999, 10)] {
+            let mut s = Stored::new();
+            s.sleep_interval_s = cadence;
+            let predicted = ble::resolve_sleep_now(asked, cadence);
+            assert_eq!(
+                apply(&mut s, &u32_write(ble::CFG_SLEEP_NOW, asked)).action,
+                Action::SleepNow(predicted),
+                "asked {asked}, cadence {cadence}"
+            );
         }
     }
 }
