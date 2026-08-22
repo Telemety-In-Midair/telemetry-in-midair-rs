@@ -413,8 +413,11 @@ SD both sit directly on +3V3, and the only load switch (U3, SiP32431)
 feeds the GPS active antenna and is driven by the GPS's own `LNA_EN`, not
 by a host GPIO. So `0x10` is accepted and logged with nothing behind it,
 and deep sleep leaves a MAX-M10 acquiring beside a sleeping S3 - which is
-the dominant draw at roughly 25-31 mA. GPS backup mode (`0x12`) is the only
-firmware lever on it, and on this board it is a poor one: `V_BCKP` goes to a
+the dominant draw. The receiver is 25-31 mA on its own, and the active
+antenna's LNA rides on top of it: `VCC_RF` feeds it through U3, whose enable
+is the GPS's own `LNA_EN`, so no host GPIO can separate the two and parking
+the receiver is the only thing that parks the antenna. Call the subsystem
+30-50 mA. GPS backup mode (`0x12`) is the only firmware lever on it, and on this board it is a poor one: `V_BCKP` goes to a
 test point and nothing else, so the M10's backup domain - the RTC, the BBR
 holding the ephemeris, and the UART-RX wake source itself - has no supply.
 Backup mode there means a cold start on every wake rather than a warm one,

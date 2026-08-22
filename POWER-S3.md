@@ -1,13 +1,39 @@
 # Wio-S3 power investigation
 
-Measured: ~180 mA "passive" (awake, nothing transmitting), and deep sleep
-that does not look like sleep. This is a read of the firmware and the two
-crates it delegates power to, against the module's own numbers.
+Measured: **~180 mA at the 4.2 V regulator input**, awake and with nothing
+transmitting, and deep sleep that does not look like sleep. This is a read
+of the firmware and the two crates it delegates power to, against the
+module's own numbers.
 
 Nothing here is a single broken line. The board has no power management in
 the awake state at all, one dependency silently removes the biggest saving
-the chip offers, and the deep-sleep path parks exactly one of the four
-loads it could park. The 180 mA is those three facts added up.
+the chip offers, and the deep-sleep path can park exactly one of the loads
+it would want to. The 180 mA is those facts added up.
+
+## Where the measurement was taken, and what it means
+
+The 4.2 V node is the output of the diode-OR (D3 battery / D4 USB, both
+`DM3CS-SF` Schottky) and the input to **U2, a `TLV75733PDBVR`** - a linear
+regulator, not a switcher. That settles the one thing the first draft of
+this report left open, and it settles it the unhelpful way:
+
+**An LDO passes its load current straight through.** Input current equals
+output current plus a quiescent draw of about 25 uA. So the 180 mA is not a
+higher-voltage-side number that divides down - it *is* the +3V3 load, and
+the budget below has to account for all of it rather than for the ~140 mA a
+switching regulator would have implied.
+
+Two consequences the topology adds on its own, neither of them firmware's:
+
+- **162 mW is burned as heat in U2** ((4.2 - 3.3) V x 180 mA), which is
+  about 21% of the power drawn from the cell. A buck in that position would
+  put roughly that fraction back - the same 3.3 V load would cost around
+  150 mA at 4.2 V instead of 180 mA. In a SOT-23-5 it is also about a 30 C
+  rise on the part itself.
+- **The diode costs usable cell range.** The LDO needs ~3.35 V in to hold
+  3.3 V out at this current; the Schottky drops ~0.3-0.4 V on top, so the
+  rail starts sagging with the cell still around 3.7 V. That is well short
+  of a LiPo's empty, and it is capacity that is simply not reachable.
 
 ## The module's own numbers, for calibration
 
@@ -30,27 +56,48 @@ firmware cannot get 31 mA, for the reason in finding 1.
 
 ```mermaid
 flowchart LR
-    RAIL["+3V3 rail<br/>~180 mA observed"]
+    CELL["4.2 V cell / USB<br/>~180 mA measured here"]
+    LDO["U2 TLV75733 LDO<br/>passes current 1:1<br/>burns 162 mW as heat"]
+    CELL --> LDO
 
-    RAIL --> BLE["ESP32-S3 + BLE controller<br/>~90-95 mA<br/>modem sleep hardcoded off"]
-    RAIL --> GPS["MAX-M10, 5 constellations<br/>continuous, 1 Hz<br/>~25-31 mA"]
-    RAIL --> CPU["CPU at 240 MHz<br/>vs 80/160<br/>~10-15 mA of the above"]
-    RAIL --> LORA["SX1262 continuous RX<br/>rx_boost on<br/>~6 mA"]
-    RAIL --> SD["SD card mounted, idle<br/>~1-10 mA, card dependent"]
-    RAIL --> USB["USB Serial/JTAG PHY<br/>~3-5 mA"]
-    RAIL --> MISC["LDO quiescent, LEDs off,<br/>floating MISO pads<br/>~2-5 mA"]
+    LDO --> BLE["ESP32-S3 + BLE controller<br/>95-110 mA<br/>modem sleep hardcoded off,<br/>advertising at +9 dBm"]
+    LDO --> GPS["MAX-M10, 5 constellations<br/>continuous, acquiring<br/>25-31 mA"]
+    LDO --> ANT["GPS active antenna LNA<br/>via VCC_RF and U3<br/>5-20 mA if fitted"]
+    LDO --> LORA["SX1262 continuous RX<br/>DC-DC + rx_boost<br/>~6 mA"]
+    LDO --> SD["SD card mounted, idle<br/>1-10 mA, card dependent"]
+    LDO --> USB["USB Serial/JTAG PHY<br/>3-5 mA"]
 
     BLE -.->|"the one big lever"| FIX1["drop BleConnector<br/>when not advertising"]
-    GPS -.->|"the other big lever"| FIX2["PowerMode::PsmOnOff,<br/>or backup before sleep"]
+    GPS -.-> FIX2
+    ANT -.->|"both need V_BCKP fed<br/>before they can be parked"| FIX2["tie V_BCKP to +3V3,<br/>then GPS backup on sleep"]
 ```
 
-Adding the estimates gives ~130-150 mA. The remainder is measurement path
-(if the ammeter is on the 5 V USB side rather than +3V3, a boost or a
-charger's quiescent draw is in the number too) and an SD card that idles
-hotter than the low end of that range. Worth resolving before chasing
-anything below finding 4.
+| Load | Estimate at 3.3 V |
+|-|-|
+| ESP32-S3 + BLE controller, modem sleep off, advertising at +9 dBm | 95-110 mA |
+| MAX-M10, five constellations, continuous, acquiring | 25-31 mA |
+| GPS active antenna LNA, through the module's `VCC_RF` and U3 | 5-20 mA |
+| SX1262 continuous RX, DC-DC and `rx_boost` on | ~6 mA |
+| SD card mounted and idle | 1-10 mA |
+| USB Serial/JTAG PHY | 3-5 mA |
+| LEDs off, LDO quiescent, leakage | ~1 mA |
+| **Total** | **136-183 mA** |
 
----
+That brackets the measurement, with 180 mA sitting at the top of the range -
+which is where a board with an active antenna, a card in the slot and USB
+plugged in should sit.
+
+The first draft of this report was ~30-50 mA short and blamed the
+measurement path. It was wrong on both counts. The path is 1:1, and the two
+things actually missing were **the GPS active antenna** - the module's
+`VCC_RF` feeds it through the U3 load switch, so it is a load on +3V3 that
+the receiver's own datasheet figure does not include - and the BLE
+controller advertising at +9 dBm rather than the 0 dBm the datasheet figures
+assume.
+
+Worth stating plainly what that means for runtime: 180 mA is roughly three
+to five hours from the LiPo sizes this board takes, and about a fifth of
+that is heat in U2.
 
 ## 1. esp-radio hardcodes BLE modem sleep off - biggest single item
 
@@ -155,8 +202,16 @@ priority sharply: it is not only "minutes of TTFF instead of seconds", it is
 the gate on the entire sleep story. With V_BCKP fed, backing the GPS up
 during deep sleep becomes both safe and obviously correct (BBR survives, so
 wakes are warm starts), and deep sleep goes from ~30 mA to something near
-the datasheet's 9.3 uA. Until then the ~30 mA is the floor and no amount of
+the datasheet's 9.3 uA. Until then that is the floor and no amount of
 firmware moves it.
+
+The 4.2 V measurement makes this worth more than it first looked. The active
+antenna's LNA is fed from the module's `VCC_RF` through U3, and U3's enable
+is the GPS's own `LNA_EN` - so the antenna is powered exactly while the
+receiver is, and no host GPIO can separate them. Parking the receiver is
+therefore the only thing that parks the antenna too. What V_BCKP is blocking
+is not 25-31 mA, it is **30-50 mA**: the whole GPS subsystem, and the single
+largest load on a sleeping board by a wide margin.
 
 ## 3. Nothing is held across deep sleep, so two chips wake themselves up
 
@@ -274,21 +329,28 @@ sleep-now command works regardless of it.
 
 ## Order to work in
 
-1. **Resolve the measurement path first.** +3V3 rail or 5 V USB input? The
-   estimate above only closes to ~130-150 mA, and the gap is most likely
-   upstream of the module.
-2. Re-measure awake with the CPU at 160 MHz, and read the periodic status
-   line while doing it. `radio rx` is the expected mode; `radio tx` or an
-   `err` word with 0x0020 set would change this whole analysis.
-3. **Measure a sleep, now that one can be asked for.** `pixi run wio-sleep
-   --seconds 60` on the bench, or the app's Sleep now button. The console
-   line on the far side (`woke from deep sleep #N`) is the confirmation
-   that it was a sleep and not a reset. Expect ~30 mA, not 9.3 uA, and see
-   finding 2 for why.
-4. **Tie V_BCKP to +3V3 on the next board spin.** It is the gate on the
-   whole sleep story, not just on TTFF, and no firmware change substitutes
-   for it.
-5. Finding 1's larger half: duty-cycle the BLE controller by dropping the
-   `BleConnector` outside the advertising window. Biggest remaining win,
-   biggest change, and it wants the measurements above first so the ~90 mA
-   claim is confirmed on this board rather than assumed.
+The measurement question is answered, so what is left is ranked by size.
+
+1. **Duty-cycle the BLE controller.** 95-110 mA of a 180 mA budget, and the
+   only lever is `BleConnector`'s `Drop` - build the trouble-host stack
+   inside the advertising window and tear it down when the window closes.
+   Biggest win by far, and the one that makes a LoRa-only deployed node
+   possible at all: without BLE the same board is a ~40 mA device.
+2. **Tie V_BCKP to +3V3 on the next board spin.** Unblocks parking the GPS
+   *and* its antenna during deep sleep - 30-50 mA, and the difference
+   between a sleep that measures 30 mA and one that measures microamps. No
+   firmware substitutes for it.
+3. **Consider a buck in place of U2.** 162 mW, about a fifth of everything
+   drawn from the cell, is heat. This is the one item that gets cheaper the
+   more the others succeed only in relative terms - it scales with whatever
+   the load ends up being.
+4. **Re-measure awake at 160 MHz**, and read the periodic status line while
+   doing it. `radio rx` is the expected mode; `radio tx` or an `err` word
+   with 0x0020 set would change this whole analysis.
+5. **Measure a sleep, now that one can be asked for.** `pixi run wio-sleep
+   --seconds 60`, or the app's Sleep now button. The console line on the far
+   side (`woke from deep sleep #N`) confirms it was a sleep and not a reset.
+   Expect ~30 mA until item 2 lands.
+6. Pull the SD card and unplug USB for one reading each. Both are in the
+   estimate as ranges rather than numbers, and between them they cover up to
+   15 mA that nothing in the firmware controls.
