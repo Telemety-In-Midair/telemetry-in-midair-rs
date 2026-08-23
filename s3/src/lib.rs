@@ -41,6 +41,7 @@ macro_rules! vprintln {
     }};
 }
 
+pub mod compass;
 pub mod flash;
 pub mod gps;
 pub mod node;

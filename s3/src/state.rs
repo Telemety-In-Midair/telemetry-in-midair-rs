@@ -313,6 +313,22 @@ pub enum Request {
 /// never concurrent - a board is either advertising or in a session.
 pub static SLEEP_NOW_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
+/// The node the compass should point at: `(src, position, age_s, rssi)`.
+///
+/// Read straight from the roster rather than cached, because the roster is
+/// already the thing that knows which node was heard most recently and
+/// duplicating that here would be a second answer to the same question.
+pub fn compass_target(
+    now_ms: u64,
+) -> Option<(u8, gps_proto::packet::PositionPacket, u16, i16)> {
+    critical_section::with(|cs| {
+        let roster = SHARED.borrow(cs).roster.borrow();
+        let (src, bytes, age_s, rssi) = roster.newest_position(now_ms)?;
+        let packet = gps_proto::packet::PositionPacket::decode(&bytes)?;
+        Some((src, packet, age_s, rssi))
+    })
+}
+
 /// Publish the running config's transmit deadline, in ms.
 pub fn set_tx_worst_case_ms(ms: u32) {
     critical_section::with(|cs| SHARED.borrow(cs).tx_worst_case_ms.set(ms));

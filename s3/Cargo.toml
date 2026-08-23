@@ -63,6 +63,10 @@ heapless         = "0.9"
 # covers atomics, and core's are not available on every target it builds for.
 portable-atomic = "1"
 
+# Trig for the compass heading. The bearing math itself lives in
+# midair-proto, which pulls the same crate.
+libm = "0.2"
+
 # The USB Serial/JTAG console, which the host tools speak the bulk protocol
 # over.
 embedded-io-async = "0.7.0"

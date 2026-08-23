@@ -410,14 +410,23 @@ async fn main(spawner: Spawner) -> ! {
     // names those two nets `GPIO10` and `GPIO11` and nothing else - so both
     // orders are tried rather than one being picked and a reversed cable
     // looking like a dead panel.
-    let oled = probe_oled(peripherals.I2C0).await;
-    match &oled {
-        Some(o) => println!("oled: 128x32 at {:#04x}", o.address()),
-        None => println!("oled: none on J5"),
+    let j5 = probe_j5(peripherals.I2C0).await;
+    match &j5 {
+        Some(j) => {
+            match &j.oled {
+                Some(o) => println!("oled: 128x32 at {:#04x}", o.address()),
+                None => println!("oled: none on J5"),
+            }
+            match &j.compass {
+                Some(c) => println!("compass: {} found", c.part().as_str()),
+                None => println!("compass: none on J5"),
+            }
+        }
+        None => println!("j5: nothing on the bus"),
     }
 
     spawner
-        .spawn(hardware_task(lora, gps, sdlog, oled, d5, d2))
+        .spawn(hardware_task(lora, gps, sdlog, j5, d5, d2))
         .expect("spawn hardware task");
 
     // The USB console: firmware text out, framed host commands in.
@@ -499,13 +508,24 @@ async fn main(spawner: Spawner) -> ! {
     }
 }
 
+/// Everything found on the J5 I2C bus, and the bus itself.
+///
+/// One bus, up to two devices, and the hardware loop owns all three - which
+/// is what makes it safe for the display and the magnetometer to share a
+/// controller with no arbitration: there is exactly one caller.
+pub struct J5 {
+    pub i2c: esp_hal::i2c::master::I2c<'static, esp_hal::Async>,
+    pub oled: Option<wio_s3_gps::oled::Oled>,
+    pub compass: Option<wio_s3_gps::compass::Compass>,
+}
+
 /// Try both SDA/SCL orders on J5 and return whichever finds a panel.
 ///
 /// The I2C peripheral and the two pins are consumed by each attempt, so the
 /// retry steals the singletons back. That is sound here and only here: this
 /// runs once, before anything else has been handed either pin, and the
 /// `I2c` from the failed attempt is dropped before the next is built.
-async fn probe_oled(i2c0: esp_hal::peripherals::I2C0<'static>) -> Option<wio_s3_gps::oled::Oled> {
+async fn probe_j5(i2c0: esp_hal::peripherals::I2C0<'static>) -> Option<J5> {
     use esp_hal::i2c::master::{Config as I2cConfig, I2c};
 
     // 400 kHz: a 512-byte frame is about 11 ms of bus time at 400 kHz
@@ -529,15 +549,19 @@ async fn probe_oled(i2c0: esp_hal::peripherals::I2C0<'static>) -> Option<wio_s3_
                 )
             }
         };
-        let i2c = match I2c::new(unsafe { i2c0.clone_unchecked() }, config) {
+        let mut i2c = match I2c::new(unsafe { i2c0.clone_unchecked() }, config) {
             Ok(i2c) => i2c.with_sda(sda).with_scl(scl).into_async(),
             Err(_) => return None,
         };
-        if let Some(oled) = wio_s3_gps::oled::Oled::probe(i2c).await {
+        let oled = wio_s3_gps::oled::Oled::probe(&mut i2c).await;
+        let compass = wio_s3_gps::compass::Compass::probe(&mut i2c).await;
+        // Either device answering settles the wiring, so a board with a
+        // magnetometer and no display still gets the right pin order.
+        if oled.is_some() || compass.is_some() {
             if swapped {
-                println!("oled: found with SDA/SCL swapped (SDA on GPIO11)");
+                println!("j5: SDA/SCL swapped (SDA on GPIO11)");
             }
-            return Some(oled);
+            return Some(J5 { i2c, oled, compass });
         }
     }
     None
@@ -1055,7 +1079,7 @@ async fn hardware_task(
     lora: Sx1262Driver<'static>,
     mut gps: Gps<'static>,
     mut sdlog: SdLog<'static>,
-    mut oled: Option<wio_s3_gps::oled::Oled>,
+    mut j5: Option<J5>,
     d5: Output<'static>,
     d2: Output<'static>,
 ) {
@@ -1132,9 +1156,11 @@ async fn hardware_task(
 
     // Something on the panel before the first telemetry, so a board that
     // fails during init does not look like a board with a dead display.
-    if let Some(o) = oled.as_mut() {
+    if let Some(j) = j5.as_mut()
+        && let Some(o) = j.oled.as_mut()
+    {
         wio_s3_gps::oled::render(o, None, cfg.address);
-        o.flush().await;
+        o.flush(&mut j.i2c).await;
     }
 
     let mut rx_count: u32 = 0;
@@ -1207,8 +1233,10 @@ async fn hardware_task(
                     // The panel sits on the always-on +3V3, so without this
                     // it holds its last frame - and its current - for the
                     // whole sleep.
-                    if let Some(o) = oled.as_mut() {
-                        o.blank().await;
+                    if let Some(j) = j5.as_mut()
+                        && let Some(o) = j.oled.as_mut()
+                    {
+                        o.blank(&mut j.i2c).await;
                     }
                     standby = true;
                     state::SLEEP_READY.signal(());
@@ -1458,12 +1486,22 @@ async fn hardware_task(
         // so this is fast enough that a fix or a packet lands promptly and
         // slow enough that the 11 ms frame write is a couple of percent of
         // the loop. `flush` is a no-op when nothing changed.
-        if oled.is_some() && due(now, next_oled) {
+        if j5.is_some() && due(now, next_oled) {
             next_oled = now.wrapping_add(500);
             let telemetry = state::telemetry();
-            if let Some(o) = oled.as_mut() {
-                wio_s3_gps::oled::render(o, telemetry, cfg.address);
-                o.flush().await;
+            let own = gps.packet();
+            let target = state::compass_target(now_ms);
+            if let Some(j) = j5.as_mut() {
+                // Sampled every refresh whether or not a panel is fitted:
+                // the hard-iron calibration only improves by being fed, and
+                // a board being carried is calibrating itself.
+                if let Some(c) = j.compass.as_mut() {
+                    c.sample(&mut j.i2c).await;
+                }
+                if let Some(o) = j.oled.as_mut() {
+                    draw_screen(o, j.compass.as_ref(), telemetry, &own, target, cfg.address);
+                    o.flush(&mut j.i2c).await;
+                }
             }
         }
 
@@ -1505,6 +1543,61 @@ async fn hardware_task(
 
         Timer::after(Duration::from_millis(10)).await;
     }
+}
+
+/// Choose and draw the screen: the compass when there is somewhere to
+/// point, the status readout otherwise.
+///
+/// The compass needs both ends of a bearing - this node's fix and another
+/// node's - so it appears exactly when it can be correct and the status
+/// screen is what a board sees the rest of the time. That is a better trade
+/// than alternating: a panel this size is read at a glance, and a glance
+/// that lands on the wrong half of a rotation is worse than a screen that
+/// only changes when the situation does.
+fn draw_screen(
+    oled: &mut wio_s3_gps::oled::Oled,
+    compass: Option<&wio_s3_gps::compass::Compass>,
+    telemetry: Option<link::Telemetry>,
+    own: &packet::PositionPacket,
+    target: Option<(u8, packet::PositionPacket, u16, i16)>,
+    node_address: u8,
+) {
+    use wio_s3_gps::oled;
+
+    let Some((node, remote, age_s, rssi)) = target else {
+        oled::render(oled, telemetry, node_address);
+        return;
+    };
+    if !own.has_fix() || !remote.has_fix() {
+        oled::render(oled, telemetry, node_address);
+        return;
+    }
+
+    let from = (own.lat_e7, own.lon_e7);
+    let to = (remote.lat_e7, remote.lon_e7);
+
+    // Heading, best source first. The magnetometer works standing still but
+    // only once the board has been turned through a circle; GPS course is
+    // always trustworthy but only exists while actually moving, so a walking
+    // pace floor keeps a stationary receiver's wandering course out of it.
+    const MOVING_CMS: u16 = 50;
+    let heading = match compass.and_then(|c| c.heading_deg()) {
+        Some(deg) => oled::Heading::Magnetic(deg as u16),
+        None if own.speed_cms >= MOVING_CMS => {
+            oled::Heading::Course((own.course_cdeg / 100).min(359))
+        }
+        None => oled::Heading::None,
+    };
+
+    let target = oled::Target {
+        node,
+        bearing_deg: midair_proto::geo::bearing_deg(from, to),
+        distance_m: midair_proto::geo::distance_m(from, to),
+        age_s,
+        rssi,
+    };
+    let (fix, sats) = (own.has_fix(), own.sats);
+    oled::render_compass(oled, &target, heading, fix, sats);
 }
 
 /// Adopt a radio config that arrived over BLE or USB.

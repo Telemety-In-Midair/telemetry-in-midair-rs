@@ -67,7 +67,17 @@ classDiagram
     class StatusOled {
         <<optional, SSD1306 on J5>>
         fix, sats, RSSI, time since
+        compass to the newest node
         detected not configured
+    }
+    class Magnetometer {
+        <<optional, QMC5883L or HMC5883L>>
+        shares the J5 bus
+        heading, hard-iron corrected
+    }
+    class Geo {
+        bearing_deg() distance_m()
+        relative_bearing_deg()
     }
     class State {
         <<snapshot, not a channel>>
@@ -149,6 +159,9 @@ classDiagram
     GattSession <--> State
     HardwareTask <--> State
     HardwareTask --> StatusOled : render(telemetry)
+    HardwareTask --> Magnetometer : sample()
+    Magnetometer --> StatusOled : heading, else GPS course
+    StatusOled ..> Geo : bearing and distance<br/>to the roster's newest node
     StatusOled ..> State : reads the same snapshot<br/>the app is notified
     UsbTask --> Xfer
     GattSession --> Xfer

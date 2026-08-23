@@ -1215,6 +1215,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
+name = "libm"
+version = "0.2.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
+
+[[package]]
 name = "linked_list_allocator"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1252,6 +1258,7 @@ name = "midair-proto"
 version = "0.1.0"
 dependencies = [
  "gps-proto",
+ "libm",
 ]
 
 [[package]]
@@ -1882,6 +1889,7 @@ dependencies = [
  "esp-storage",
  "gps-proto",
  "heapless 0.9.3",
+ "libm",
  "midair-proto",
  "portable-atomic",
  "static_cell",

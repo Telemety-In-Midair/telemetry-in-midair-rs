@@ -375,6 +375,46 @@ tried, and so are both SDA/SCL orders - the schematic names those two nets
 `GPIO10` and `GPIO11` and nothing else, so a reversed cable is a working
 display rather than a dead one.
 
+#### The compass
+
+Add a QMC5883L or HMC5883L magnetometer to the same J5 bus (0x0D and 0x1E,
+both probed) and the panel switches to a compass whenever there is somewhere
+to point: a rose on the left, the numbers on the right.
+
+```
+    |     n9 NNE 032
+  \ | /   1.24km
+   \|/    -87dB 4s
+    o     FIX 12sat M
+```
+
+Up is the way you are facing; the arrow is the other node. The three-letter
+point and the degrees are both relative, and the last character says where
+the heading came from - which matters, because the arrow means something
+different in each case:
+
+| | |
+|-|-|
+| `M` | Magnetometer. Works standing still. |
+| `G` | GPS course over ground, used when there is no usable magnetic heading and you are moving faster than 0.5 m/s. Relative to the way you are *travelling*. |
+| `T` | No heading at all. The arrow is the **true** bearing - north is up, and you supply the rotation. |
+
+The compass screen appears only when this node has a fix and some other node
+has reported one, so it is shown exactly when it can be correct; the status
+screen above is what you see the rest of the time. It points at the node
+heard from most recently, not the nearest - "nearest" makes the arrow jump
+between two nodes trading places at similar range, where "newest" only
+changes when a different node is actually heard.
+
+**It has to be turned before it works.** The heading is hard-iron corrected
+from the extremes seen on each axis, which only mean anything once the board
+has been rotated through a full circle - a magnetometer next to a LoRa PA, an
+SD card and a battery does not read a field centered on zero. Until it has,
+the marker reads `G` or `T` rather than showing a confident heading built
+from a quarter turn. It is also **not tilt-compensated**: hold the board
+level. Correcting that needs an accelerometer, which is a different part than
+the two supported here.
+
 The panel reads the same telemetry the BLE session notifies, so it and the
 app cannot disagree. It refreshes twice a second and skips frames identical
 to what is already on screen.
@@ -601,7 +641,7 @@ Board wiring (carrier design, `wio-s3-max-gps`):
 | GPIO44 | SD CS |
 | GPIO45 | SD MOSI - strapping pin, R17 DNP as of board V2 |
 | GPIO46 | SD SCK - strapping pin |
-| GPIO10, GPIO11 | J5 JST SH 4-pin, I2C - the status OLED |
+| GPIO10, GPIO11 | J5 JST SH 4-pin, I2C - status OLED and compass |
 | GPIO38-41, GPIO47 | J1 header 1x07 |
 | GPIO0 / RST | BOOT / RST test points |
 
