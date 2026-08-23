@@ -27,6 +27,7 @@ pub use gps_proto;
 
 pub mod ble;
 pub mod bulk;
+pub mod geo;
 pub mod link;
 pub mod lora;
 pub mod radiocfg;

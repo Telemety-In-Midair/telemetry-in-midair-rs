@@ -21,6 +21,7 @@
 
 use crate::ble;
 use crate::link;
+use gps_proto::packet;
 
 /// Nodes tracked at once. A shared LoRa channel saturates well before this
 /// many nodes are beaconing on it, so the table is not the limit.
@@ -158,6 +159,42 @@ impl Roster {
         for slot in self.slots.iter_mut().flatten() {
             slot.dirty = true;
         }
+    }
+
+    /// The most recently heard node that reported a position, as
+    /// `(src, packet bytes, age in seconds)`.
+    ///
+    /// This is what the compass points at. Newest rather than nearest,
+    /// deliberately: "nearest" needs a distance to every node on every
+    /// refresh and, worse, makes the arrow jump between nodes as two of
+    /// them trade places at similar range. Newest changes only when a
+    /// different node is actually heard from, which is a change the
+    /// operator can see a reason for.
+    ///
+    /// Ping-only nodes are skipped - they carry no position, so there is
+    /// nothing to point at.
+    pub fn newest_position(&self, now_ms: u64) -> Option<(u8, [u8; packet::POSITION_PACKET_LEN], u16)> {
+        let mut pick: Option<(&Slot, u64)> = None;
+        for slot in self.slots.iter().flatten() {
+            if !matches!(slot.report, Report::Position(_)) {
+                continue;
+            }
+            if now_ms.saturating_sub(slot.at_ms) > TTL_MS {
+                continue;
+            }
+            if pick.is_none_or(|(_, at)| slot.at_ms > at) {
+                pick = Some((slot, slot.at_ms));
+            }
+        }
+        let (slot, at_ms) = pick?;
+        let Report::Position(b) = slot.report else {
+            return None;
+        };
+        let mut pkt = [0u8; packet::POSITION_PACKET_LEN];
+        // Layout is [src, rssi u16, packet]; see `ble::REMOTE_LEN`.
+        pkt.copy_from_slice(&b[3..]);
+        let age = (now_ms.saturating_sub(at_ms) / 1000).min(ble::AGE_MAX_S as u64) as u16;
+        Some((b[0], pkt, age))
     }
 
     /// Nodes currently remembered.
@@ -420,5 +457,64 @@ mod tests {
         assert!(r.take_dirty(0).is_none());
         r.replay(0);
         assert!(r.take_dirty(0).is_none());
+    }
+
+    // -- what the compass points at ---------------------------------------
+
+    /// Newest, not first-seen and not nearest: the arrow follows whichever
+    /// node was heard from last.
+    #[test]
+    fn the_compass_target_is_the_newest_position() {
+        let mut r = Roster::new();
+        r.record(1_000, position(7, -80));
+        r.record(2_000, position(9, -95));
+        let (src, pkt, _) = r.newest_position(2_500).expect("a target");
+        assert_eq!(src, 9);
+        assert_eq!(i32::from_le_bytes(pkt[0..4].try_into().unwrap()), 9);
+
+        // An older node reporting again takes the arrow back.
+        r.record(3_000, position(7, -80));
+        assert_eq!(r.newest_position(3_100).unwrap().0, 7);
+    }
+
+    /// A ping carries no position, so a fleet of nodes that have never had
+    /// a fix leaves nothing to point at rather than pointing at nothing.
+    #[test]
+    fn pings_are_not_compass_targets() {
+        let mut r = Roster::new();
+        r.record(1_000, ping(4, 60));
+        assert!(r.newest_position(1_100).is_none());
+
+        // A position from another node is picked even though the ping is
+        // newer, because the ping was never a candidate.
+        r.record(2_000, position(5, -70));
+        r.record(3_000, ping(4, 90));
+        assert_eq!(r.newest_position(3_100).unwrap().0, 5);
+    }
+
+    /// An expired node must not be walked towards. Its last position is
+    /// half an hour old and it is the one target where being confidently
+    /// wrong costs the operator a walk.
+    #[test]
+    fn an_expired_node_is_not_a_target() {
+        let mut r = Roster::new();
+        r.record(1_000, position(3, -70));
+        assert!(r.newest_position(1_000 + TTL_MS).is_some(), "inside the ttl");
+        assert!(r.newest_position(1_001 + TTL_MS).is_none(), "past it");
+    }
+
+    /// The age comes back with the target, so a display can say how stale
+    /// the bearing it is drawing actually is.
+    #[test]
+    fn the_target_carries_its_age() {
+        let mut r = Roster::new();
+        r.record(1_000, position(2, -60));
+        assert_eq!(r.newest_position(1_000).unwrap().2, 0);
+        assert_eq!(r.newest_position(46_000).unwrap().2, 45);
+    }
+
+    #[test]
+    fn an_empty_roster_has_no_target() {
+        assert!(Roster::new().newest_position(1_000).is_none());
     }
 }

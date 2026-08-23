@@ -8,4 +8,7 @@ description = "Shared protocol for the telemetry-in-midair board: LoRa payloads,
 # no_std (except under test). Depends only on gps-proto (also no_std) so both
 # firmwares and host tests can use it.
 [dependencies]
+# Trig for the bearing/distance math in `geo`. no_std needs it; the host
+# tests use the same implementation so a result cannot differ by platform.
+libm = "0.2"
 gps-proto = { path = "../../gps-proto" }
