@@ -44,6 +44,7 @@ macro_rules! vprintln {
 pub mod flash;
 pub mod gps;
 pub mod node;
+pub mod oled;
 pub mod radio;
 pub mod sdlog;
 pub mod settings;

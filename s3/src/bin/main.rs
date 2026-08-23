@@ -36,7 +36,7 @@ use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
-use esp_hal::gpio::interconnect::{InputSignal, PeripheralInput};
+use esp_hal::gpio::interconnect::{InputSignal, OutputSignal, PeripheralInput};
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
 use esp_hal::rtc_cntl::Rtc;
@@ -244,15 +244,12 @@ async fn main(spawner: Spawner) -> ! {
     // 75 mA and is most of the budget in deep sleep.
     //
     // Pulled down rather than driven, because five of these leave the board:
-    // GPIO10/11 on the J5 JST-SH and GPIO38-41/47 on the J1 header. A pull
-    // is a defined state that still yields to whatever a user wires up; an
-    // output would fight it. When a real function claims one of these pins,
-    // it takes the pin from here.
+    // GPIO38-41/47 on the J1 header. A pull is a defined state that still
+    // yields to whatever a user wires up; an output would fight it. When a
+    // real function claims one of these pins, it takes the pin from here -
+    // as GPIO10 and GPIO11 have been, by the status display's I2C.
     let idle = InputConfig::default().with_pull(Pull::Down);
     let _parked = (
-        // J5, I2C-shaped
-        Input::new(peripherals.GPIO10, idle),
-        Input::new(peripherals.GPIO11, idle),
         // J1 header
         Input::new(peripherals.GPIO38, idle),
         Input::new(peripherals.GPIO39, idle),
@@ -406,8 +403,21 @@ async fn main(spawner: Spawner) -> ! {
         .expect("sd spi device");
     let sdlog = SdLog::new(embedded_sdmmc::SdCard::new(sd_dev, Delay::new()));
 
+    // The status display on J5. Optional hardware: a board with nothing on
+    // that connector gets `None` and never mentions it again.
+    //
+    // Which of GPIO10/GPIO11 is SDA is not a board fact - the schematic
+    // names those two nets `GPIO10` and `GPIO11` and nothing else - so both
+    // orders are tried rather than one being picked and a reversed cable
+    // looking like a dead panel.
+    let oled = probe_oled(peripherals.I2C0).await;
+    match &oled {
+        Some(o) => println!("oled: 128x32 at {:#04x}", o.address()),
+        None => println!("oled: none on J5"),
+    }
+
     spawner
-        .spawn(hardware_task(lora, gps, sdlog, d5, d2))
+        .spawn(hardware_task(lora, gps, sdlog, oled, d5, d2))
         .expect("spawn hardware task");
 
     // The USB console: firmware text out, framed host commands in.
@@ -487,6 +497,50 @@ async fn main(spawner: Spawner) -> ! {
     loop {
         Timer::after(Duration::from_secs(1)).await;
     }
+}
+
+/// Try both SDA/SCL orders on J5 and return whichever finds a panel.
+///
+/// The I2C peripheral and the two pins are consumed by each attempt, so the
+/// retry steals the singletons back. That is sound here and only here: this
+/// runs once, before anything else has been handed either pin, and the
+/// `I2c` from the failed attempt is dropped before the next is built.
+async fn probe_oled(i2c0: esp_hal::peripherals::I2C0<'static>) -> Option<wio_s3_gps::oled::Oled> {
+    use esp_hal::i2c::master::{Config as I2cConfig, I2c};
+
+    // 400 kHz: a 512-byte frame is about 11 ms of bus time at 400 kHz
+    // against 44 ms at 100 kHz, and the refresh has to fit between radio
+    // polls. Every SSD1306 module takes fast mode.
+    let config = I2cConfig::default().with_frequency(Rate::from_khz(400));
+
+    for swapped in [false, true] {
+        // SAFETY: see the note above - single-threaded init, one live
+        // borrow of each pin at a time.
+        let (sda, scl): (OutputSignal<'static>, OutputSignal<'static>) = unsafe {
+            if swapped {
+                (
+                    esp_hal::peripherals::GPIO11::steal().into(),
+                    esp_hal::peripherals::GPIO10::steal().into(),
+                )
+            } else {
+                (
+                    esp_hal::peripherals::GPIO10::steal().into(),
+                    esp_hal::peripherals::GPIO11::steal().into(),
+                )
+            }
+        };
+        let i2c = match I2c::new(unsafe { i2c0.clone_unchecked() }, config) {
+            Ok(i2c) => i2c.with_sda(sda).with_scl(scl).into_async(),
+            Err(_) => return None,
+        };
+        if let Some(oled) = wio_s3_gps::oled::Oled::probe(i2c).await {
+            if swapped {
+                println!("oled: found with SDA/SCL swapped (SDA on GPIO11)");
+            }
+            return Some(oled);
+        }
+    }
+    None
 }
 
 /// The settings characteristic value: what an app reads on connect.
@@ -1001,11 +1055,17 @@ async fn hardware_task(
     lora: Sx1262Driver<'static>,
     mut gps: Gps<'static>,
     mut sdlog: SdLog<'static>,
+    mut oled: Option<wio_s3_gps::oled::Oled>,
     d5: Output<'static>,
     d2: Output<'static>,
 ) {
     let mut rx_led = Blinker::new(d5);
     let mut tx_led = Blinker::new(d2);
+    // Owned by this task rather than given one of its own, because the
+    // panel has to be blanked *before* the board sleeps and this is where
+    // `PrepareSleep` is answered. A separate task would need the ordering
+    // negotiated; here it is a function call in the right place.
+    let mut next_oled = 0u32;
 
     // Give the card a chance to mount before its config is asked for.
     sdlog.poll(0);
@@ -1069,6 +1129,13 @@ async fn hardware_task(
         cfg.spreading_factor,
         cfg.bandwidth_khz
     );
+
+    // Something on the panel before the first telemetry, so a board that
+    // fails during init does not look like a board with a dead display.
+    if let Some(o) = oled.as_mut() {
+        wio_s3_gps::oled::render(o, None, cfg.address);
+        o.flush().await;
+    }
 
     let mut rx_count: u32 = 0;
     let mut tx_count: u32 = 0;
@@ -1137,6 +1204,12 @@ async fn hardware_task(
                     // Cold sleep, not standby: `init` runs again on the
                     // wake, which is a full reset anyway.
                     node.radio_mut().sleep();
+                    // The panel sits on the always-on +3V3, so without this
+                    // it holds its last frame - and its current - for the
+                    // whole sleep.
+                    if let Some(o) = oled.as_mut() {
+                        o.blank().await;
+                    }
                     standby = true;
                     state::SLEEP_READY.signal(());
                 }
@@ -1379,6 +1452,20 @@ async fn hardware_task(
         });
 
         sdlog.poll(now);
+
+        // ---- Status display -------------------------------------------------
+        // Twice a second. The fields underneath change about once a second,
+        // so this is fast enough that a fix or a packet lands promptly and
+        // slow enough that the 11 ms frame write is a couple of percent of
+        // the loop. `flush` is a no-op when nothing changed.
+        if oled.is_some() && due(now, next_oled) {
+            next_oled = now.wrapping_add(500);
+            let telemetry = state::telemetry();
+            if let Some(o) = oled.as_mut() {
+                wio_s3_gps::oled::render(o, telemetry, cfg.address);
+                o.flush().await;
+            }
+        }
 
         // ---- Periodic status ------------------------------------------------
         // Without this a quiet radio and a quiet GPS look identical from the
