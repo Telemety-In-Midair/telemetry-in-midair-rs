@@ -62,7 +62,7 @@ flowchart LR
 
     LDO --> BLE["ESP32-S3 + BLE controller<br/>95-110 mA<br/>modem sleep hardcoded off,<br/>advertising at +9 dBm"]
     LDO --> GPS["MAX-M10, 5 constellations<br/>continuous, acquiring<br/>25-31 mA"]
-    LDO --> ANT["GPS active antenna LNA<br/>via VCC_RF and U3<br/>5-20 mA if fitted"]
+    LDO --> ANT["GPS antenna LNA<br/>via VCC_RF and U3<br/>5-20 mA, active antenna only<br/>DC feed is live either way"]
     LDO --> LORA["SX1262 continuous RX<br/>DC-DC + rx_boost<br/>~6 mA"]
     LDO --> SD["SD card mounted, idle<br/>1-10 mA, card dependent"]
     LDO --> USB["USB Serial/JTAG PHY<br/>3-5 mA"]
@@ -76,28 +76,71 @@ flowchart LR
 |-|-|
 | ESP32-S3 + BLE controller, modem sleep off, advertising at +9 dBm | 95-110 mA |
 | MAX-M10, five constellations, continuous, acquiring | 25-31 mA |
-| GPS active antenna LNA, through the module's `VCC_RF` and U3 | 5-20 mA |
 | SX1262 continuous RX, DC-DC and `rx_boost` on | ~6 mA |
 | SD card mounted and idle | 1-10 mA |
 | USB Serial/JTAG PHY | 3-5 mA |
 | LEDs off, LDO quiescent, leakage | ~1 mA |
-| **Total** | **136-183 mA** |
+| GPS antenna LNA, *if an active antenna is fitted* | 5-20 mA |
+| **Total, passive antenna** | **131-163 mA** |
+| **Total, active antenna** | **136-183 mA** |
 
-That brackets the measurement, with 180 mA sitting at the top of the range -
-which is where a board with an active antenna, a card in the slot and USB
-plugged in should sit.
+**With an active antenna that closes**, 180 mA landing at the top of the
+range - a board with the antenna powered, a card in the slot and USB
+attached. **With a passive one it does not**: 17-49 mA is unaccounted for,
+and the rest of this section is honest about not knowing which it is. See
+"the antenna question" below, which is a measurement rather than an
+argument.
 
-The first draft of this report was ~30-50 mA short and blamed the
-measurement path. It was wrong on both counts. The path is 1:1, and the two
-things actually missing were **the GPS active antenna** - the module's
-`VCC_RF` feeds it through the U3 load switch, so it is a load on +3V3 that
-the receiver's own datasheet figure does not include - and the BLE
-controller advertising at +9 dBm rather than the 0 dBm the datasheet figures
-assume.
+The first draft of this report was short by about the same amount and
+blamed the measurement path. That was wrong: the path is 1:1. Two things
+were genuinely missing from it - the antenna line above, and the BLE
+controller advertising at **+9 dBm** against datasheet figures taken at
+0 dBm.
 
-Worth stating plainly what that means for runtime: 180 mA is roughly three
+Worth stating plainly what this means for runtime: 180 mA is roughly three
 to five hours from the LiPo sizes this board takes, and about a fifth of
 that is heat in U2.
+
+### The antenna question
+
+The board is built for an **active** antenna, and nothing in the firmware
+says otherwise:
+
+- The bias tee is populated and unconditional - `U5.VCC_RF` -> U3
+  (SiP32431) -> R15 10R -> L1 27nH -> the SMA J2 center pin.
+- U3's enable is the GPS's own `LNA_EN`, not a host GPIO, so the DC feed is
+  live whenever the receiver's RF section is on.
+- `Gps::configure` writes signal enables, `CFG-PM-OPERATEMODE`,
+  `CFG-RATE-MEAS`, `CFG-NAVSPG-DYNMODEL` and the NMEA message rates. It
+  writes **no `CFG-HW-ANT_*` key at all**, so the antenna supervisor is at
+  its factory default and nothing has ever told this receiver which kind of
+  antenna is on the end of the cable.
+
+So with a passive antenna fitted, DC is still being pushed at the SMA center
+pin, and what that costs depends entirely on the antenna's DC path:
+
+- **DC-open feed** (a series cap, most whips and monopoles): nothing flows.
+  The 5-20 mA line comes out of the budget and the 17-49 mA gap above is
+  real and still unexplained.
+- **DC-shorted feed** (very common on passive patches, where the feed is a
+  shorted stub): 3.3 V across R15's 10 ohm is a ~330 mA demand into a dead
+  short, clamped by U3's current limit and by the M10's own `VCC_RF`
+  regulator. That is not a power line item, it is a fault - and it would
+  show up on +3V3 as exactly the sort of tens-of-milliamps the budget cannot
+  otherwise place.
+
+**One measurement settles it:** DC volts on the SMA center pin, and DC volts
+*across R15*. R15 at ~0 V means nothing is being drawn and the antenna is
+DC-open. Volts across R15 means current is flowing - which is correct and
+expected for an active antenna, and a short for a passive one.
+
+If it turns out to be passive, the firmware should say so rather than leave
+it to the default: `CFG-HW-ANT_CFG_VOLTCTRL` set to 0 stops the receiver
+asserting antenna power, which would be a new key in `GpsConfig` alongside
+`power_mode` and `dyn_model`. That is not written yet, deliberately - the
+key id wants checking against the M10 interface description first, and
+guessing a UBX key writes something, just not necessarily the thing
+intended.
 
 ## 1. esp-radio hardcodes BLE modem sleep off - biggest single item
 
@@ -205,13 +248,15 @@ wakes are warm starts), and deep sleep goes from ~30 mA to something near
 the datasheet's 9.3 uA. Until then that is the floor and no amount of
 firmware moves it.
 
-The 4.2 V measurement makes this worth more than it first looked. The active
-antenna's LNA is fed from the module's `VCC_RF` through U3, and U3's enable
-is the GPS's own `LNA_EN` - so the antenna is powered exactly while the
-receiver is, and no host GPIO can separate them. Parking the receiver is
-therefore the only thing that parks the antenna too. What V_BCKP is blocking
-is not 25-31 mA, it is **30-50 mA**: the whole GPS subsystem, and the single
-largest load on a sleeping board by a wide margin.
+If an active antenna is fitted this is worth more than it first looked. Its
+LNA is fed from the module's `VCC_RF` through U3, and U3's enable is the
+GPS's own `LNA_EN` - so the antenna is powered exactly while the receiver
+is, and no host GPIO can separate them. Parking the receiver is therefore
+the only thing that parks the antenna too, and what V_BCKP blocks is the
+whole subsystem at 30-50 mA rather than the receiver's 25-31.
+
+With a passive antenna it is 25-31 mA, which is still the largest single
+load on a sleeping board by a wide margin, and the argument is unchanged.
 
 ## 3. Nothing is held across deep sleep, so two chips wake themselves up
 
@@ -337,20 +382,26 @@ The measurement question is answered, so what is left is ranked by size.
    Biggest win by far, and the one that makes a LoRa-only deployed node
    possible at all: without BLE the same board is a ~40 mA device.
 2. **Tie V_BCKP to +3V3 on the next board spin.** Unblocks parking the GPS
-   *and* its antenna during deep sleep - 30-50 mA, and the difference
-   between a sleep that measures 30 mA and one that measures microamps. No
-   firmware substitutes for it.
+   during deep sleep - 25-31 mA, or 30-50 with an active antenna, since
+   nothing separates the two - and the difference between a sleep that
+   measures ~30 mA and one that measures microamps. No firmware substitutes
+   for it.
 3. **Consider a buck in place of U2.** 162 mW, about a fifth of everything
    drawn from the cell, is heat. This is the one item that gets cheaper the
    more the others succeed only in relative terms - it scales with whatever
    the load ends up being.
-4. **Re-measure awake at 160 MHz**, and read the periodic status line while
+4. **Settle the antenna question with a voltmeter** - DC across R15, one
+   probe. It decides whether the budget above closes or has 17-49 mA still
+   unplaced, it decides whether item 2 is worth 30-50 mA or 25-31, and if
+   the antenna is passive *and* DC-shorted it is a fault rather than a
+   power line item.
+5. **Re-measure awake at 160 MHz**, and read the periodic status line while
    doing it. `radio rx` is the expected mode; `radio tx` or an `err` word
    with 0x0020 set would change this whole analysis.
-5. **Measure a sleep, now that one can be asked for.** `pixi run wio-sleep
+6. **Measure a sleep, now that one can be asked for.** `pixi run wio-sleep
    --seconds 60`, or the app's Sleep now button. The console line on the far
    side (`woke from deep sleep #N`) confirms it was a sleep and not a reset.
    Expect ~30 mA until item 2 lands.
-6. Pull the SD card and unplug USB for one reading each. Both are in the
+7. Pull the SD card and unplug USB for one reading each. Both are in the
    estimate as ranges rather than numbers, and between them they cover up to
    15 mA that nothing in the firmware controls.

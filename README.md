@@ -413,19 +413,32 @@ SD both sit directly on +3V3, and the only load switch (U3, SiP32431)
 feeds the GPS active antenna and is driven by the GPS's own `LNA_EN`, not
 by a host GPIO. So `0x10` is accepted and logged with nothing behind it,
 and deep sleep leaves a MAX-M10 acquiring beside a sleeping S3 - which is
-the dominant draw. The receiver is 25-31 mA on its own, and the active
-antenna's LNA rides on top of it: `VCC_RF` feeds it through U3, whose enable
-is the GPS's own `LNA_EN`, so no host GPIO can separate the two and parking
-the receiver is the only thing that parks the antenna. Call the subsystem
-30-50 mA. GPS backup mode (`0x12`) is the only firmware lever on it, and on this board it is a poor one: `V_BCKP` goes to a
+the dominant draw at 25-31 mA. GPS backup mode (`0x12`) is the only firmware
+lever on it, and on this board it is a poor one: `V_BCKP` goes to a
 test point and nothing else, so the M10's backup domain - the RTC, the BBR
 holding the ephemeris, and the UART-RX wake source itself - has no supply.
 Backup mode there means a cold start on every wake rather than a warm one,
 which on a short cadence is a board that never gets a fix. That is why the
 sleep path does not reach for it on its own: it stays an explicit choice.
 
-Tying `V_BCKP` to +3V3 is the fix, and it is a board change (see
-`BOARD-REVIEW.md` in the board repo). It is worth more than the TTFF it is
+**The board is wired for an active antenna, and the firmware does not
+configure the antenna at all.** `U5.VCC_RF` -> U3 (SiP32431) -> R15 10R ->
+L1 27nH -> the SMA J2 center pin is a populated, unconditional bias tee, and
+U3's enable is the GPS's own `LNA_EN` rather than a host GPIO - so DC is on
+the antenna port whenever the receiver's RF section is on. `Gps::configure`
+writes no `CFG-HW-ANT_*` key, so the antenna supervisor sits at its factory
+default and the receiver has never been told which kind of antenna is
+fitted.
+
+With an active antenna that adds its LNA (5-20 mA) to the figure above, and
+it cannot be dropped without parking the receiver. With a passive one it
+depends on the antenna's DC path: a capacitively-coupled feed ignores the
+bias, while a DC-shorted feed - common on passive patches - puts 3.3 V
+across R15's 10 ohm, which is a short rather than a load. Measuring DC
+across R15 is the one-probe answer.
+
+Tying `V_BCKP` to +3V3 is the fix for the sleep half, and it is a board
+change (see `BOARD-REVIEW.md` in the board repo). It is worth more than the TTFF it is
 usually filed under - it is what would let a sleeping board park its GPS and
 approach the module's 9.3 uA instead of sitting at 30 mA.
 
