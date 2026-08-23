@@ -351,6 +351,40 @@ Config command ids (config characteristic, `[id, len, value]`):
 | `0x14` | u32 s | advertising window per wake check, 1 s..60 s (default 15 s) |
 | `0x15` | u32 s | deep sleep **now** for this long, 5 s..5 min; 0 = use `0x13`. A command, not a setting |
 
+### Status display
+
+An optional 0.91" 128x32 SSD1306 on the J5 JST-SH shows the four numbers
+that answer "is this board working" without a phone or a serial cable:
+
+```
+GPS FIX   12 sat
+RSSI  -87 dBm
+SEEN     4s
+n1   rx23   tx15
+```
+
+`GPS ----` means no fix. `RSSI --` and `SEEN never` mean nothing has been
+heard over LoRa since boot, which is what separates a quiet channel from a
+radio that is not working. The bottom line is this node's address and its
+packet counters, so two boards on a bench are told apart without connecting
+to either.
+
+It is **detected, not configured**: no I2C ack on J5 and the firmware says
+`oled: none on J5` once and never mentions it again. Both 0x3C and 0x3D are
+tried, and so are both SDA/SCL orders - the schematic names those two nets
+`GPIO10` and `GPIO11` and nothing else, so a reversed cable is a working
+display rather than a dead one.
+
+The panel reads the same telemetry the BLE session notifies, so it and the
+app cannot disagree. It refreshes twice a second and skips frames identical
+to what is already on screen.
+
+**It costs 5-15 mA** depending on how many pixels are lit, which is why the
+layout leaves most of the panel dark and why the firmware blanks it (charge
+pump off, not just pixels cleared) before every deep sleep - it sits on the
+always-on +3V3 and would otherwise hold its last frame, and its current,
+for the whole sleep.
+
 ### Low power
 
 Sleep is off by default (`0x13` = 0), which is what an unconfigured board
@@ -430,12 +464,24 @@ writes no `CFG-HW-ANT_*` key, so the antenna supervisor sits at its factory
 default and the receiver has never been told which kind of antenna is
 fitted.
 
-With an active antenna that adds its LNA (5-20 mA) to the figure above, and
-it cannot be dropped without parking the receiver. With a passive one it
-depends on the antenna's DC path: a capacitively-coupled feed ignores the
-bias, while a DC-shorted feed - common on passive patches - puts 3.3 V
-across R15's 10 ohm, which is a short rather than a load. Measuring DC
-across R15 is the one-probe answer.
+**The feed cannot be turned off in firmware.** MAX-M10N integration manual
+Table 22: `LNA_EN` is high in normal operation and the antenna supervisor
+does not gate it - the supervisor can only pull it low on a detected short,
+which needs a sense pin this board does not have, and its voltage control is
+disabled by default anyway. The pin's polarity is fixed and it also drives
+the module's internal LNA, so it is not the firmware's to repurpose. No
+config key exists for this because a key that does nothing is worse than
+none.
+
+With an active antenna the LNA adds 5-20 mA and cannot be dropped without
+parking the receiver. With a passive one it depends on the antenna's DC
+path: a wire or any capacitively-coupled feed is DC-open and the bias drives
+nothing, while a DC-shorted feed - common on passive patches - puts 3.3 V
+across R15's 10 ohm, which is a short rather than a load. One probe across
+R15 tells them apart: ~0 V is open.
+
+**For a passive build the fix is hardware:** depopulate R15, the 10 ohm in
+the bias tee's DC path. One 0402, and the feed is gone.
 
 Tying `V_BCKP` to +3V3 is the fix for the sleep half, and it is a board
 change (see `BOARD-REVIEW.md` in the board repo). It is worth more than the TTFF it is
@@ -555,7 +601,7 @@ Board wiring (carrier design, `wio-s3-max-gps`):
 | GPIO44 | SD CS |
 | GPIO45 | SD MOSI - strapping pin, R17 DNP as of board V2 |
 | GPIO46 | SD SCK - strapping pin |
-| GPIO10, GPIO11 | J5 JST SH 4-pin, I2C-shaped |
+| GPIO10, GPIO11 | J5 JST SH 4-pin, I2C - the status OLED |
 | GPIO38-41, GPIO47 | J1 header 1x07 |
 | GPIO0 / RST | BOOT / RST test points |
 

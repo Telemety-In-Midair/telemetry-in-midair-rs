@@ -80,6 +80,7 @@ flowchart LR
 | SD card mounted and idle | 1-10 mA |
 | USB Serial/JTAG PHY | 3-5 mA |
 | LEDs off, LDO quiescent, leakage | ~1 mA |
+| 0.91" OLED on J5, *if fitted* (new) | 5-15 mA |
 | GPS antenna LNA, *if an active antenna is fitted* | 5-20 mA |
 | **Total, passive antenna** | **131-163 mA** |
 | **Total, active antenna** | **136-183 mA** |
@@ -134,13 +135,51 @@ pin, and what that costs depends entirely on the antenna's DC path:
 DC-open. Volts across R15 means current is flowing - which is correct and
 expected for an active antenna, and a short for a passive one.
 
-If it turns out to be passive, the firmware should say so rather than leave
-it to the default: `CFG-HW-ANT_CFG_VOLTCTRL` set to 0 stops the receiver
-asserting antenna power, which would be a new key in `GpsConfig` alongside
-`power_mode` and `dyn_model`. That is not written yet, deliberately - the
-key id wants checking against the M10 interface description first, and
-guessing a UBX key writes something, just not necessarily the thing
-intended.
+### There is no "configure for passive", and the manual is explicit
+
+The plan was `CFG-HW-ANT_CFG_VOLTCTRL = 0` as a new `GpsConfig` key. The
+MAX-M10N integration manual (UBXDOC-304424225, Table 22) says that does not
+do what we both assumed:
+
+| Mode/feature | LNA_EN state |
+|-|-|
+| Normal operation | **High** |
+| Software standby mode | Low |
+| Hardware backup mode | Low |
+| LEAP mode | Duty cycling high-low |
+| Antenna supervisor: supply power down on short detect | Low |
+
+**LNA_EN is high in normal operation regardless of the antenna supervisor.**
+The supervisor does not gate it - it can only pull it *low*, and only on a
+detected short, which needs a sense circuit on `CFG-HW-ANT_SUP_SHORT_PIN`
+that this board does not have. `VOLTCTRL` is already disabled by default
+(section 3.4.1: an unconfigured receiver reports antenna status "DON'T
+KNOW"), so writing 0 to it changes nothing at all.
+
+The pin also has no polarity control - "The polarity cannot be changed" -
+and it is shared with the module's *internal* LNA, so it is not a pin the
+firmware may repurpose.
+
+So the honest answer is: **the DC feed cannot be turned off in firmware**,
+and no config key has been added, because a setting that does nothing is
+worse than no setting.
+
+What the options actually are:
+
+- **Depopulate R15.** The 10 ohm in the bias tee's DC path is the whole
+  feed; removing one 0402 breaks it and costs nothing else. This is the
+  correct build option for a passive antenna and it belongs in the board
+  notes as one.
+- **Leave it.** With a wire antenna the SMA center pin is DC-open, so the
+  feed drives nothing and the cost is zero. This is the current state and
+  it is fine.
+- `CFG-PM-OPERATEMODE` set to a power-save mode duty-cycles LNA_EN as a
+  side effect (the LEAP row above). That is a receiver power decision that
+  happens to touch the antenna, not an antenna setting, and `power_mode` is
+  already a config key.
+
+**With the wire antennas in use, this is a non-issue and not a saving.** The
+line stays out of the budget, and the 17-49 mA gap is still open.
 
 ## 1. esp-radio hardcodes BLE modem sleep off - biggest single item
 
@@ -390,11 +429,11 @@ The measurement question is answered, so what is left is ranked by size.
    drawn from the cell, is heat. This is the one item that gets cheaper the
    more the others succeed only in relative terms - it scales with whatever
    the load ends up being.
-4. **Settle the antenna question with a voltmeter** - DC across R15, one
-   probe. It decides whether the budget above closes or has 17-49 mA still
-   unplaced, it decides whether item 2 is worth 30-50 mA or 25-31, and if
-   the antenna is passive *and* DC-shorted it is a fault rather than a
-   power line item.
+4. **Confirm the wire antennas are DC-open** - one probe across R15, which
+   should read ~0 V. Expected for a wire soldered to an SMA center pin, and
+   it is the difference between "the bias tee drives nothing" and a short
+   through 10 ohm. If it is open, depopulating R15 is tidiness rather than
+   a fix and can wait for a respin.
 5. **Re-measure awake at 160 MHz**, and read the periodic status line while
    doing it. `radio rx` is the expected mode; `radio tx` or an `err` word
    with 0x0020 set would change this whole analysis.

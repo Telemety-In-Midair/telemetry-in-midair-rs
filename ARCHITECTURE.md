@@ -59,9 +59,15 @@ classDiagram
         PING INFO BULK
     }
     class HardwareTask {
-        owns radio, gps and card
+        owns radio, gps, card and panel
         beacon() poll() repeat() log()
         applies a pushed config
+        blanks the panel for sleep
+    }
+    class StatusOled {
+        <<optional, SSD1306 on J5>>
+        fix, sats, RSSI, time since
+        detected not configured
     }
     class State {
         <<snapshot, not a channel>>
@@ -142,6 +148,8 @@ classDiagram
     ServeTask --> Settings : sleep interval, window
     GattSession <--> State
     HardwareTask <--> State
+    HardwareTask --> StatusOled : render(telemetry)
+    StatusOled ..> State : reads the same snapshot<br/>the app is notified
     UsbTask --> Xfer
     GattSession --> Xfer
     Xfer --> BulkTransfer
