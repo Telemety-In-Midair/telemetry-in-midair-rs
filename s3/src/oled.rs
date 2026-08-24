@@ -31,6 +31,12 @@ pub const HEIGHT: usize = 32;
 const PAGES: usize = HEIGHT / 8;
 const FRAME: usize = WIDTH * PAGES;
 
+/// Column 0 of the panel in the controller's RAM. Zero on an SSD1306,
+/// which is what a 0.91" module carries; an SH1106 centers a 128-column
+/// panel in 132 columns of RAM and needs 2, which is what a display that
+/// works but is shifted two pixels sideways is telling you.
+const COL_OFFSET: u8 = 0;
+
 /// Glyph cell: a 5x7 font with one column of spacing.
 const CELL_W: usize = 6;
 /// Characters per line, and lines per screen.
@@ -57,7 +63,7 @@ const INIT: &[u8] = &[
     0xD3, 0x00, // no display offset
     0x40, // start line 0
     0x8D, 0x14, // charge pump on - without this the panel stays dark
-    0x20, 0x00, // horizontal addressing, so a frame is one linear write
+    0x20, 0x02, // page addressing: see `write_page` for why not horizontal
     0xA1, // segment remap: column 127 maps to SEG0
     0xC8, // COM scan direction reversed
     0xDA, 0x02, // COM pin configuration for 32 rows
@@ -67,8 +73,11 @@ const INIT: &[u8] = &[
     0xA4, // follow display RAM, rather than forcing every pixel on
     0xA6, // normal, not inverted
     0x2E, // scrolling off
-    0xAF, // display on
 ];
+// Display on is deliberately not in that list: `init` clears display RAM
+// first, so the panel never shows whatever the RAM happened to hold at
+// power-up.
+const DISPLAY_ON: &[u8] = &[0xAF];
 
 /// 5x7 glyphs for ASCII 0x20..=0x7E, five column bytes each, LSB at the top
 /// of the cell. Anything outside the range renders as a space.
@@ -235,10 +244,66 @@ impl Oled {
 
     async fn init(&mut self, i2c: &mut I2c<'static, Async>) -> Result<(), ()> {
         self.cmds(i2c, INIT).await?;
+        self.clear_ram(i2c).await?;
+        self.cmds(i2c, DISPLAY_ON).await?;
         self.on = true;
         // Nothing is known about display RAM across an init, so the next
         // flush has to send a whole frame rather than trust `sent`.
         self.sent_valid = false;
+        Ok(())
+    }
+
+    /// Point the write pointer at column `col` of `page`.
+    ///
+    /// Page addressing rather than the addressing-mode registers, because
+    /// the column start is split across two commands here but works the
+    /// same on every SSD1306-compatible controller, including the SH1106
+    /// that some modules carry, which has no horizontal addressing mode at
+    /// all and quietly drops the window commands.
+    async fn goto(&mut self, i2c: &mut I2c<'static, Async>, page: u8, col: u8) -> Result<(), ()> {
+        let col = col + COL_OFFSET;
+        self.cmds(i2c, &[0xB0 | page, col & 0x0F, 0x10 | (col >> 4)])
+            .await
+    }
+
+    /// Zero every page the controller has, not just the four this panel
+    /// shows.
+    ///
+    /// A 128x64 controller driven at 32 rows still holds whatever landed in
+    /// the pages below, and RAM is not defined at power-up - so anything not
+    /// written here is free to appear as speckle. Done once per init, before
+    /// the display is turned on.
+    async fn clear_ram(&mut self, i2c: &mut I2c<'static, Async>) -> Result<(), ()> {
+        // 132 columns, the widest RAM row any of these controllers has.
+        let mut frame = [0u8; 1 + 66];
+        frame[0] = CTRL_DATA;
+        for page in 0..8 {
+            self.goto(i2c, page, 0).await?;
+            for _ in 0..2 {
+                i2c.write_async(self.address, &frame)
+                    .await
+                    .map_err(|_| ())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Send one page: 128 bytes from `buf` to the row of the panel that
+    /// `page` addresses.
+    async fn write_page(&mut self, i2c: &mut I2c<'static, Async>, page: usize) -> Result<(), ()> {
+        self.goto(i2c, page as u8, 0).await?;
+        let mut frame = [0u8; 65];
+        let end = (page + 1) * WIDTH;
+        let mut off = page * WIDTH;
+        while off < end {
+            let n = (end - off).min(frame.len() - 1);
+            frame[0] = CTRL_DATA;
+            frame[1..1 + n].copy_from_slice(&self.buf[off..off + n]);
+            i2c.write_async(self.address, &frame[..1 + n])
+                .await
+                .map_err(|_| ())?;
+            off += n;
+        }
         Ok(())
     }
 
@@ -336,30 +401,21 @@ impl Oled {
         if self.sent_valid && self.buf == self.sent {
             return;
         }
-        // Window the whole panel, then stream it. Horizontal addressing
-        // wraps column to page for us, so the frame is one linear run.
-        if self
-            .cmds(i2c, &[0x21, 0, (WIDTH - 1) as u8, 0x22, 0, (PAGES - 1) as u8])
-            .await
-            .is_err()
-        {
-            return;
-        }
-        let mut frame = [0u8; 65];
-        for chunk in self.buf.chunks(frame.len() - 1) {
-            frame[0] = CTRL_DATA;
-            frame[1..1 + chunk.len()].copy_from_slice(chunk);
-            if i2c
-                .write_async(self.address, &frame[..1 + chunk.len()])
-                .await
-                .is_err()
-            {
+        // Per page, and only the pages that changed: a status readout
+        // usually redraws one line, which is a quarter of the bus time of a
+        // whole frame.
+        for page in 0..PAGES {
+            let range = page * WIDTH..(page + 1) * WIDTH;
+            if self.sent_valid && self.buf[range.clone()] == self.sent[range] {
+                continue;
+            }
+            if self.write_page(i2c, page).await.is_err() {
                 // A panel unplugged mid-run: stop, and let the next pass
                 // try again rather than spending the rest of the frame on
                 // a bus nothing is answering. `sent` is deliberately left
-                // invalid, because half a frame reached the panel and the
-                // next pass must not skip itself on a comparison against
-                // what was only partly written.
+                // invalid, because part of a frame reached the panel and
+                // the next pass must not skip itself on a comparison
+                // against what was only partly written.
                 self.sent_valid = false;
                 return;
             }

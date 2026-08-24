@@ -409,7 +409,8 @@ async fn main(spawner: Spawner) -> ! {
     // Which of GPIO10/GPIO11 is SDA is not a board fact - the schematic
     // names those two nets `GPIO10` and `GPIO11` and nothing else - so both
     // orders are tried rather than one being picked and a reversed cable
-    // looking like a dead panel.
+    // looking like a dead panel. SDA on GPIO10 / SCL on GPIO11 is tried
+    // first, so that is what a straight cable gets.
     let j5 = probe_j5(peripherals.I2C0).await;
     match &j5 {
         Some(j) => {
@@ -520,6 +521,8 @@ pub struct J5 {
 }
 
 /// Try both SDA/SCL orders on J5 and return whichever finds a panel.
+///
+/// SDA on GPIO10 and SCL on GPIO11 goes first; the reverse is the fallback.
 ///
 /// The I2C peripheral and the two pins are consumed by each attempt, so the
 /// retry steals the singletons back. That is sound here and only here: this
