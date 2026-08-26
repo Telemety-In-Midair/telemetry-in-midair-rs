@@ -1,14 +1,18 @@
 # Wio-S3 power investigation
 
-Measured: **~180 mA at the 4.2 V regulator input**, awake and with nothing
-transmitting, and deep sleep that does not look like sleep. This is a read
-of the firmware and the two crates it delegates power to, against the
-module's own numbers.
+Measured: **~140 mA at the 4.2 V regulator input**, awake, BLE connected,
+GPS tracking and nothing transmitting. It was 180 mA before the clock came
+down to 160 MHz and the unused pins were parked. The same scenario on the
+two-MCU board this one replaces measures **66 mA**.
 
-Nothing here is a single broken line. The board has no power management in
-the awake state at all, one dependency silently removes the biggest saving
-the chip offers, and the deep-sleep path can park exactly one of the loads
-it would want to. The 180 mA is those facts added up.
+That comparison is the most useful number in this document and it arrived
+after the first two drafts, so read this one as the corrected version. The
+74 mA gap is not a firmware regression. Roughly 50 mA of it is the part
+swap - an S3's BLE radio costs about twice a C6's for the same job - and
+roughly 20 mA is a hardware feature the old board had and this one does
+not: a GPIO under the GPS and LoRa rail. Neither board ever gets BLE modem
+sleep, because the crate in the middle hardcodes it off, and that is where
+the recoverable current is.
 
 ## Where the measurement was taken, and what it means
 
@@ -18,17 +22,17 @@ regulator, not a switcher. That settles the one thing the first draft of
 this report left open, and it settles it the unhelpful way:
 
 **An LDO passes its load current straight through.** Input current equals
-output current plus a quiescent draw of about 25 uA. So the 180 mA is not a
+output current plus a quiescent draw of about 25 uA. So the 140 mA is not a
 higher-voltage-side number that divides down - it *is* the +3V3 load, and
-the budget below has to account for all of it rather than for the ~140 mA a
+the budget below has to account for all of it rather than for the ~110 mA a
 switching regulator would have implied.
 
 Two consequences the topology adds on its own, neither of them firmware's:
 
-- **162 mW is burned as heat in U2** ((4.2 - 3.3) V x 180 mA), which is
+- **126 mW is burned as heat in U2** ((4.2 - 3.3) V x 140 mA), which is
   about 21% of the power drawn from the cell. A buck in that position would
   put roughly that fraction back - the same 3.3 V load would cost around
-  150 mA at 4.2 V instead of 180 mA. In a SOT-23-5 it is also about a 30 C
+  115 mA at 4.2 V instead of 140 mA. In a SOT-23-5 it is also about a 25 C
   rise on the part itself.
 - **The diode costs usable cell range.** The LDO needs ~3.35 V in to hold
   3.3 V out at this current; the Schottky drops ~0.3-0.4 V on top, so the
@@ -52,29 +56,71 @@ The useful one is the third: 158 mA with the LoRa PA keyed at 22 dBm
 measured that with ESP-IDF defaults, which enable BT modem sleep. This
 firmware cannot get 31 mA, for the reason in finding 1.
 
-## Where the 180 mA goes
+## The two-MCU board is the calibration that matters
+
+`README.md` keeps the predecessor's bench figures. Two of them carry the
+whole diagnosis:
+
+| Scenario, old two-MCU board | |
+|-|-|
+| Everything running, no SD (BLE connected, fix, LoRa TX pulses) | 66 mA |
+| ESP only, BLE connected | 46 mA |
+
+The second line is the one to read twice. **46 mA is a C6 doing nothing but
+BLE**, with the AP2112K on GPIO2 holding the GPS and the WIO-E5 off - that
+firmware only raises the rail when a central actually connects. So the old
+board's headline 66 mA is 46 mA of BLE plus 20 mA for an entire second MCU,
+a GPS and a LoRa radio.
+
+Lined up against this board:
+
+| | Old (C6 + WIO-E5) | New (Wio-S3) |
+|-|-|-|
+| MCU + BLE, RF never sleeping | 46 mA measured | 95-100 mA, datasheet class |
+| GPS + LoRa + second MCU | 20 mA measured | ~35 mA |
+| Rail gate under GPS/LoRa | AP2112K on GPIO2 | **none - U2 feeds everything** |
+| **Same scenario** | **66 mA** | **~140 mA** |
+
+Two facts, and neither is a line of firmware anyone got wrong:
+
+- **The S3's radio costs about twice the C6's.** Both parts run the same
+  esp-radio with modem sleep hardcoded off, so both sit in "RF working"
+  continuously rather than duty-cycling between advertising events. The
+  C6's version of that state measures 46 mA; the S3's is a ~95 mA part
+  figure. That is most of the gap, and it was bought with the module.
+- **There is no rail to switch.** The old board could take its GPS and LoRa
+  side to zero with one GPIO, and its best number is quoted with them
+  there. Here U2 feeds the receiver, the SX1262, the panel and the card
+  unconditionally, so that ~35 mA is in every reading this board can
+  produce.
+
+The consolation is that the single-module board should still win once BLE
+is dealt with: 66 mA on the old board included a second MCU that no longer
+exists.
+
+## Where the 140 mA goes
 
 ```mermaid
 flowchart LR
-    CELL["4.2 V cell / USB<br/>~180 mA measured here"]
-    LDO["U2 TLV75733 LDO<br/>passes current 1:1<br/>burns 162 mW as heat"]
+    CELL["4.2 V cell / USB<br/>~140 mA measured here"]
+    LDO["U2 TLV75733 LDO<br/>passes current 1:1<br/>burns 126 mW as heat"]
     CELL --> LDO
 
-    LDO --> BLE["ESP32-S3 + BLE controller<br/>95-110 mA<br/>modem sleep hardcoded off,<br/>advertising at +9 dBm"]
+    LDO --> BLE["ESP32-S3 + BLE controller<br/>95-100 mA<br/>modem sleep hardcoded off,<br/>advertising at +9 dBm"]
     LDO --> GPS["MAX-M10, 5 constellations<br/>continuous, acquiring<br/>25-31 mA"]
     LDO --> ANT["GPS antenna LNA<br/>via VCC_RF and U3<br/>5-20 mA, active antenna only<br/>DC feed is live either way"]
     LDO --> LORA["SX1262 continuous RX<br/>DC-DC + rx_boost<br/>~6 mA"]
     LDO --> SD["SD card mounted, idle<br/>1-10 mA, card dependent"]
     LDO --> USB["USB Serial/JTAG PHY<br/>3-5 mA"]
 
-    BLE -.->|"the one big lever"| FIX1["drop BleConnector<br/>when not advertising"]
+    BLE -.->|"the one big lever"| FIX1["patch sleep_mode, and/or<br/>drop BleConnector<br/>when not advertising"]
     GPS -.-> FIX2
     ANT -.->|"both need V_BCKP fed<br/>before they can be parked"| FIX2["tie V_BCKP to +3V3,<br/>then GPS backup on sleep"]
 ```
 
 | Load | Estimate at 3.3 V |
 |-|-|
-| ESP32-S3 + BLE controller, modem sleep off, advertising at +9 dBm | 95-110 mA |
+| ESP32-S3 + BLE controller, modem sleep off, advertising at +9 dBm | 95-100 mA |
 | MAX-M10, five constellations, continuous, acquiring | 25-31 mA |
 | SX1262 continuous RX, DC-DC and `rx_boost` on | ~6 mA |
 | SD card mounted and idle | 1-10 mA |
@@ -82,24 +128,19 @@ flowchart LR
 | LEDs off, LDO quiescent, leakage | ~1 mA |
 | 0.91" OLED on J5, *if fitted* (new) | 5-15 mA |
 | GPS antenna LNA, *if an active antenna is fitted* | 5-20 mA |
-| **Total, passive antenna** | **131-163 mA** |
-| **Total, active antenna** | **136-183 mA** |
+| **Total, no card and no panel** | **130-143 mA** |
+| **Total, panel fitted** | **135-158 mA** |
 
-**With an active antenna that closes**, 180 mA landing at the top of the
-range - a board with the antenna powered, a card in the slot and USB
-attached. **With a passive one it does not**: 17-49 mA is unaccounted for,
-and the rest of this section is honest about not knowing which it is. See
-"the antenna question" below, which is a measurement rather than an
-argument.
+**That closes**, and it closes without needing an antenna theory to fill
+it: 140 mA sits inside the range with a panel fitted and inside it without
+one. The 17-49 mA the earlier draft could not place was the difference
+between an *estimate* of the S3's BLE state and a *measurement* of the
+equivalent state, and the two-MCU comparison above supplies the
+measurement. The antenna section below stands as an open bench check
+rather than as a load-bearing part of the budget.
 
-The first draft of this report was short by about the same amount and
-blamed the measurement path. That was wrong: the path is 1:1. Two things
-were genuinely missing from it - the antenna line above, and the BLE
-controller advertising at **+9 dBm** against datasheet figures taken at
-0 dBm.
-
-Worth stating plainly what this means for runtime: 180 mA is roughly three
-to five hours from the LiPo sizes this board takes, and about a fifth of
+Worth stating plainly what this means for runtime: 140 mA is roughly four
+to six hours from the LiPo sizes this board takes, and about a fifth of
 that is heat in U2.
 
 ### The antenna question
@@ -243,7 +284,40 @@ which is exactly what `state::radio_busy()` exists to keep apart.
 setter is public and its argument is unnameable from outside the crate.
 Recorded in a comment at the construction site rather than worked around;
 the workaround available is a raw vendor HCI command, which is not worth
-its fragility for a spike this size.
+its fragility for a spike this size. Note that the vendored copy in the
+next section reaches this too - the same fork that sets `sleep_mode` can
+call `with_default_tx_power`, since inside the crate the enum is nameable.
+
+### The cheaper route to most of the same current: patch the two literals
+
+Dropping the connector saves ~90 mA *between* advertising windows and
+nothing at all while a phone is connected. Modem sleep saves ~60 mA in both
+states, and the entire change is two values in a vendored esp-radio:
+
+```rust
+// esp-radio-0.17.0/src/ble/os_adapter_esp32c3_s3.rs, create_ble_config
+sleep_mode: 1,   // ESP-IDF CONFIG_BT_CTRL_SLEEP_MODE_EFF, which defaults on
+sleep_clock: 1,  // ESP-IDF main-XTAL low-power clock
+```
+
+plus a `[patch.crates-io]` entry pointing at the copy. Confirm both values
+against ESP-IDF's `esp_bt.h` for the S3 before trusting them; the point is
+that the module datasheet's implied ~31 mA for BLE advertising is what
+ESP-IDF gets with whatever these are, so the target is known rather than
+guessed.
+
+**It is unproven and may simply not work.** The C3/S3 path runs through
+`npl.rs`, whose init calls
+`ble_os_adapter_chip_specific::disable_sleep_mode()` - and for this chip
+that function's whole body is the comment `// nothing`. The sleep phase
+callbacks (`btdm_sleep_enter_phase1` and the rest) are present in the OSI
+table, but nothing in the crate exercises them, and a controller that asks
+to sleep and gets a stub back hangs rather than saves.
+
+It is still the first thing to try, because it is an afternoon against a
+restructuring, it helps in the connected state that dropping the connector
+cannot touch, and it fails loudly: the board either advertises at ~35 mA or
+stops advertising.
 
 ## 2. The GPS is the whole deep-sleep budget, and V_BCKP is why it stays
 
@@ -413,34 +487,37 @@ sleep-now command works regardless of it.
 
 ## Order to work in
 
-The measurement question is answered, so what is left is ranked by size.
+Ranked by current recovered per unit of work, with the old board's 66 mA as
+the number to beat.
 
-1. **Duty-cycle the BLE controller.** 95-110 mA of a 180 mA budget, and the
-   only lever is `BleConnector`'s `Drop` - build the trouble-host stack
-   inside the advertising window and tear it down when the window closes.
-   Biggest win by far, and the one that makes a LoRa-only deployed node
-   possible at all: without BLE the same board is a ~40 mA device.
-2. **Tie V_BCKP to +3V3 on the next board spin.** Unblocks parking the GPS
-   during deep sleep - 25-31 mA, or 30-50 with an active antenna, since
-   nothing separates the two - and the difference between a sleep that
-   measures ~30 mA and one that measures microamps. No firmware substitutes
-   for it.
-3. **Consider a buck in place of U2.** 162 mW, about a fifth of everything
-   drawn from the cell, is heat. This is the one item that gets cheaper the
-   more the others succeed only in relative terms - it scales with whatever
-   the load ends up being.
-4. **Confirm the wire antennas are DC-open** - one probe across R15, which
-   should read ~0 V. Expected for a wire soldered to an SMA center pin, and
-   it is the difference between "the bias tee drives nothing" and a short
-   through 10 ohm. If it is open, depopulating R15 is tidiness rather than
-   a fix and can wait for a respin.
-5. **Re-measure awake at 160 MHz**, and read the periodic status line while
-   doing it. `radio rx` is the expected mode; `radio tx` or an `err` word
-   with 0x0020 set would change this whole analysis.
-6. **Measure a sleep, now that one can be asked for.** `pixi run wio-sleep
-   --seconds 60`, or the app's Sleep now button. The console line on the far
-   side (`woke from deep sleep #N`) confirms it was a sleep and not a reset.
-   Expect ~30 mA until item 2 lands.
-7. Pull the SD card and unplug USB for one reading each. Both are in the
-   estimate as ranges rather than numbers, and between them they cover up to
-   15 mA that nothing in the firmware controls.
+1. **Try BLE modem sleep.** Two literals in a vendored esp-radio, ~60 mA if
+   it takes, and the only lever that helps while a phone is connected. It
+   fails loudly, so the experiment is cheap. Do this before anything
+   structural.
+2. **Duty-cycle the BLE controller** - if modem sleep does not take, and
+   worth having as well as it if it does. ~90 mA whenever no central is
+   connected, through `BleConnector`'s `Drop`. This is what makes a
+   deployed LoRa-only node possible at all: the same board with the BLE
+   modem down is a ~45 mA device.
+3. **Push `power_mode = psmct` and measure.** The key already exists
+   (`CFG-PM-OPERATEMODE`, `PowerMode::PsmCyclic`) and defaults to `full`;
+   cyclic tracking holds a fix at a fraction of the receiver's continuous
+   25-31 mA. No code at all, so measure it before writing any.
+4. **Next board spin: tie V_BCKP to +3V3, and add a load switch under the
+   GPS and SX1262.** The old board's 46 mA reading exists because it had
+   one, and this board cannot reach its own equivalent without it. V_BCKP
+   is separately the gate on the whole deep-sleep story (finding 2). No
+   firmware substitutes for either.
+5. **160 -> 80 MHz**, worth ~10 mA, once the items above have settled.
+   esp-radio is validated at the S3's ESP-IDF default of 160, so change
+   this last and re-test BLE after it.
+6. **Consider a buck in place of U2.** 126 mW, about a fifth of everything
+   drawn from the cell, is heat - and it scales with whatever the load
+   ends up being.
+7. **Confirm the wire antennas are DC-open** - one probe across R15, which
+   should read ~0 V. No longer load-bearing for the budget, but still the
+   difference between a bias tee driving nothing and a short through
+   10 ohm.
+8. **Measure a sleep.** `pixi run wio-sleep --seconds 60`, or the app's
+   Sleep now button; `woke from deep sleep #N` on the far side confirms it
+   was a sleep and not a reset. Expect ~30 mA until item 4 lands.
