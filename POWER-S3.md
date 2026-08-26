@@ -108,14 +108,12 @@ flowchart LR
 
     LDO --> BLE["ESP32-S3 + BLE controller<br/>95-100 mA<br/>modem sleep hardcoded off,<br/>advertising at +9 dBm"]
     LDO --> GPS["MAX-M10, 5 constellations<br/>continuous, acquiring<br/>25-31 mA"]
-    LDO --> ANT["GPS antenna LNA<br/>via VCC_RF and U3<br/>5-20 mA, active antenna only<br/>DC feed is live either way"]
     LDO --> LORA["SX1262 continuous RX<br/>DC-DC + rx_boost<br/>~6 mA"]
     LDO --> SD["SD card mounted, idle<br/>1-10 mA, card dependent"]
     LDO --> USB["USB Serial/JTAG PHY<br/>3-5 mA"]
 
     BLE -.->|"the one big lever"| FIX1["patch sleep_mode, and/or<br/>drop BleConnector<br/>when not advertising"]
-    GPS -.-> FIX2
-    ANT -.->|"both need V_BCKP fed<br/>before they can be parked"| FIX2["tie V_BCKP to +3V3,<br/>then GPS backup on sleep"]
+    GPS -.->|"needs V_BCKP fed<br/>before it can be parked"| FIX2["tie V_BCKP to +3V3,<br/>then GPS backup on sleep"]
 ```
 
 | Load | Estimate at 3.3 V |
@@ -127,54 +125,49 @@ flowchart LR
 | USB Serial/JTAG PHY | 3-5 mA |
 | LEDs off, LDO quiescent, leakage | ~1 mA |
 | 0.91" OLED on J5, *if fitted* (new) | 5-15 mA |
-| GPS antenna LNA, *if an active antenna is fitted* | 5-20 mA |
 | **Total, no card and no panel** | **130-143 mA** |
 | **Total, panel fitted** | **135-158 mA** |
+
+There is no antenna line because **U3 is unpopulated and the GPS antenna is
+a wire** - see the section below. The bias tee drives nothing, so it costs
+nothing.
 
 **That closes**, and it closes without needing an antenna theory to fill
 it: 140 mA sits inside the range with a panel fitted and inside it without
 one. The 17-49 mA the earlier draft could not place was the difference
 between an *estimate* of the S3's BLE state and a *measurement* of the
 equivalent state, and the two-MCU comparison above supplies the
-measurement. The antenna section below stands as an open bench check
-rather than as a load-bearing part of the budget.
+measurement.
 
 Worth stating plainly what this means for runtime: 140 mA is roughly four
 to six hours from the LiPo sizes this board takes, and about a fifth of
 that is heat in U2.
 
-### The antenna question
+### The antenna question, closed
 
-The board is built for an **active** antenna, and nothing in the firmware
-says otherwise:
+**U3 is not fitted, and the GPS antenna is a wire.** That settles it as a
+build fact, and it costs nothing to leave alone:
 
-- The bias tee is populated and unconditional - `U5.VCC_RF` -> U3
-  (SiP32431) -> R15 10R -> L1 27nH -> the SMA J2 center pin.
-- U3's enable is the GPS's own `LNA_EN`, not a host GPIO, so the DC feed is
-  live whenever the receiver's RF section is on.
-- `Gps::configure` writes signal enables, `CFG-PM-OPERATEMODE`,
-  `CFG-RATE-MEAS`, `CFG-NAVSPG-DYNMODEL` and the NMEA message rates. It
-  writes **no `CFG-HW-ANT_*` key at all**, so the antenna supervisor is at
-  its factory default and nothing has ever told this receiver which kind of
-  antenna is on the end of the cable.
+- The board is *designed* for an active antenna - `U5.VCC_RF` -> U3
+  (SiP32431) -> R15 10R -> L1 27nH -> the SMA J2 center pin - but with the
+  load switch depopulated the DC path is open at U3. No current leaves
+  `VCC_RF`, whatever `LNA_EN` does.
+- A wire soldered to the SMA center pin is a passive monopole, so there is
+  no LNA to feed and nothing on the far end that wants DC. The
+  DC-shorted-patch failure mode that earlier drafts worried about cannot
+  happen either, because the feed is broken one component earlier.
+- R15 and L1 are left as an open stub off the RF node. At 1575 MHz a 27 nH
+  shunt into an open is not a load worth counting.
 
-So with a passive antenna fitted, DC is still being pushed at the SMA center
-pin, and what that costs depends entirely on the antenna's DC path:
+So the antenna line is **0 mA**, the R15 probe is unnecessary, and the
+budget above has to close on the other loads alone - which it does. The
+only thing left of this section is the note below, which is about a config
+key that was never worth adding.
 
-- **DC-open feed** (a series cap, most whips and monopoles): nothing flows.
-  The 5-20 mA line comes out of the budget and the 17-49 mA gap above is
-  real and still unexplained.
-- **DC-shorted feed** (very common on passive patches, where the feed is a
-  shorted stub): 3.3 V across R15's 10 ohm is a ~330 mA demand into a dead
-  short, clamped by U3's current limit and by the M10's own `VCC_RF`
-  regulator. That is not a power line item, it is a fault - and it would
-  show up on +3V3 as exactly the sort of tens-of-milliamps the budget cannot
-  otherwise place.
-
-**One measurement settles it:** DC volts on the SMA center pin, and DC volts
-*across R15*. R15 at ~0 V means nothing is being drawn and the antenna is
-DC-open. Volts across R15 means current is flowing - which is correct and
-expected for an active antenna, and a short for a passive one.
+`Gps::configure` writes signal enables, `CFG-PM-OPERATEMODE`,
+`CFG-RATE-MEAS`, `CFG-NAVSPG-DYNMODEL` and the NMEA message rates, and no
+`CFG-HW-ANT_*` key at all. On this build that is the right answer for a
+second reason: with U3 absent, there is no supply to supervise.
 
 ### There is no "configure for passive", and the manual is explicit
 
@@ -205,22 +198,19 @@ So the honest answer is: **the DC feed cannot be turned off in firmware**,
 and no config key has been added, because a setting that does nothing is
 worse than no setting.
 
-What the options actually are:
+On this build it is moot anyway: **U3 is unpopulated**, so the feed is
+already broken a component upstream of anything `LNA_EN` could reach, and
+depopulating R15 as well would be belt and braces on a path that is
+already open. Fitting U3 is the decision that would bring any of this back,
+and it should only be made alongside an actual active antenna.
 
-- **Depopulate R15.** The 10 ohm in the bias tee's DC path is the whole
-  feed; removing one 0402 breaks it and costs nothing else. This is the
-  correct build option for a passive antenna and it belongs in the board
-  notes as one.
-- **Leave it.** With a wire antenna the SMA center pin is DC-open, so the
-  feed drives nothing and the cost is zero. This is the current state and
-  it is fine.
-- `CFG-PM-OPERATEMODE` set to a power-save mode duty-cycles LNA_EN as a
-  side effect (the LEAP row above). That is a receiver power decision that
-  happens to touch the antenna, not an antenna setting, and `power_mode` is
-  already a config key.
+Worth keeping from the original note: `CFG-PM-OPERATEMODE` set to a
+power-save mode duty-cycles `LNA_EN` as a side effect (the LEAP row above).
+That is a receiver power decision that happens to touch the antenna, not an
+antenna setting, and `power_mode` is already a config key - see item 3 in
+the work order.
 
-**With the wire antennas in use, this is a non-issue and not a saving.** The
-line stays out of the budget, and the 17-49 mA gap is still open.
+**With a wire antenna and no U3, this is a non-issue and not a saving.**
 
 ## 1. esp-radio hardcodes BLE modem sleep off - biggest single item
 
@@ -361,15 +351,12 @@ wakes are warm starts), and deep sleep goes from ~30 mA to something near
 the datasheet's 9.3 uA. Until then that is the floor and no amount of
 firmware moves it.
 
-If an active antenna is fitted this is worth more than it first looked. Its
-LNA is fed from the module's `VCC_RF` through U3, and U3's enable is the
-GPS's own `LNA_EN` - so the antenna is powered exactly while the receiver
-is, and no host GPIO can separate them. Parking the receiver is therefore
-the only thing that parks the antenna too, and what V_BCKP blocks is the
-whole subsystem at 30-50 mA rather than the receiver's 25-31.
-
-With a passive antenna it is 25-31 mA, which is still the largest single
-load on a sleeping board by a wide margin, and the argument is unchanged.
+Earlier drafts hedged this at 30-50 mA on the chance that an active
+antenna's LNA was being fed through U3 alongside the receiver. **U3 is
+unpopulated and the antenna is a wire**, so there is no LNA in the picture
+and the number is the receiver's own **25-31 mA**. That is still the
+largest single load on a sleeping board by a wide margin, and the argument
+is unchanged - only simpler.
 
 ## 3. Nothing is held across deep sleep, so two chips wake themselves up
 
@@ -543,10 +530,6 @@ the number to beat.
 6. **Consider a buck in place of U2.** 126 mW, about a fifth of everything
    drawn from the cell, is heat - and it scales with whatever the load
    ends up being.
-7. **Confirm the wire antennas are DC-open** - one probe across R15, which
-   should read ~0 V. No longer load-bearing for the budget, but still the
-   difference between a bias tee driving nothing and a short through
-   10 ohm.
-8. **Measure a sleep.** `pixi run wio-sleep --seconds 60`, or the app's
+7. **Measure a sleep.** `pixi run wio-sleep --seconds 60`, or the app's
    Sleep now button; `woke from deep sleep #N` on the far side confirms it
    was a sleep and not a reset. Expect ~30 mA until item 4 lands.
