@@ -52,9 +52,15 @@ Two consequences the topology adds on its own, neither of them firmware's:
 | ESP32-S3 deep sleep + LoRa sleep | 9.3 uA |
 
 The useful one is the third: 158 mA with the LoRa PA keyed at 22 dBm
-(127 mA on its own) leaves about **31 mA for "BLE advertising"**. Seeed
-measured that with ESP-IDF defaults, which enable BT modem sleep. This
-firmware cannot get 31 mA, for the reason in finding 1.
+(127 mA on its own) leaves about **31 mA for "BLE advertising"**.
+
+**Treat that as an anchor, not a target.** It is a subtraction across two
+separate rows, which assumes everything else about them was identical, and
+the conditions are not stated - in particular whether modem sleep was on,
+which on this chip family is not the ESP-IDF default (see finding 1). It
+is evidence that a duty-cycled BLE advertiser on this module costs tens of
+milliamps rather than ninety, and it is not a number to plan against. The
+real one comes off a meter.
 
 ## The two-MCU board is the calibration that matters
 
@@ -225,12 +231,30 @@ the work order.
         sleep_clock: 0,
 ```
 
-Literals, not config fields. ESP-IDF defaults `CONFIG_BT_CTRL_MODEM_SLEEP`
-to on; esp-radio does not. With `sleep_mode: 0` the BT controller never
-powers its PHY down between advertising events, so the part sits in
-"RF working" - roughly 90-95 mA on an S3 - continuously, instead of the
-~31 mA the module datasheet reports. There is no firmware knob for this in
-esp-radio 0.17.
+Literals, not config fields. With `sleep_mode: 0` the BT controller never
+powers its PHY down between advertising or connection events, so the part
+sits in "RF working" - a ~95 mA figure on an S3, against the C6's measured
+46 - for as long as the controller exists. There is no firmware knob for
+it in esp-radio 0.17.
+
+**Upstream is not doing anything wrong, and earlier drafts of this document
+said it was.** The claim here used to be that ESP-IDF defaults
+`CONFIG_BT_CTRL_MODEM_SLEEP` to on and esp-radio silently diverged. It does
+not: on the C3/S3 controller `BT_CTRL_MODEM_SLEEP` is `default n`
+(`components/bt/controller/esp32c3/Kconfig.in`), so the published crate is
+doing exactly what its comment says - tracking
+`BT_CONTROLLER_INIT_CONFIG_DEFAULT`. Modem sleep is an opt-in in both
+places. That makes this a supported configuration someone chose not to
+select, rather than a saving a dependency took away, and it lowers
+confidence in the ~31 mA estimate that was partly resting on the same bad
+assumption.
+
+The values, from `esp_bt.h`, are `ESP_BT_SLEEP_MODE_1 = 1` and
+`ESP_BT_SLEEP_CLOCK_MAIN_XTAL = 1`; mode 1 is the only sleep mode the
+controller implements, and main crystal is what menuconfig's low-power
+clock choice defaults to. The 32 kHz options need an external crystal
+(`RTC_CLK_SRC_EXT_CRYS`) or accept the internal RC's accuracy, which is far
+outside BLE's 500 ppm.
 
 What there *is*: `BleConnector` owns a `PhyInitGuard`, and
 
@@ -272,11 +296,11 @@ which is exactly what `state::radio_busy()` exists to keep apart.
 `TxPower` enum its own `with_default_tx_power` builder takes: both
 `ble::npl` and `ble_os_adapter_chip_specific` are `pub(crate)`, so the
 setter is public and its argument is unnameable from outside the crate.
-Recorded in a comment at the construction site rather than worked around;
-the workaround available is a raw vendor HCI command, which is not worth
-its fragility for a spike this size. Note that the vendored copy in the
-next section reaches this too - the same fork that sets `sleep_mode` can
-call `with_default_tx_power`, since inside the crate the enum is nameable.
+It cannot be lowered *from outside the crate*. The vendored copy solves it
+in one line - a `pub use` beside the existing `Config` re-export - and the
+firmware now runs at **0 dBm**. On this board the extra 9 dB was buying
+nothing anyway: `WIFI/BT_ANT` runs to test point BLE1 and stops, so range
+is whatever the stub couples at either power.
 
 ### The cheaper route to most of the same current: patch the two literals
 
@@ -462,10 +486,11 @@ Findings 3, 4, 5 and 7 are fixed, and sleep is now something a board can be
 |-|-|
 | 3 | SX1262 NSS is pad-held through the sleep (GPIO21 is an RTC pin). SD CS on GPIO44 is not fixable this way - the S3's RTC pins stop at 21 - and is still open. |
 | 4 | The park budget is the running config's own transmit deadline, and the hardware loop declines to start a beacon with a sleep pending. |
-| 5 | 240 -> 160 MHz. |
+| 5 | 240 -> 160 -> 80 MHz. 80 is esp-radio's own documented floor; it refuses to start below it. |
 | 7 | Both MISO pads pulled up, through a frozen `InputSignal` because `with_miso` overwrites the pull otherwise. |
 | new | `CFG_SLEEP_NOW` (BLE), `SLEEP` (USB console), `pixi run wio-sleep`, and a Sleep now control on the app's Beacon page. |
 | new | A wake counter in RTC RAM. A deep sleep is a full reset, so from the console a board on its cadence and a board resetting in a loop print the same banner - the wake number is what separates them. |
+| 1a | **esp-radio is vendored under `s3/vendor/esp-radio`** with `sleep_mode`/`sleep_clock` set to 1, and `TxPower` re-exported so BLE TX drops from +9 to 0 dBm. Wired through `[patch.crates-io]`; deleting that block reverts it. Builds clean - whether the controller actually sleeps is a bench question, not a build one. |
 
 Finding 6 stands as designed - an unconfigured board never sleeping on its
 own is the right default for something you have to be able to reach - but
@@ -506,10 +531,13 @@ patching them first.
 Ranked by current recovered per unit of work, with the old board's 66 mA as
 the number to beat.
 
-1. **Try BLE modem sleep.** Two literals in a vendored esp-radio, ~60 mA if
-   it takes, and the only lever that helps while a phone is connected. It
-   fails loudly, so the experiment is cheap. Do this before anything
-   structural.
+1. ~~Try BLE modem sleep.~~ **Done, unmeasured.** Flash `s3` at the
+   vendoring commit and read the meter against the 140 mA baseline. Two
+   failure modes and only one is loud: a hang or a board that stops
+   advertising is obvious, but the controller can equally accept the config
+   and change no current at all, because the NPL init calls
+   `disable_sleep_mode()` and for this chip that function's body is the
+   comment `// nothing`. **The meter is the test, not the behavior.**
 2. **Duty-cycle the BLE controller** - if modem sleep does not take, and
    worth having as well as it if it does. ~90 mA whenever no central is
    connected, through `BleConnector`'s `Drop`. This is what makes a
@@ -524,9 +552,11 @@ the number to beat.
    one, and this board cannot reach its own equivalent without it. V_BCKP
    is separately the gate on the whole deep-sleep story (finding 2). No
    firmware substitutes for either.
-5. **160 -> 80 MHz**, worth ~10 mA, once the items above have settled.
-   esp-radio is validated at the S3's ESP-IDF default of 160, so change
-   this last and re-test BLE after it.
+5. ~~160 -> 80 MHz.~~ **Done, unmeasured**, as its own commit on top of the
+   vendoring. Both change BLE's operating conditions, so read the parent
+   commit first or the two cannot be told apart - and a controller unhappy
+   at 80 MHz looks exactly like a modem-sleep failure. `_160MHz` is the
+   one-word revert.
 6. **Consider a buck in place of U2.** 126 mW, about a fifth of everything
    drawn from the cell, is heat - and it scales with whatever the load
    ends up being.
