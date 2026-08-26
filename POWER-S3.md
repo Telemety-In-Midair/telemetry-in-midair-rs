@@ -485,6 +485,35 @@ own is the right default for something you have to be able to reach - but
 finding a board that will not sleep no longer means reading the policy: the
 sleep-now command works regardless of it.
 
+## Two things that look like levers and are not
+
+**Unused peripherals are already clock-gated, and not by luck.**
+`esp_hal::init` calls `system::disable_peripherals()`
+(esp-hal-1.0.0/src/system.rs:37), which gates and resets every peripheral
+outside a small `KEEP_ENABLED` set. Each driver then holds a refcounted
+`PeripheralGuard` that enables on construction and disables on `Drop`
+(same file, 54-77). This firmware constructs TIMG0, SPI2, SPI3, I2C0,
+UART1, USB_DEVICE, BT, LPWR and FLASH; every other block - the spare
+UARTs, I2S, LCD_CAM, RMT, PCNT, TWAI, MCPWM, LEDC, the crypto
+accelerators, unclaimed DMA - was never turned on to begin with. There is
+no saving here, and the pin sweep already covered the pads. The one
+exception worth a line is `USB_DEVICE`: its PHY is 3-5 mA and is only
+useful with a cable attached, so dropping the driver when unplugged would
+gate it. Small, and only helps on battery.
+
+**ESP-IDF's power management API does not exist on this stack.**
+`esp_pm_configure` - DFS between a min and max frequency, plus automatic
+light sleep on tickless idle, arbitrated by PM locks that drivers take -
+is an ESP-IDF facility. esp-hal 1.0 sets `CpuClock` once at `init` and has
+no runtime DFS, and esp-rtos 0.2's idle hook is a bare `waiti 0`
+(esp-rtos-0.2.0/src/task/xtensa.rs:17): a WFI with every clock still
+running, not tickless idle. `Rtc::sleep_light` exists
+(esp-hal-1.0.0/src/rtc_cntl/mod.rs:415) but it is manual, and entering it
+with the BLE controller up is precisely what `sleep_mode`/`sleep_clock`
+are supposed to arrange. The IDF document is describing the machinery that
+finding 1's two literals opt out of, which is one more argument for
+patching them first.
+
 ## Order to work in
 
 Ranked by current recovered per unit of work, with the old board's 66 mA as
