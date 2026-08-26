@@ -212,17 +212,18 @@ esp_bootloader_esp_idf::esp_app_desc!();
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) -> ! {
-    // Not `CpuClock::max()`, which on the S3 is 240 MHz. Nothing here needs
-    // it: the hardware loop runs at 100 Hz, the GPS link is 9600 baud, the
-    // SD bus is 400 kHz and the radio sees one 8 MHz burst per beacon. The
-    // clock is a standing cost the whole time the board is awake, and 240
-    // against 160 is on the order of 10 mA for headroom nothing claims.
+    // Not `CpuClock::max()`, which on the S3 is 240 MHz, and not ESP-IDF's
+    // default of 160 either. Nothing here claims that headroom: the
+    // hardware loop runs at 100 Hz, the GPS link is 9600 baud, the SD bus
+    // is 400 kHz and the radio sees one 8 MHz burst per beacon. The clock
+    // is a standing cost the whole time the board is awake, and each step
+    // down is on the order of 10 mA.
     //
-    // 160 rather than 80 because it is what ESP-IDF defaults the S3 to, and
-    // so what the BLE controller inside `esp-radio` is validated at. 80 MHz
-    // is the next step down if a measurement says the difference is worth
-    // finding out.
-    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_160MHz);
+    // 80 MHz is the floor rather than an arbitrary choice - esp-radio
+    // refuses to start below it. Step back up to `_160MHz` if the BLE
+    // controller misbehaves; that is the configuration it is validated at,
+    // and this one is not.
+    let config = esp_hal::Config::default().with_cpu_clock(CpuClock::_80MHz);
     let peripherals = esp_hal::init(config);
 
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
