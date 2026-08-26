@@ -88,6 +88,18 @@ midair-proto = { path = "../proto" }
 # Shared BLE position protocol and NMEA parsing.
 gps-proto = { path = "../../gps-proto" }
 
+# esp-radio is vendored so the BLE controller's modem sleep can be turned on.
+# Upstream hardcodes `sleep_mode`/`sleep_clock` to 0 in `create_ble_config`,
+# matching ESP-IDF's own defaults, which leaves the BT PHY powered between
+# advertising and connection events - the largest single load on this board.
+# The fork sets ESP-IDF's mode 1 / main-crystal pair instead, and re-exports
+# the `TxPower` enum so the +9 dBm default can be lowered.
+#
+# To go back to the published crate, delete this block. `vendor/esp-radio` is
+# an unmodified 0.17.0 apart from the two sites marked `LOCAL PATCH`.
+[patch.crates-io]
+esp-radio = { path = "vendor/esp-radio" }
+
 [profile.dev]
 # Rust debug is too slow.
 # For debug builds always builds with some optimization

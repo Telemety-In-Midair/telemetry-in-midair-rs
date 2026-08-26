@@ -437,21 +437,21 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(wio_s3_gps::usb::usb_task(usb_rx, usb_tx))
         .expect("spawn usb task");
 
-    // BLE. Same stack the C6 runs.
+    // BLE. Same stack the C6 runs, against a vendored esp-radio whose BLE
+    // controller has modem sleep turned on - the PHY powers down between
+    // advertising and connection events instead of staying up continuously.
     //
-    // `Default::default()` is not a preference here, it is the only thing
-    // that can be written. The config's transmit power defaults to +9 dBm -
-    // far more than a phone a few meters away needs, and the worst current
-    // spike to put beside a LoRa PA that can be keying 22 dBm at the same
-    // time, which is the conflict `state::radio_busy` exists to keep apart.
-    // It cannot be lowered from here: esp-radio 0.17 re-exports `Config` but
-    // not the `TxPower` enum its `with_default_tx_power` builder takes
-    // (`ble_os_adapter_chip_specific` is `pub(crate)`), so the setter is
-    // public and its argument is unnameable. Revisit when the crate exports
-    // the enum.
+    // TX power is 0 dBm rather than the +9 dBm default. Nine buys nothing
+    // here: the module's 2.4 GHz pin goes to a test point and stops, so
+    // range is whatever the stub couples either way, and a +9 dBm burst is
+    // the worst current spike to put beside a LoRa PA that can be keying
+    // 22 dBm at the same moment - the conflict `state::radio_busy` exists
+    // to keep apart.
+    let ble_config = esp_radio::ble::Config::default()
+        .with_default_tx_power(esp_radio::ble::TxPower::N0);
     let radio = esp_radio::init().expect("radio init");
     let transport =
-        esp_radio::ble::controller::BleConnector::new(&radio, peripherals.BT, Default::default())
+        esp_radio::ble::controller::BleConnector::new(&radio, peripherals.BT, ble_config)
             .expect("ble connector");
     let controller = ExternalController::<_, 20>::new(transport);
 
