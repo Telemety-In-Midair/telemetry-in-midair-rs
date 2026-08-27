@@ -42,6 +42,7 @@ macro_rules! vprintln {
 }
 
 pub mod compass;
+pub mod config;
 pub mod flash;
 pub mod gps;
 pub mod node;

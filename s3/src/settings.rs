@@ -22,7 +22,7 @@ use portable_atomic::{AtomicU32, Ordering};
 const MAGIC: u32 = 0x6D69_6461;
 
 // esp-hal's `Persistable` marker only covers atomics and primitives, hence
-// four statics rather than one struct.
+// a static per field rather than one struct.
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static MAGIC_WORD: AtomicU32 = AtomicU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
@@ -31,6 +31,8 @@ static INTERVAL: AtomicU32 = AtomicU32::new(0);
 static FLAGS: AtomicU32 = AtomicU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static ADV_WINDOW: AtomicU32 = AtomicU32::new(0);
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static BLE_OFF: AtomicU32 = AtomicU32::new(0);
 
 /// How many deep sleeps this board has woken from since its last cold
 /// boot, and the seconds it was last told to sleep for.
@@ -54,6 +56,7 @@ pub fn get() -> Stored {
             sleep_interval_s: INTERVAL.load(Ordering::Relaxed),
             flags: FLAGS.load(Ordering::Relaxed),
             adv_window_s: ADV_WINDOW.load(Ordering::Relaxed),
+            ble_off_s: BLE_OFF.load(Ordering::Relaxed),
         }
     } else {
         Stored::new()
@@ -64,6 +67,7 @@ pub fn set(s: Stored) {
     INTERVAL.store(s.sleep_interval_s, Ordering::Relaxed);
     FLAGS.store(s.flags, Ordering::Relaxed);
     ADV_WINDOW.store(s.adv_window_s, Ordering::Relaxed);
+    BLE_OFF.store(s.ble_off_s, Ordering::Relaxed);
     MAGIC_WORD.store(MAGIC, Ordering::Relaxed);
 }
 

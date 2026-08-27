@@ -53,6 +53,17 @@ pub mod usb {
     /// can say when to expect the port back) and then goes, which drops the
     /// USB device - the port vanishing is the command working.
     pub const SLEEP: u8 = 0x54;
+    /// Host -> board, `[id, len, value...]` - one settings write in the
+    /// same wire format the BLE config characteristic takes, run through
+    /// the same [`crate::session::apply`]. The board answers
+    /// [`super::resp::ACK`] (`[CFG, ack bytes...]`) carrying the gps-proto
+    /// ack the write produced, so a tool sees the clamped value the board
+    /// actually stored rather than the one it asked for.
+    ///
+    /// Generic on purpose. Every settings id is reachable from a bench with
+    /// nothing but a USB cable, which is what a power measurement needs -
+    /// the alternative is a phone for every knob.
+    pub const CFG: u8 = 0x55;
 }
 
 /// Responses (either direction, follow a command).

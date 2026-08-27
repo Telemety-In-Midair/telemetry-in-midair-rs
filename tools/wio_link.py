@@ -35,6 +35,7 @@ USB_BULK = 0x51
 USB_BULK_ACK = 0x52
 USB_INFO = 0x53
 USB_SLEEP = 0x54
+USB_CFG = 0x55
 
 OP_BEGIN = 0x01
 OP_DATA = 0x02
@@ -333,6 +334,30 @@ def sleep_now(ser: serial.Serial, secs: int, timeout: float = 2.0) -> int | None
     if len(payload) < 3 or payload[0] != USB_SLEEP:
         return None
     return int(struct.unpack("<H", payload[1:3])[0])
+
+
+def set_config(ser: serial.Serial, cfg_id: int, value: bytes,
+               timeout: float = 2.0):
+    """Write one settings id and return `(status, value_bytes)` from the ack.
+
+    The board clamps, so the returned value is what it stored rather than
+    what was asked for. Status 0 is OK; anything else is a rejection and the
+    setting did not change. `None` means the board never acked.
+
+    Same wire format and the same handler as a BLE config write, so this is
+    not a bench-only side door - it is the same operation the app performs.
+    """
+    ser.reset_input_buffer()
+    ser.write(build_frame(USB_CFG, bytes([cfg_id, len(value)]) + value))
+    ser.flush()
+    frame, _ = read_frame(ser, {RESP_ACK}, timeout)
+    if frame is None:
+        return None
+    payload = frame[1]
+    # [USB_CFG, ack id, ack status, ack value...]
+    if len(payload) < 4 or payload[0] != USB_CFG:
+        return None
+    return payload[2], bytes(payload[3:])
 
 
 def send_bulk(ser: serial.Serial, kind: int, data: bytes, version: int = 0,

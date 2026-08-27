@@ -105,14 +105,14 @@ pub const RADIO_CONFIG_UUID: &str = "c3a1000a-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 pub const RADIO_CONFIG_UUID_U128: u128 = 0xc3a1000a_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 
 /// Wire length of [`Settings`].
-pub const SETTINGS_LEN: usize = 16;
+pub const SETTINGS_LEN: usize = 20;
 /// Layout version in byte 0, so an app meeting a newer firmware can
 /// reject the blob rather than misread it.
 ///
 /// Version 2 dropped the separate stow interval: one wake-check interval
 /// now covers every sleep the board does. Version 3 appended the
-/// advertising window.
-pub const SETTINGS_VERSION: u8 = 3;
+/// advertising window, version 4 the BLE off period.
+pub const SETTINGS_VERSION: u8 = 4;
 
 pub const SFLAG_PWR_EN: u8 = 1 << 0;
 pub const SFLAG_WIO_SLEEP: u8 = 1 << 1;
@@ -134,6 +134,9 @@ pub struct Settings {
     /// Advertising window per wake check ([`CFG_ESP_ADV_WINDOW_S`]). Always
     /// the effective value, never 0.
     pub adv_window_s: u32,
+    /// Seconds the BLE controller stays powered down between advertising
+    /// windows ([`CFG_BLE_OFF_S`]), 0 = never take it down.
+    pub ble_off_s: u32,
 }
 
 impl Settings {
@@ -155,6 +158,7 @@ impl Settings {
         b[4..8].copy_from_slice(&self.sleep_interval_s.to_le_bytes());
         b[8..12].copy_from_slice(&self.notify_interval_ms.to_le_bytes());
         b[12..16].copy_from_slice(&self.adv_window_s.to_le_bytes());
+        b[16..20].copy_from_slice(&self.ble_off_s.to_le_bytes());
         b
     }
 
@@ -172,6 +176,7 @@ impl Settings {
             sleep_interval_s: word(4),
             notify_interval_ms: word(8),
             adv_window_s: word(12),
+            ble_off_s: word(16),
         })
     }
 }
@@ -233,6 +238,35 @@ pub const CFG_ESP_ADV_WINDOW_S: u8 = 0x14;
 pub const ESP_ADV_MIN_S: u32 = 1;
 pub const ESP_ADV_MAX_S: u32 = 60;
 pub const ESP_ADV_DEFAULT_S: u32 = 15;
+
+/// `u32` seconds: how long the BLE controller stays powered down between
+/// advertising windows. 0 disables it, which is the default and the old
+/// behavior - a board that is not deep-sleeping advertises continuously.
+///
+/// This is the awake-state counterpart to [`CFG_ESP_SLEEP_S`], and on the
+/// Wio-S3 it is the largest lever the firmware has. BLE measures **71 mA of
+/// the board's 126**, and it cannot be reduced while the controller exists:
+/// esp-radio does not implement the controller's modem sleep, so the PHY
+/// stays up for as long as `BleConnector` is alive. Dropping the connector
+/// calls `ble_deinit` and takes the PHY with it, which is what this
+/// schedules.
+///
+/// Unlike deep sleep it costs no reset and stops nothing else: the LoRa
+/// beacon keeps transmitting, the GPS keeps tracking and the card keeps
+/// logging. What it costs is reachability - a board inside its off period
+/// cannot be connected to, exactly as a sleeping one cannot, so the ceiling
+/// is set the same way and for the same reason.
+pub const CFG_BLE_OFF_S: u8 = 0x16;
+
+/// Clamp range for [`CFG_BLE_OFF_S`], plus 0 to disable.
+///
+/// The ceiling is five minutes for the reason [`ESP_SLEEP_MAX_S`] is: it is
+/// the worst case for how long the board is unreachable, and past a few
+/// minutes that stops being a wait and starts being a lockout. The floor
+/// keeps an off period long enough to be worth the controller teardown and
+/// re-init, which is not free.
+pub const BLE_OFF_MIN_S: u32 = 5;
+pub const BLE_OFF_MAX_S: u32 = 5 * 60;
 
 /// `u32` seconds: sleep *now*, for this long, and then come back.
 ///
@@ -372,6 +406,7 @@ mod tests {
             sleep_interval_s: 300,
             notify_interval_ms: 1000,
             adv_window_s: 15,
+            ble_off_s: 60,
         };
         let bytes = s.encode();
         assert_eq!(bytes.len(), super::SETTINGS_LEN);

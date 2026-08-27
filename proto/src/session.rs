@@ -48,6 +48,16 @@ pub struct Stored {
     /// Advertising window per wake check, 0 = never configured. Read it
     /// through [`Stored::adv_window`], which substitutes the default.
     pub adv_window_s: u32,
+    /// How long the BLE controller stays powered down between advertising
+    /// windows, 0 = never take it down.
+    ///
+    /// This is the awake-state counterpart to `sleep_interval_s`. Deep
+    /// sleep takes the whole chip away and costs a full reset; this takes
+    /// only the BLE modem away, which is 71 mA of the board's 126, and
+    /// leaves the LoRa beacon and the GPS running. A board doing this is
+    /// still a working tracker and is still logging - it just cannot be
+    /// connected to until the next window.
+    pub ble_off_s: u32,
 }
 
 impl Stored {
@@ -56,6 +66,7 @@ impl Stored {
             sleep_interval_s: 0,
             flags: 0,
             adv_window_s: 0,
+            ble_off_s: 0,
         }
     }
 
@@ -116,6 +127,7 @@ impl Stored {
             sleep_interval_s: self.sleep_interval_s,
             notify_interval_ms,
             adv_window_s: self.adv_window(),
+            ble_off_s: self.ble_off_s,
         }
     }
 
@@ -128,8 +140,9 @@ impl Stored {
         rec[8..12].copy_from_slice(&self.sleep_interval_s.to_le_bytes());
         rec[12..16].copy_from_slice(&self.flags.to_le_bytes());
         rec[16..20].copy_from_slice(&self.adv_window_s.to_le_bytes());
-        let crc = link::crc32(&rec[0..20]);
-        rec[20..24].copy_from_slice(&crc.to_le_bytes());
+        rec[20..24].copy_from_slice(&self.ble_off_s.to_le_bytes());
+        let crc = link::crc32(&rec[0..RECORD_LEN - 4]);
+        rec[RECORD_LEN - 4..RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
         rec
     }
 
@@ -145,12 +158,15 @@ impl Stored {
         if word(0) != RECORD_MAGIC {
             return None;
         }
-        // A version 2 record stops one word short and carries no window,
-        // which reads back as the default. Its trailing bytes are erased
-        // flash, so the crc has to be checked where that version put it.
-        let (crc_at, adv_window_s) = match word(4) {
-            2 => (V2_CRC_AT, 0),
-            RECORD_VERSION => (RECORD_LEN - 4, word(RECORD_LEN - 8)),
+        // Every older version stops short and carries zeros for the fields
+        // it predates, which read back as "never configured" and resolve to
+        // defaults. Their trailing bytes are erased flash, so the crc has to
+        // be checked where each version put it rather than where this one
+        // does.
+        let (crc_at, adv_window_s, ble_off_s) = match word(4) {
+            2 => (V2_CRC_AT, 0, 0),
+            3 => (V3_CRC_AT, word(16), 0),
+            RECORD_VERSION => (RECORD_LEN - 4, word(16), word(20)),
             _ => return None,
         };
         if word(crc_at) != link::crc32(&rec[0..crc_at]) {
@@ -160,6 +176,7 @@ impl Stored {
             sleep_interval_s: word(8),
             flags: word(12),
             adv_window_s,
+            ble_off_s,
         })
     }
 }
@@ -171,18 +188,21 @@ pub const RECORD_MAGIC: u32 = 0x6D69_6441;
 ///
 /// Version 2 dropped a separate stow interval; a version 1 record is
 /// discarded rather than misread. Version 3 appended the advertising
-/// window, which is a pure append, so a version 2 record still reads - a
-/// board updated in the field keeps the cadence it was left on instead of
-/// coming back advertising continuously.
-pub const RECORD_VERSION: u32 = 3;
+/// window and version 4 the BLE off period. Both are pure appends, so an
+/// older record still reads - a board updated in the field keeps the
+/// cadence it was left on instead of coming back advertising continuously.
+pub const RECORD_VERSION: u32 = 4;
 
-/// magic, version, sleep interval, flags, advertising window, crc32 - all
-/// `u32`, so the length is already a multiple of the flash write word.
-pub const RECORD_LEN: usize = 24;
+/// magic, version, sleep interval, flags, advertising window, BLE off
+/// period, crc32 - all `u32`, so the length is already a multiple of the
+/// flash write word.
+pub const RECORD_LEN: usize = 28;
 
 /// Where the crc sits in a version 2 record, which is this layout minus its
-/// last word.
+/// last three words.
 const V2_CRC_AT: usize = 16;
+/// Where the crc sits in a version 3 record - this layout minus one word.
+const V3_CRC_AT: usize = 20;
 
 // ---------------------------------------------------------------------------
 // Config characteristic writes
@@ -208,6 +228,11 @@ pub enum Action {
     /// The advertising window per wake check is now this many seconds.
     /// Takes effect on the next wake, not the window already running.
     AdvWindow(u32),
+    /// The BLE controller now stays down for this many seconds between
+    /// advertising windows (0 = never take it down). Takes effect at the
+    /// end of the window already running, not immediately - a central that
+    /// just set it keeps its connection.
+    BleOff(u32),
     /// Deep sleep now, for this many seconds, then resume as configured.
     ///
     /// Unlike every other variant here this is a command rather than a
@@ -338,6 +363,28 @@ pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
                 stored.adv_window_s = secs;
                 return Outcome::new(
                     Action::AdvWindow(secs),
+                    true,
+                    id,
+                    packet::ACK_OK,
+                    &secs.to_le_bytes(),
+                );
+            }
+            ble::CFG_BLE_OFF_S => {
+                let Ok(bytes) = <[u8; 4]>::try_from(value) else {
+                    return Outcome::reject(id, packet::ACK_BAD_VALUE);
+                };
+                // 0 means off, like the sleep interval and unlike the
+                // advertising window: a board that never takes BLE down is
+                // the old behavior and has to stay reachable as one.
+                let asked = u32::from_le_bytes(bytes);
+                let secs = if asked == 0 {
+                    0
+                } else {
+                    asked.clamp(ble::BLE_OFF_MIN_S, ble::BLE_OFF_MAX_S)
+                };
+                stored.ble_off_s = secs;
+                return Outcome::new(
+                    Action::BleOff(secs),
                     true,
                     id,
                     packet::ACK_OK,
@@ -520,6 +567,7 @@ mod tests {
                 sleep_interval_s: 0,
                 notify_interval_ms: packet::UPDATE_INTERVAL_DEFAULT_MS,
                 adv_window_s: ble::ESP_ADV_DEFAULT_S,
+                ble_off_s: 0,
             }
         );
     }
@@ -699,6 +747,25 @@ mod tests {
 
     /// A malformed value changes nothing. Silently applying part of it
     /// would leave the board on a cadence the app never asked for.
+    /// 0 is off rather than a floor, because a board that never takes BLE
+    /// down is the reachable default and has to stay expressible.
+    #[test]
+    fn the_ble_off_period_clamps_but_keeps_zero() {
+        let mut s = Stored::new();
+        assert_eq!(s.ble_off_s, 0);
+        for (asked, applied) in [
+            (0u32, 0u32),
+            (1, ble::BLE_OFF_MIN_S),
+            (30, 30),
+            (99_999, ble::BLE_OFF_MAX_S),
+        ] {
+            let o = apply(&mut s, &u32_write(ble::CFG_BLE_OFF_S, asked));
+            assert_eq!(o.action, Action::BleOff(applied), "asked {}", asked);
+            assert_eq!(s.ble_off_s, applied, "asked {}", asked);
+            assert!(o.save);
+        }
+    }
+
     #[test]
     fn a_malformed_value_is_rejected_and_changes_nothing() {
         let mut s = Stored::new();
@@ -773,6 +840,7 @@ mod tests {
             sleep_interval_s: 300,
             flags: PFLAG_PWR_OFF | PFLAG_GPS_SLEEP,
             adv_window_s: 45,
+            ble_off_s: 90,
         };
         let rec = s.encode_record();
         assert_eq!(rec.len(), RECORD_LEN);
@@ -797,6 +865,32 @@ mod tests {
         // No window in that layout, so the default applies.
         assert_eq!(s.adv_window_s, 0);
         assert_eq!(s.adv_window(), ble::ESP_ADV_DEFAULT_S);
+        // Nor a BLE off period, which means the old behavior: never take
+        // the controller down.
+        assert_eq!(s.ble_off_s, 0);
+    }
+
+    /// The version this firmware replaced. A board updated in the field
+    /// keeps the cadence and window it was left on rather than coming back
+    /// unconfigured and advertising continuously.
+    #[test]
+    fn a_version_3_record_still_reads() {
+        let mut rec = [0xFFu8; RECORD_LEN]; // erased flash past the record
+        rec[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+        rec[4..8].copy_from_slice(&3u32.to_le_bytes());
+        rec[8..12].copy_from_slice(&120u32.to_le_bytes());
+        rec[12..16].copy_from_slice(&PFLAG_WIO_SLEEP.to_le_bytes());
+        rec[16..20].copy_from_slice(&45u32.to_le_bytes());
+        let crc = link::crc32(&rec[0..V3_CRC_AT]);
+        rec[V3_CRC_AT..V3_CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
+
+        let s = Stored::decode_record(&rec).expect("a version 3 record still reads");
+        assert_eq!(s.sleep_interval_s, 120);
+        assert!(s.wio_sleep());
+        assert_eq!(s.adv_window_s, 45);
+        // The field that version predates reads as disabled, so an updated
+        // board does not start going dark on its own.
+        assert_eq!(s.ble_off_s, 0);
     }
 
     /// Anything that is not this firmware's record leaves the board
@@ -807,6 +901,7 @@ mod tests {
             sleep_interval_s: 60,
             flags: 0,
             adv_window_s: 15,
+            ble_off_s: 0,
         }
         .encode_record();
 

@@ -123,6 +123,17 @@ pub async fn usb_task(
                     send_frame(&mut tx, out.as_bytes()).await;
                     state::request_sleep_now(secs);
                 }
+                link::usb::CFG => {
+                    // The same path a BLE config write takes, so a setting
+                    // pushed over USB is stored, persisted and acted on
+                    // exactly as one pushed from the app.
+                    let (ack, alen) = crate::config::apply_config(&payload[..len]).await;
+                    let mut reply = [0u8; 1 + gps_proto::packet::ACK_MAX_LEN];
+                    reply[0] = link::usb::CFG;
+                    reply[1..1 + alen].copy_from_slice(&ack[..alen]);
+                    out.build(link::resp::ACK, &reply[..1 + alen]);
+                    send_frame(&mut tx, out.as_bytes()).await;
+                }
                 link::usb::BULK => {
                     let (ack, alen) =
                         xfer::handle(Owner::Usb, Instant::now().as_millis(), &payload[..len]).await;

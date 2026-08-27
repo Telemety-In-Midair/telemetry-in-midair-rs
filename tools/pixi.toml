@@ -31,6 +31,15 @@ wio-ota = "python wio_ota.py"
 #   pixi run wio-info
 wio-info = "python wio_info.py"
 
+# Write one board setting over USB, the same path a BLE config write takes:
+#   pixi run wio-set ble-off 30      # BLE modem down 30 s between windows
+#   pixi run wio-set ble-off 0       # never take it down (the default)
+#   pixi run wio-set adv-window 10
+# The board clamps and the ack says what it stored, so the printed value is
+# what the board is running. `ble-off` is the power one - BLE is 71 mA of
+# this board's 126 and the only lever on it is the controller's lifetime.
+wio-set = "python wio_set.py"
+
 # Put the board into deep sleep now, rather than waiting out an advertising
 # window with nothing connected - which is otherwise the only way in:
 #   pixi run wio-sleep

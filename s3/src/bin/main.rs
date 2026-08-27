@@ -465,49 +465,7 @@ async fn main(spawner: Spawner) -> ! {
     // power investigation has never had.
     #[cfg(not(feature = "iso-no-ble"))]
     {
-    // BLE. Same stack the C6 runs, and it is measured at 71 mA on this
-    // board - the single largest load, more than twice the ~31 mA the
-    // module datasheet quotes for advertising. The controller holds its PHY
-    // up for as long as it exists, and nothing in esp-radio 0.17 can make
-    // it stop; the only lever is the connector's own lifetime, because
-    // `BleConnector::drop` calls `ble_deinit` and takes the PHY guard with
-    // it.
-    //
-    // TX power is 0 dBm rather than the +9 dBm default. Nine buys nothing
-    // here: the module's 2.4 GHz pin goes to a test point and stops, so
-    // range is whatever the stub couples either way, and a +9 dBm burst is
-    // the worst current spike to put beside a LoRa PA that can be keying
-    // 22 dBm at the same moment - the conflict `state::radio_busy` exists
-    // to keep apart.
-    let ble_config = esp_radio::ble::Config::default()
-        .with_default_tx_power(esp_radio::ble::TxPower::N0);
-    let radio = esp_radio::init().expect("radio init");
-    let transport =
-        esp_radio::ble::controller::BleConnector::new(&radio, peripherals.BT, ble_config)
-            .expect("ble connector");
-    let controller = ExternalController::<_, 20>::new(transport);
-
     println!("BLE-ADDR {}", fmt_ble_address(&addr_bytes));
-
-    let mut resources: HostResources<DefaultPacketPool, CONNECTIONS_MAX, L2CAP_CHANNELS_MAX> =
-        HostResources::new();
-    let stack = trouble_host::new(controller, &mut resources)
-        .set_random_address(Address::random(addr_bytes));
-    let Host {
-        mut peripheral,
-        mut runner,
-        ..
-    } = stack.build();
-
-    let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
-        name: ble::DEVICE_NAME,
-        appearance: &appearance::sensor::GENERIC_SENSOR,
-    }))
-    .expect("gatt server");
-
-    // Seed the readable value so a central that reads immediately after
-    // discovery cannot beat the first publish in `gatt_session`.
-    let _ = server.gps.settings.set(&server, &current_settings().encode());
 
     let mut rtc = Rtc::new(peripherals.LPWR);
     if woke_from_sleep {
@@ -522,27 +480,121 @@ async fn main(spawner: Spawner) -> ! {
         status_println!("cold boot (not a deep-sleep wake)");
     }
 
-    let _ = select(
-        async {
-            loop {
-                if runner.run().await.is_err() {
-                    qprintln!("ble host error, restarting");
-                    Timer::after(Duration::from_millis(200)).await;
-                }
-            }
-        },
-        serve(&mut peripheral, &server, &mut rtc),
-    )
-    .await;
+    // The BLE duty cycle.
+    //
+    // BLE measures 71 mA of this board's 126, and it cannot be reduced
+    // while the controller exists: esp-radio does not implement the
+    // controller's modem sleep, so the PHY stays up for as long as
+    // `BleConnector` is alive. What *does* work is its `Drop`, which calls
+    // `ble_deinit` and takes the `PhyInitGuard` with it - so the whole
+    // stack is built inside this loop and dropped at the bottom of it.
+    //
+    // `serve` returns rather than advertising forever once the window is
+    // spent and `ble_off_s` is set; with it at 0 it never returns and this
+    // is the single pass the firmware always did.
+    //
+    // Unlike deep sleep this stops nothing else. The hardware task keeps
+    // beaconing, the GPS keeps tracking and the card keeps logging - the
+    // board stays a working tracker and only stops being connectable.
+    loop {
+        {
+            // TX power is 0 dBm rather than the +9 dBm default. Nine buys
+            // nothing here: the module's 2.4 GHz pin goes to a test point
+            // and stops, so range is whatever the stub couples either way,
+            // and a +9 dBm burst is the worst current spike to put beside a
+            // LoRa PA that can be keying 22 dBm at the same moment - the
+            // conflict `state::radio_busy` exists to keep apart.
+            let ble_config = esp_radio::ble::Config::default()
+                .with_default_tx_power(esp_radio::ble::TxPower::N0);
+
+            // SAFETY: the previous iteration's `BleConnector` was dropped at
+            // the closing brace below, and nothing outside this block ever
+            // holds `BT`. The first pass steals a peripheral that `main`
+            // still owns and has never used, which is the same trade the
+            // J5 probe makes.
+            let bt = unsafe { esp_hal::peripherals::BT::steal() };
+
+            // Declared before the stack so it outlives it: dropping the
+            // connector needs the radio still initialized, and locals drop
+            // in reverse declaration order.
+            let radio = esp_radio::init().expect("radio init");
+            let transport =
+                esp_radio::ble::controller::BleConnector::new(&radio, bt, ble_config)
+                    .expect("ble connector");
+            let controller = ExternalController::<_, 20>::new(transport);
+
+            let mut resources: HostResources<
+                DefaultPacketPool,
+                CONNECTIONS_MAX,
+                L2CAP_CHANNELS_MAX,
+            > = HostResources::new();
+            let stack = trouble_host::new(controller, &mut resources)
+                .set_random_address(Address::random(addr_bytes));
+            let Host {
+                mut peripheral,
+                mut runner,
+                ..
+            } = stack.build();
+
+            let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
+                name: ble::DEVICE_NAME,
+                appearance: &appearance::sensor::GENERIC_SENSOR,
+            }))
+            .expect("gatt server");
+
+            // Seed the readable value so a central that reads immediately
+            // after discovery cannot beat the first publish in
+            // `gatt_session`.
+            let _ = server.gps.settings.set(&server, &current_settings().encode());
+
+            let _ = select(
+                async {
+                    loop {
+                        if runner.run().await.is_err() {
+                            qprintln!("ble host error, restarting");
+                            Timer::after(Duration::from_millis(200)).await;
+                        }
+                    }
+                },
+                serve(&mut peripheral, &server, &mut rtc),
+            )
+            .await;
+        }
+
+        // Everything above is dropped by here, `ble_deinit` included.
+        let off_s = settings::get().ble_off_s;
+        if off_s == 0 {
+            // `serve` only returns when the period is set, so this is a
+            // setting cleared mid-window. Go straight back to advertising
+            // rather than spinning on a zero-length wait.
+            continue;
+        }
+        status_println!("ble down for {} s (lora and gps stay up)", off_s);
+        // A board told to sleep over the USB console must not have to wait
+        // out the whole dark period first - the console is alive throughout,
+        // and it is the only way in while the radio is down.
+        let commanded = async { state::SLEEP_NOW_SIGNAL.wait().await };
+        if let Either::Second(()) =
+            select(Timer::after(Duration::from_secs(off_s as u64)), commanded).await
+        {
+            let secs = state::take_sleep_now()
+                .unwrap_or_else(|| ble::resolve_sleep_now(0, settings::get().sleep_interval_s));
+            status_println!("sleep on command: {} s, from a BLE-down period", secs);
+            enter_deep_sleep(&mut rtc, secs).await;
+        }
+        qprintln!("ble back up");
+    }
     }
 
-    // Neither side of that select ever finishes, so this is reached only by
-    // an `iso-no-ble` build, which has nothing left to do but hold the rail
-    // up and answer the console.
+    // The duty-cycle loop above never exits, so this is an `iso-no-ble`
+    // build with nothing left to do but hold the rail up and answer the
+    // console.
     #[cfg(feature = "iso-no-ble")]
-    status_println!("iso-no-ble: BLE stack not started");
-    loop {
-        Timer::after(Duration::from_secs(1)).await;
+    {
+        status_println!("iso-no-ble: BLE stack not started");
+        loop {
+            Timer::after(Duration::from_secs(1)).await;
+        }
     }
 }
 
@@ -679,10 +731,16 @@ async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
 
 /// Advertise, accept one central, serve it, repeat.
 ///
-/// With sleep mode active, a bounded advertising window ends in deep sleep
-/// instead of advertising forever. The budget is a deadline rather than a
-/// per-attempt timeout, so no retry path below can extend it - see
-/// [`session::Window`].
+/// A spent window ends one of three ways, in this order of precedence:
+///
+/// - **Deep sleep**, if `sleep_interval_s` is set. Does not return.
+/// - **Returning**, if `ble_off_s` is set instead. The caller drops the BLE
+///   stack, which powers the modem down, waits, and calls this again.
+/// - **Advertising on**, if neither is set. Does not return, and is what an
+///   unconfigured board does - reachable forever, at 126 mA.
+///
+/// The budget is a deadline rather than a per-attempt timeout, so no retry
+/// path below can extend it - see [`session::Window`].
 async fn serve<C: Controller>(
     peripheral: &mut Peripheral<'_, C, DefaultPacketPool>,
     server: &Server<'_>,
@@ -707,12 +765,20 @@ async fn serve<C: Controller>(
     let mut window = session::Window::new(Instant::now().as_millis(), settings::get().adv_window());
 
     loop {
-        let sleep_interval = settings::get().sleep_interval_s;
+        let stored = settings::get();
+        let sleep_interval = stored.sleep_interval_s;
+        let ble_off = stored.ble_off_s;
         // Budget spent, whatever used it up.
         if let session::Next::Sleep { interval_s } =
             window.next(Instant::now().as_millis(), sleep_interval)
         {
             enter_deep_sleep(rtc, interval_s).await;
+        }
+        // Same deadline, cheaper exit: with deep sleep off but the BLE duty
+        // cycle on, hand control back so the caller can drop the stack. The
+        // board stays awake and on the air over LoRa; only the modem goes.
+        if ble_off > 0 && window.remaining_ms(Instant::now().as_millis()) == 0 {
+            return;
         }
         qprintln!("advertising as {}", ble::DEVICE_NAME);
         let advertiser = match peripheral
@@ -743,14 +809,15 @@ async fn serve<C: Controller>(
                 state::SLEEP_NOW_SIGNAL.wait().await;
             };
             let accept = async {
-                if sleep_interval > 0 {
+                // Bounded whenever the window means anything - either
+                // ending sends the board somewhere. Unbounded only for a
+                // board configured to advertise forever, where waiting on
+                // `accept` with no deadline is the whole intent.
+                if sleep_interval > 0 || ble_off > 0 {
                     let left =
                         Duration::from_millis(window.remaining_ms(Instant::now().as_millis()));
-                    match with_timeout(left, advertiser.accept()).await {
-                        Ok(r) => Some(r),
-                        // Window expired with nobody interested.
-                        Err(_) => None,
-                    }
+                    // `None` is the window expiring with nobody interested.
+                    with_timeout(left, advertiser.accept()).await.ok()
                 } else {
                     Some(advertiser.accept().await)
                 }
@@ -768,9 +835,17 @@ async fn serve<C: Controller>(
                 Timer::after(Duration::from_millis(200)).await;
                 continue;
             }
-            // The advertising budget ran out. Only reachable with sleep mode
-            // on, since the branch above only bounds the wait when it is.
-            Either::First(None) => enter_deep_sleep(rtc, sleep_interval).await,
+            // The advertising budget ran out with nobody interested. Deep
+            // sleep first if it is configured, because it saves more; the
+            // duty cycle is what a board that must stay on the air does
+            // instead.
+            Either::First(None) => {
+                if sleep_interval > 0 {
+                    enter_deep_sleep(rtc, sleep_interval).await
+                }
+                qprintln!("advertising window over");
+                return;
+            }
             // Told to sleep while advertising to nobody.
             Either::Second(()) => {
                 // The cell is always set before the signal is raised, so the
@@ -896,7 +971,7 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
                     }
                     match wrote {
                         Wrote::Config => {
-                            let (ack, _) = apply_config(&data[..len]).await;
+                            let (ack, _) = wio_s3_gps::config::apply_config(&data[..len]).await;
                             let _ = server.gps.ack.notify(conn, &ack).await;
                             // The write may have changed something the
                             // settings characteristic reports, including
@@ -1021,52 +1096,6 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
     .await;
 }
 
-/// Apply a config-characteristic write.
-///
-/// The decision - what is legal, what it clamps to, what the ack says - is
-/// [`session::apply`], the same host-tested policy the C6 runs. What
-/// changed is the far side: an action that used to be a link frame and a
-/// wait for the WIO's answer is now a signal to the hardware loop, so the
-/// ack the policy built always holds.
-async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
-    let mut stored = settings::get();
-    let outcome = session::apply(&mut stored, data);
-    settings::set(stored);
-    if outcome.save {
-        settings::save().await;
-    }
-    match outcome.action {
-        session::Action::GpsSleep(on) => state::request(Request::GpsSleep(on)),
-        // No second MCU to put to sleep; the nearest thing is parking the
-        // radio, which is what the WIO's soft sleep actually bought.
-        session::Action::WioSleep(on) => state::request(Request::RadioStandby(on)),
-        // No host-controlled rail on this board - the GPS and SD sit
-        // directly on +3V3. See BOARD-REVIEW.md in the board repo.
-        session::Action::Rail(_) => qprintln!("config: rail control has no hardware here"),
-        session::Action::NotifyInterval(ms) => {
-            state::set_notify_interval_ms(ms);
-            qprintln!("config: notify interval set to {} ms", ms);
-        }
-        session::Action::SleepInterval(secs) => {
-            qprintln!("config: sleep interval {} s", secs);
-        }
-        // Handed to the serve loop rather than acted on here: this function
-        // runs inside the GATT session, and the ack it is building has not
-        // been sent yet. The loop that owns the `Rtc` sleeps once the
-        // session has finished paying out what it owes the central.
-        session::Action::SleepNow(secs) => {
-            status_println!("config: sleep now for {} s", secs);
-            state::request_sleep_now(secs);
-        }
-        session::Action::AdvWindow(secs) => {
-            qprintln!("config: advertising window {} s", secs);
-        }
-        session::Action::None => {
-            qprintln!("config: rejected write (status {})", outcome.ack[1]);
-        }
-    }
-    (outcome.ack, outcome.ack_len)
-}
 
 // ---------------------------------------------------------------------------
 // Hardware
