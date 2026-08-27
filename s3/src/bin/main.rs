@@ -1422,7 +1422,7 @@ async fn hardware_task(
                 Ok(()) => {
                     tx_count = tx_count.saturating_add(1);
                     vprintln!(
-                        "beacon {} ({} bytes on air)",
+                        "beacon {} ({} ms on air)",
                         if payload_is_fix { "position" } else { "ping" },
                         cfg.beacon_airtime_us() / 1000
                     );

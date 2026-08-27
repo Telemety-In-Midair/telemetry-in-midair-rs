@@ -603,10 +603,33 @@ cargo run --release --features iso-no-ble,iso-no-app
 
 | Build | What runs | Reading |
 |-|-|-|
-| baseline | everything | 126 mA |
+| baseline | everything | **126 mA** |
 | `iso-no-ble` | app only - no `esp_radio::init`, no PHY, no controller | |
 | `iso-no-app` | BLE only - no LoRa driver, GPS UART, card or panel | |
-| both | bare chip, USB console only | |
+| both | bare chip, USB console only | **49 mA** |
+
+**BLE plus the application is 77 mA**, and that is the number the whole
+investigation was circling. The floor underneath it is 49 mA, of which the
+free-running MAX-M10 is most - the S3 itself is only around 12 mA once the
+receiver, the idle SX1262, the USB PHY and leakage are taken out.
+
+The two middle rows split the 77, and the split is the answer:
+
+- **If `iso-no-app` lands near 80 mA**, BLE is costing about 31 mA - the
+  module datasheet figure - and roughly 46 mA is going into a 100 Hz poll
+  loop, which would be absurd and would mean something in the application
+  is pathological.
+- **If it lands near 116 mA**, BLE is costing about 67 mA, the controller
+  is sitting in RF-working, and **the vendored modem sleep is not working**
+  - the silent failure this document has warned about twice.
+
+The second is much more likely, and it would make duty-cycling
+`BleConnector` the only remaining lever rather than one of two.
+
+Note that ~5 mA of the 77 is not BLE or the loop: the isolation build never
+initializes the SX1262, so it sits in its power-on STDBY_RC instead of the
+continuous RX the real firmware puts it in. A fitted J5 panel is worth up
+to 15 mA more on the same basis.
 
 What each subtraction means:
 
@@ -631,6 +654,41 @@ established - plan on a power cycle.
 
 An isolation build is missing a subsystem on purpose. Do not flash one and
 leave it on a board.
+
+### What the console retired
+
+A run of the real firmware, 95 minutes in:
+
+```
+t=5684s radio rx err 0000 rx 0 tx 189 | gps 6807 nmea fix 0 sats 0 | sd absent | nodes 0
+beacon ping (288 ms on air)
+```
+
+- **`radio rx err 0000`** - the SX1262 is in receive with no device errors.
+  The stuck-PA theory, which would have explained everything at 127 mA, is
+  dead. Work-order item 2 is closed.
+- **Transmit duty cycle is not a factor.** 189 beacons in 5684 s is one per
+  30 s, and each is 288 ms of air. That is 1% of 127 mA, so **~1.3 mA**
+  averaged. Beaconing is not where the current goes.
+- **`sd absent`** - no card in any of these readings, so the 1-10 mA card
+  line is out of the budget entirely.
+- **`gps 6807 nmea` is a sentence count, not a byte count** (it is
+  `rx_sentences()`). 392 sentences in 340 s is 1.15 per second, which is
+  exactly right for a 1 Hz nav rate with the extra sentences silenced. The
+  receiver is healthy and talking.
+
+One thing the console does *not* say is good: **`fix 0 sats 0` after 95
+minutes.** Not one satellite. With a wire soldered to the SMA that is
+believable, but it means the MAX-M10 has been in continuous acquisition the
+whole time, which is its highest-current state - and it is a functional
+problem before it is a power one. Get a fix before taking the final
+numbers, or the GPS line is being measured in its worst case.
+
+That also sharpens an old discrepancy. On the two-MCU board the GPS, the
+LoRa radio **and** an STM32WL together measured 20 mA. Here the GPS alone
+looks like most of a 49 mA floor. Either the old figure was taken with the
+receiver in a state this one has never reached, or this board's GPS is
+drawing considerably more. `--features iso-gps-backup` is what settles it.
 
 ### What the two landed commits actually bought
 
