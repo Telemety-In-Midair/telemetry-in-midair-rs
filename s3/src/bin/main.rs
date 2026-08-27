@@ -465,9 +465,13 @@ async fn main(spawner: Spawner) -> ! {
     // power investigation has never had.
     #[cfg(not(feature = "iso-no-ble"))]
     {
-    // BLE. Same stack the C6 runs, against a vendored esp-radio whose BLE
-    // controller has modem sleep turned on - the PHY powers down between
-    // advertising and connection events instead of staying up continuously.
+    // BLE. Same stack the C6 runs, and it is measured at 71 mA on this
+    // board - the single largest load, more than twice the ~31 mA the
+    // module datasheet quotes for advertising. The controller holds its PHY
+    // up for as long as it exists, and nothing in esp-radio 0.17 can make
+    // it stop; the only lever is the connector's own lifetime, because
+    // `BleConnector::drop` calls `ble_deinit` and takes the PHY guard with
+    // it.
     //
     // TX power is 0 dBm rather than the +9 dBm default. Nine buys nothing
     // here: the module's 2.4 GHz pin goes to a test point and stops, so

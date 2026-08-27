@@ -549,19 +549,25 @@ pub(crate) fn create_ble_config(config: &Config) -> esp_bt_controller_config_t {
         bluetooth_mode: esp_bt_mode_t_ESP_BT_MODE_BLE as _,
 
         ble_max_act: config.max_connections,
-        // LOCAL PATCH (upstream ships 0 for both).
+        // Back to upstream's zeros, and they have to stay that way.
         //
-        // These are ESP-IDF's ESP_BT_SLEEP_MODE_1 and
-        // ESP_BT_SLEEP_CLOCK_MAIN_XTAL from esp_bt.h. In mode 1 the
-        // controller powers its PHY down between BLE events and keeps its
-        // reference clock on the SoC main crystal, which is what the
-        // BT_CTRL_MODEM_SLEEP / BT_CTRL_LPCLK_SEL_MAIN_XTAL pair selects in
-        // menuconfig. Both default off in ESP-IDF too, so upstream's 0 is
-        // not a bug - this fork just makes the other choice.
+        // Setting these to ESP_BT_SLEEP_MODE_1 / ESP_BT_SLEEP_CLOCK_MAIN_XTAL
+        // was tried and measured: no change in current at all. The config
+        // field is not what enables modem sleep. ESP-IDF also calls
+        // btdm_lpclk_select_src, btdm_controller_set_sleep_mode and, after
+        // btdm_controller_enable, btdm_controller_enable_sleep(true). None
+        // of those exist here.
         //
-        // Reverting is these two literals and nothing else.
-        sleep_mode: 1,
-        sleep_clock: 1,
+        // More to the point, the controller could not sleep even if it were
+        // told to: every callback it would use for that is a `todo!()` in
+        // btdm.rs - btdm_sleep_check_duration, btdm_sleep_enter_phase1 and
+        // _phase2, btdm_sleep_exit_phase1 through _phase3, and
+        // btdm_lpcycles_2_hus. Only btdm_hus_2_lpcycles is written. Modem
+        // sleep is unimplemented in this crate, not merely unconfigured, and
+        // a controller that did try to enter it would panic rather than save
+        // anything.
+        sleep_mode: 0,
+        sleep_clock: 0,
         ble_st_acl_tx_buf_nb: 0,
         ble_hw_cca_check: 0,
         ble_adv_dup_filt_max: 30,

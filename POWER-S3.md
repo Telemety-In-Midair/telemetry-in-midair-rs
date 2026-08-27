@@ -573,9 +573,14 @@ direction. Everything below item 1 is provisional until item 1 is done.
    `radio op error` line appears, the PA is keyed and LoRa Tx is 127 mA on
    its own - which would be the whole mystery in one line, and it has been
    sitting unread in this document since the first draft.
-3. **Duty-cycle the BLE controller.** Still the largest firmware lever
-   whatever item 1 says, because it is the only way to get a deployed
-   LoRa-only node. Through `BleConnector`'s `Drop`.
+3. **Duty-cycle the BLE controller. This is now the only firmware lever
+   of any size.** 71 mA measured, and modem sleep cannot reduce it, so the
+   connector's lifetime is all there is: build the trouble-host stack
+   inside the advertising window and drop it when the window closes.
+   `BleConnector::drop` calls `ble_deinit` and takes the `PhyInitGuard`
+   with it. A node with the BLE modem down is **55 mA** (the 49 mA floor
+   plus the 6 mA application), and that is what a deployed LoRa-only
+   tracker would draw.
 4. **Push `power_mode = psmct` and measure.** The key already exists
    (`CFG-PM-OPERATEMODE`, `PowerMode::PsmCyclic`) and defaults to `full`.
    No code at all.
@@ -604,32 +609,38 @@ cargo run --release --features iso-no-ble,iso-no-app
 | Build | What runs | Reading |
 |-|-|-|
 | baseline | everything | **126 mA** |
-| `iso-no-ble` | app only - no `esp_radio::init`, no PHY, no controller | |
-| `iso-no-app` | BLE only - no LoRa driver, GPS UART, card or panel | |
+| `iso-no-app` | BLE only - no LoRa driver, GPS UART, card or panel | **120 mA** |
 | both | bare chip, USB console only | **49 mA** |
 
-**BLE plus the application is 77 mA**, and that is the number the whole
-investigation was circling. The floor underneath it is 49 mA, of which the
-free-running MAX-M10 is most - the S3 itself is only around 12 mA once the
-receiver, the idle SX1262, the USB PHY and leakage are taken out.
+`iso-no-ble` was not needed once the other two landed - the two
+subtractions give the whole split.
 
-The two middle rows split the 77, and the split is the answer:
+## The budget, measured
 
-- **If `iso-no-app` lands near 80 mA**, BLE is costing about 31 mA - the
-  module datasheet figure - and roughly 46 mA is going into a 100 Hz poll
-  loop, which would be absurd and would mean something in the application
-  is pathological.
-- **If it lands near 116 mA**, BLE is costing about 67 mA, the controller
-  is sitting in RF-working, and **the vendored modem sleep is not working**
-  - the silent failure this document has warned about twice.
+No estimates left in the top-level split:
 
-The second is much more likely, and it would make duty-cycling
-`BleConnector` the only remaining lever rather than one of two.
+| | | |
+|-|-|-|
+| **BLE** | `iso-no-app` - both | **71 mA** |
+| **The whole application** | baseline - `iso-no-app` | **6 mA** |
+| **Floor** | both | **49 mA** |
+| | | **126 mA** |
 
-Note that ~5 mA of the 77 is not BLE or the loop: the isolation build never
-initializes the SX1262, so it sits in its power-on STDBY_RC instead of the
-continuous RX the real firmware puts it in. A fitted J5 panel is worth up
-to 15 mA more on the same basis.
+Two results, and one of them is a relief:
+
+- **The application costs 6 mA.** The 100 Hz poll loop, the GPS UART, the
+  radio SPI, the card driver and the panel together. About 5 mA of that is
+  just the SX1262 moving from its power-on STDBY_RC into continuous RX, so
+  the loop itself is on the order of **1 mA**. Every paragraph in earlier
+  drafts worrying that the S3 had absorbed a job the STM32WL used to do is
+  answered: it did, and it costs nothing. The port's architecture is fine.
+- **BLE costs 71 mA**, against the ~31 mA the module datasheet quotes for
+  advertising. That is the entire problem, and it is one subsystem.
+
+Inside the 49 mA floor, by subtraction and estimate: the free-running
+MAX-M10 at 25-31 mA, the S3 itself around 12, the USB PHY 3-5, the idle
+SX1262 ~2, leakage ~1. `--features iso-gps-backup` is what turns the first
+of those from an estimate into a measurement.
 
 What each subtraction means:
 
@@ -690,12 +701,36 @@ looks like most of a 49 mA floor. Either the old figure was taken with the
 receiver in a state this one has never reached, or this board's GPS is
 drawing considerably more. `--features iso-gps-backup` is what settles it.
 
-### What the two landed commits actually bought
+### Modem sleep is unimplemented in esp-radio, not unconfigured
 
-140 mA -> 126 mA, so **14 mA for the vendored modem sleep, 80 MHz and
-0 dBm together**. The clock drop alone was predicted at ~10 mA. That leaves
-almost nothing for modem sleep, which is consistent with the silent failure
-this document warned about - the NPL init calls `disable_sleep_mode()`,
-whose body for this chip is the comment `// nothing`. Treat modem sleep as
-**not working** until item 1 says otherwise. It is two literals and it can
-stay; it is not the answer.
+Setting `sleep_mode`/`sleep_clock` to ESP-IDF's mode-1 pair changed nothing
+measurable, and reading the crate says why. The S3 goes through
+**`btdm.rs`** - `#[cfg_attr(esp32s3, path = "os_adapter_esp32c3_s3.rs")]`
+under `#[cfg(bt_controller = "btdm")]` - not `npl.rs`, which earlier drafts
+of this document pointed at.
+
+Two things are missing, and the second is fatal:
+
+- **The enabling sequence.** ESP-IDF selects the low-power clock source
+  (`btdm_lpclk_select_src`, `btdm_lpclk_set_div`), calls
+  `btdm_controller_set_sleep_mode`, and then after
+  `btdm_controller_enable` calls `btdm_controller_enable_sleep(true)`.
+  `ble_init` in `btdm.rs` does none of these. The config field on its own
+  does not turn modem sleep on.
+- **The callbacks do not exist.** Every function the controller would call
+  to sleep is a `todo!()` in `btdm.rs`: `btdm_sleep_check_duration`,
+  `btdm_sleep_enter_phase1` and `_phase2`, `btdm_sleep_exit_phase1`
+  through `_phase3`, and `btdm_lpcycles_2_hus`. Only `btdm_hus_2_lpcycles`
+  is written. A controller that did enter sleep would panic, not save
+  current.
+
+So this is not an afternoon's fork. Making it work means porting the
+relevant part of ESP-IDF's `bt.c` plus six ROM callbacks, and getting the
+RTC cycle arithmetic right. The literals are back to upstream's zeros with
+the finding recorded at the site.
+
+**The vendored crate stays** for the one thing that does work: `TxPower` is
+re-exported, so BLE TX runs at 0 dBm instead of the +9 dBm default.
+
+140 mA -> 126 mA across the two earlier commits was therefore the 80 MHz
+clock drop and the TX power, with nothing from modem sleep.
