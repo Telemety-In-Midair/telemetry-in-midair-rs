@@ -729,6 +729,18 @@ relevant part of ESP-IDF's `bt.c` plus six ROM callbacks, and getting the
 RTC cycle arithmetic right. The literals are back to upstream's zeros with
 the finding recorded at the site.
 
+**It is not version lag either**, which was the obvious objection and was
+checked rather than assumed. The same three facts hold in **0.17.0**
+(pinned here), **0.18.0** (2026-04) and **1.0.0-beta.0** (2026-06, the
+current beta): `sleep_mode`/`sleep_clock` are literal zeros, `ble_init`
+runs no enabling sequence, and every sleep callback is `todo!()`. Nothing
+in any changelog mentions BLE modem sleep, and no BLE power API has
+appeared. `TxPower` is still crate-private in all three, so the vendoring
+keeps its one working purpose whatever version this lands on.
+
+Upgrading is worth considering on its own merits - see the pin note in the
+working notes, which was stale - but it will not move this number.
+
 **The vendored crate stays** for the one thing that does work: `TxPower` is
 re-exported, so BLE TX runs at 0 dBm instead of the +9 dBm default.
 
