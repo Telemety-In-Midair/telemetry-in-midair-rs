@@ -235,7 +235,10 @@ async fn main(spawner: Spawner) -> ! {
     esp_alloc::heap_allocator!(#[esp_hal::ram(reclaimed)] size: 65536);
 
     let timg0 = TimerGroup::new(peripherals.TIMG0);
-    esp_rtos::start(timg0.timer0);
+    // The idle task is substituted so the core's halted fraction is
+    // measurable rather than assumed - see `idle`. The default hook does
+    // the same `waiti`, just without counting it.
+    esp_rtos::start_with_idle_hook(timg0.timer0, wio_s3_gps::idle::hook);
 
     // D5 and D2. Both start dark so the first blink is visibly the
     // firmware's, not a leftover level from the ROM bootloader driving
@@ -1291,6 +1294,8 @@ async fn hardware_task(
         .wrapping_add((cfg.address as u32 % 8) * 1_000)
         .wrapping_add(2_000);
     let mut next_status = boot.wrapping_add(5_000);
+    let mut idle_mark = wio_s3_gps::idle::totals();
+    let mut idle_at = boot;
     let mut next_pos = boot;
     let mut next_gps_cfg = boot;
     let mut gps_cfg_tries: u8 = 0;
@@ -1621,10 +1626,21 @@ async fn hardware_task(
         // Without this a quiet radio and a quiet GPS look identical from the
         // console.
         if due(now, next_status) {
+            // Idle fraction over the window just ended, not since boot: a
+            // cumulative figure would average away exactly the thing worth
+            // seeing, which is a core that stopped halting at some point.
+            let idle_now = wio_s3_gps::idle::totals();
+            let (idle_pct, wake_hz) = wio_s3_gps::idle::window(
+                idle_mark,
+                idle_now,
+                u64::from(now.wrapping_sub(idle_at)) * 1_000,
+            );
+            idle_mark = idle_now;
+            idle_at = now;
             next_status = now.wrapping_add(10_000);
             let (mode, err) = node.radio_mut().health();
             status_println!(
-                "t={}s radio {} err {:04x} rx {} tx {} | gps {} nmea fix {} sats {} | sd {} | nodes {}",
+                "t={}s radio {} err {:04x} rx {} tx {} | gps {} nmea fix {} sats {} | sd {} | nodes {} | idle {}% {} Hz",
                 now_ms / 1000,
                 mode,
                 err,
@@ -1634,7 +1650,9 @@ async fn hardware_task(
                 gps.has_fix() as u8,
                 gps.packet().sats,
                 if sdlog.ready() { "mounted" } else { "absent" },
-                state::remote_count()
+                state::remote_count(),
+                idle_pct,
+                wake_hz
             );
             // Verbose only: break down what the radio heard but did not
             // deliver, so "a couple of random RXs" can be read as mostly

@@ -1,4 +1,8 @@
 #![no_std]
+// `waiti` in `idle::hook` is inline asm, which is still unstable on Xtensa.
+// The `esp` toolchain this crate pins is nightly-based, and esp-rtos and
+// esp-hal gate the same feature for the same instruction.
+#![feature(asm_experimental_arch)]
 
 /// Print to the console *and* queue the same line for the BLE log
 /// characteristic, so a connected app sees what the console sees.
@@ -45,6 +49,7 @@ pub mod compass;
 pub mod config;
 pub mod flash;
 pub mod gps;
+pub mod idle;
 pub mod node;
 pub mod oled;
 pub mod radio;
