@@ -573,14 +573,25 @@ direction. Everything below item 1 is provisional until item 1 is done.
    `radio op error` line appears, the PA is keyed and LoRa Tx is 127 mA on
    its own - which would be the whole mystery in one line, and it has been
    sitting unread in this document since the first draft.
-3. **Duty-cycle the BLE controller. This is now the only firmware lever
-   of any size.** 71 mA measured, and modem sleep cannot reduce it, so the
-   connector's lifetime is all there is: build the trouble-host stack
-   inside the advertising window and drop it when the window closes.
-   `BleConnector::drop` calls `ble_deinit` and takes the `PhyInitGuard`
-   with it. A node with the BLE modem down is **55 mA** (the 49 mA floor
-   plus the 6 mA application), and that is what a deployed LoRa-only
-   tracker would draw.
+3. ~~Duty-cycle the BLE controller.~~ **Done, unmeasured.** The
+   trouble-host stack is built inside the advertising window and dropped
+   when the window closes, so `BleConnector::drop` runs `ble_deinit` and
+   takes the `PhyInitGuard` with it. Off by default; turn it on with
+
+   ```
+   pixi run wio-set ble-off 30
+   ```
+
+   and read the meter across a whole cycle. Expect **~55 mA** through the
+   off period - the 49 mA floor plus the 6 mA application - against 126 mA
+   while a window is open. `wio-set ble-off 0` puts it back.
+
+   Two things to check on the bench beyond the number. First, that the
+   board still beacons while dark: the status line keeps printing and the
+   `tx` counter keeps climbing, because only the BLE modem went. Second,
+   that it comes back - the console prints `ble down for N s` and
+   `ble back up` around the gap, and a phone should find it in the next
+   window.
 4. **Push `power_mode = psmct` and measure.** The key already exists
    (`CFG-PM-OPERATEMODE`, `PowerMode::PsmCyclic`) and defaults to `full`.
    No code at all.
