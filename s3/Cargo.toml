@@ -74,6 +74,11 @@ esp-radio = { version = "0.17.0", features = [
   "esp-alloc",
   "esp32s3",
   "unstable",
+  # Uncomment to power the modem domain down on BLE teardown - worth a few
+  # mA per dark period, and unproven. If the board comes up with no BLE at
+  # all and the console says "radio init failed, retrying", this is why:
+  # cycling the domain can leave the controller unable to re-initialize.
+  # "radio-power-down",
 ] }
 trouble-host = { version = "0.5.0", features = [
   "gatt",

@@ -192,6 +192,17 @@ features = ["unstable"]
 if = 'chip_has("wifi") || chip_has("bt") || chip_has("ieee802154")'
 
 [features]
+# LOCAL PATCH, off by default. Powers the modem digital domain down in
+# `Controller::drop`, mirroring ESP-IDF's `esp_wifi_bt_power_domain_off`.
+# Upstream only ever clears `wifi_force_pd`, so without this the radio stays
+# powered after every BLE teardown - worth a few mA on a board that
+# duty-cycles BLE.
+#
+# Unproven: cycling the domain may leave the BT controller unable to
+# re-initialize, and `esp_radio::init` returning Err on the next window
+# looks like "no radio at all" rather than a crash. Enable deliberately and
+# measure both states.
+radio-power-down = []
 __docs_build = []
 ble = [
     "esp-hal/__bluetooth",

@@ -356,6 +356,7 @@ pub(crate) unsafe fn phy_disable_clock() {
 /// isolate, then force the domain down. Safe only once the controller has
 /// been deinitialized, which is why the caller is `Controller::drop` and
 /// not anything earlier.
+#[cfg(feature = "radio-power-down")]
 pub(crate) fn disable_wifi_power_domain() {
     #[cfg(not(any(soc_has_pmu, esp32c2)))]
     {

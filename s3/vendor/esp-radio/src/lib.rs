@@ -239,6 +239,13 @@ impl Drop for Controller<'_> {
         // `wifi_force_pd` and upstream never sets it again, so without this
         // the radio stays powered for the rest of the program however many
         // times the controller is dropped.
+        //
+        // Behind a feature and off by default because it is unproven: if
+        // cycling the domain leaves the controller unable to come back,
+        // `esp_radio::init` fails on the next window and the board runs on
+        // with no BLE at all rather than crashing, which is a much harder
+        // symptom to read.
+        #[cfg(feature = "radio-power-down")]
         crate::common_adapter::disable_wifi_power_domain();
 
         #[cfg(esp32)]
