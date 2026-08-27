@@ -8,6 +8,30 @@ version      = "0.1.0"
 name = "wio-s3-gps"
 path = "./src/bin/main.rs"
 
+[features]
+default = []
+
+# Power isolation builds. Each one removes a load so that its contribution
+# to the board's current can be had by subtraction rather than estimated;
+# they compose, so four flashes give a 2x2. Never ship one - a board built
+# with any of these is missing a subsystem on purpose.
+#
+#   (none)                    the real firmware, the baseline reading
+#   iso-no-ble                everything but the radio and BLE stack
+#   iso-no-app                BLE only, no hardware loop
+#   iso-no-ble + iso-no-app   the bare chip, USB console only
+#
+# Neither flag powers the GPS or the SX1262 down - both sit on the
+# always-on +3V3 with no gate - so an app-less build still carries a
+# free-running MAX-M10 at its factory default. `iso-gps-backup` is the
+# lever for that one.
+iso-no-ble = []
+iso-no-app = []
+# Send the GPS straight to UBX-RXM-PMREQ backup once the UART is up, so the
+# receiver's own draw can be measured. V_BCKP is unconnected on this board,
+# so waking it again is not established - expect to power-cycle.
+iso-gps-backup = []
+
 [dependencies]
 # Same versions the esp32c6-gps crate runs, retargeted at the S3: the
 # matched esp-rtos 0.2 / esp-radio 0.17 pair expects esp-hal 1.0.x.

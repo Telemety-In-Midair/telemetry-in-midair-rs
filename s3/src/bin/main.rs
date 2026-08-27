@@ -28,6 +28,12 @@
 
 #![no_std]
 #![no_main]
+// An isolation build leaves whole subsystems uncalled on purpose, and the
+// warnings that produces are noise rather than signal.
+#![cfg_attr(
+    any(feature = "iso-no-ble", feature = "iso-no-app"),
+    allow(dead_code, unused_imports, unused_variables, unused_mut)
+)]
 
 use bt_hci::controller::ExternalController;
 use embassy_executor::Spawner;
@@ -322,6 +328,15 @@ async fn main(spawner: Spawner) -> ! {
     let addr_bytes = ble_address();
     state::set_ble_address(addr_bytes);
 
+    // Everything below up to the `hardware_task` spawn is the application:
+    // the LoRa radio, the GPS, the card and the J5 panel. `iso-no-app`
+    // drops the lot, which leaves BLE and the USB console - the closest
+    // this board can get to the old two-MCU board's "ESP only, BLE
+    // connected" reading. It does NOT power the GPS or the SX1262 down;
+    // both are on the ungated +3V3 and keep running at their power-on
+    // defaults.
+    #[cfg(not(feature = "iso-no-app"))]
+    {
     // Wio-S3 internal SX1262 wiring, from the module datasheet. Confirmed
     // against hardware - do not guess at these. An earlier build had three
     // of them wrong in a way that put an ESP push-pull output on a line the
@@ -430,6 +445,12 @@ async fn main(spawner: Spawner) -> ! {
     spawner
         .spawn(hardware_task(lora, gps, sdlog, j5, d5, d2))
         .expect("spawn hardware task");
+    }
+
+    // The LEDs are constructed above and stay at `LED_OFF`; without the
+    // hardware task nothing owns them.
+    #[cfg(feature = "iso-no-app")]
+    let _ = (&d5, &d2);
 
     // The USB console: firmware text out, framed host commands in.
     let usb = UsbSerialJtag::new(peripherals.USB_DEVICE).into_async();
@@ -438,6 +459,12 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(wio_s3_gps::usb::usb_task(usb_rx, usb_tx))
         .expect("spawn usb task");
 
+    // `iso-no-ble` skips all of this: no `esp_radio::init`, so no PHY, no
+    // controller and no advertising. The difference against the baseline is
+    // what BLE actually costs on this board, which is the one number the
+    // power investigation has never had.
+    #[cfg(not(feature = "iso-no-ble"))]
+    {
     // BLE. Same stack the C6 runs, against a vendored esp-radio whose BLE
     // controller has modem sleep turned on - the PHY powers down between
     // advertising and connection events instead of staying up continuously.
@@ -503,8 +530,13 @@ async fn main(spawner: Spawner) -> ! {
         serve(&mut peripheral, &server, &mut rtc),
     )
     .await;
+    }
 
-    // Neither side of that select ever finishes.
+    // Neither side of that select ever finishes, so this is reached only by
+    // an `iso-no-ble` build, which has nothing left to do but hold the rail
+    // up and answer the console.
+    #[cfg(feature = "iso-no-ble")]
+    status_println!("iso-no-ble: BLE stack not started");
     loop {
         Timer::after(Duration::from_secs(1)).await;
     }
@@ -1141,6 +1173,15 @@ async fn hardware_task(
     // The settings that survive a deep sleep are re-applied here, because
     // the wake that restored them is a fresh boot to everything else.
     let stored = settings::get();
+    // The isolation build asks unconditionally, because the point is to
+    // measure the receiver rather than to honor a setting. V_BCKP is not
+    // fed on this board, so the wake path is unproven - a power cycle is
+    // the way back.
+    #[cfg(feature = "iso-gps-backup")]
+    {
+        gps.sleep();
+        status_println!("iso-gps-backup: GPS asked for backup mode");
+    }
     if stored.gps_sleep() {
         gps.sleep();
     }

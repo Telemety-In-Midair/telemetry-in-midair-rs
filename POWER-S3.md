@@ -566,17 +566,8 @@ bench time on them.
 The estimates have been wrong three times in a row and in the same
 direction. Everything below item 1 is provisional until item 1 is done.
 
-1. **Isolate the loads by subtraction, on the bench.** This is now the only
-   thing worth doing first. Each step is one reading against the 126 mA
-   baseline, same USB supply, same room:
-   - Pull the SD card. Unplug the J5 panel.
-   - Build with the `BleConnector` construction commented out and flash
-     that. The delta is the true cost of BLE *and* the PHY on this board,
-     and it settles whether the vendored modem sleep did anything.
-   - Comment out the GPS UART init. The delta is the receiver.
-   - Comment out the `Sx1262Driver` construction. The delta is the radio.
-   - What is left is the S3 running its own loop, which is the number
-     nothing in this document has ever measured.
+1. **Isolate the loads by subtraction.** The only thing worth doing first.
+   The isolation builds are in the crate as cargo features - see below.
 2. **Read the boot console before any of that.** `radio status 0x..,
    mode N` comes from `print_diagnostics`. Expect RX. If it says TX, or a
    `radio op error` line appears, the PA is keyed and LoRa Tx is 127 mA on
@@ -597,6 +588,49 @@ direction. Everything below item 1 is provisional until item 1 is done.
 7. **Measure a sleep.** `pixi run wio-sleep --seconds 60`; `woke from deep
    sleep #N` on the far side confirms it was a sleep and not a reset.
    Expect ~30 mA until item 5 lands.
+
+### The isolation builds
+
+Four flashes, from `s3/`, same supply and same room each time. Card out and
+J5 unplugged for all of them unless a reading for those is wanted too.
+
+```
+cargo run --release                                    # baseline
+cargo run --release --features iso-no-ble
+cargo run --release --features iso-no-app
+cargo run --release --features iso-no-ble,iso-no-app
+```
+
+| Build | What runs | Reading |
+|-|-|-|
+| baseline | everything | 126 mA |
+| `iso-no-ble` | app only - no `esp_radio::init`, no PHY, no controller | |
+| `iso-no-app` | BLE only - no LoRa driver, GPS UART, card or panel | |
+| both | bare chip, USB console only | |
+
+What each subtraction means:
+
+- **baseline - `iso-no-ble`** is what BLE and the PHY actually cost on this
+  board. It also settles the vendored modem sleep, which the 14 mA across
+  the last two commits suggests is doing nothing.
+- **baseline - `iso-no-app`** is the application: the 100 Hz loop, the GPS
+  UART, radio SPI, the card and the panel. On the old board the equivalent
+  subsystem *including its own MCU* measured 20 mA.
+- **`iso-no-app` on its own** is the closest this board gets to the old
+  board's "ESP only, BLE connected - 46 mA". It is not a clean comparison:
+  the MAX-M10 keeps running underneath it, because nothing gates its rail.
+- **both** is the floor - an S3 holding the rail up with a free-running
+  GPS and an idle SX1262 beside it.
+
+**Neither flag powers the GPS down.** It sits on the ungated +3V3 and falls
+back to its factory default when nothing configures it, so roughly 25-30 mA
+is inside every reading above. `--features iso-gps-backup` sends
+UBX-RXM-PMREQ backup once the UART is up, which is the only way to get the
+receiver's own number. V_BCKP is unconnected, so waking it again is not
+established - plan on a power cycle.
+
+An isolation build is missing a subsystem on purpose. Do not flash one and
+leave it on a board.
 
 ### What the two landed commits actually bought
 
