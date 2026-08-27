@@ -480,6 +480,19 @@ async fn main(spawner: Spawner) -> ! {
         status_println!("cold boot (not a deep-sleep wake)");
     }
 
+    // The attribute table is built once and reused by every window.
+    //
+    // Not an optimization - a requirement. The `#[gatt_service]` macro backs
+    // each characteristic with its own `static StaticCell`, so a second
+    // `Server::new_with_config` panics ("already full, it can't be
+    // initialized twice") rather than returning an error. It borrows nothing
+    // from the per-window stack, so hoisting it costs nothing either.
+    let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
+        name: ble::DEVICE_NAME,
+        appearance: &appearance::sensor::GENERIC_SENSOR,
+    }))
+    .expect("gatt server");
+
     // The BLE duty cycle.
     //
     // BLE measures 71 mA of this board's 126, and it cannot be reduced
@@ -536,15 +549,10 @@ async fn main(spawner: Spawner) -> ! {
                 ..
             } = stack.build();
 
-            let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
-                name: ble::DEVICE_NAME,
-                appearance: &appearance::sensor::GENERIC_SENSOR,
-            }))
-            .expect("gatt server");
-
             // Seed the readable value so a central that reads immediately
             // after discovery cannot beat the first publish in
-            // `gatt_session`.
+            // `gatt_session`. Re-seeded per window because the settings may
+            // have moved while the modem was down.
             let _ = server.gps.settings.set(&server, &current_settings().encode());
 
             let _ = select(
