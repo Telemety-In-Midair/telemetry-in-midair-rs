@@ -573,7 +573,11 @@ direction. Everything below item 1 is provisional until item 1 is done.
    `radio op error` line appears, the PA is keyed and LoRa Tx is 127 mA on
    its own - which would be the whole mystery in one line, and it has been
    sitting unread in this document since the first draft.
-3. ~~Duty-cycle the BLE controller.~~ **Done, unmeasured.** The
+3. ~~Duty-cycle the BLE controller.~~ **Done and measured: 130 mA with a
+   window open, 60 mA dark.** See "what the duty cycle is worth" below.
+   Original note follows.
+
+   The
    trouble-host stack is built inside the advertising window and dropped
    when the window closes, so `BleConnector::drop` runs `ble_deinit` and
    takes the `PhyInitGuard` with it. Off by default; turn it on with
@@ -604,6 +608,42 @@ direction. Everything below item 1 is provisional until item 1 is done.
 7. **Measure a sleep.** `pixi run wio-sleep --seconds 60`; `woke from deep
    sleep #N` on the far side confirms it was a sleep and not a reset.
    Expect ~30 mA until item 5 lands.
+
+### What the duty cycle is worth
+
+Measured with `adv-window` at its 15 s default:
+
+| Phase | Reading |
+|-|-|
+| Advertising window open | ~130 mA |
+| BLE down | **60 mA** |
+
+The average is whatever the two settings make it, and it asymptotes to the
+dark figure rather than to zero:
+
+| `adv-window` / `ble-off` | Average | Worst-case wait to connect |
+|-|-|-|
+| 15 / 0 (default, no duty cycle) | 130 mA | none |
+| 15 / 30 | ~83 mA | 30 s |
+| 10 / 60 | ~70 mA | 60 s |
+| 5 / 60 | ~65 mA | 60 s |
+| 5 / 300 | ~61 mA | 5 min |
+
+**Past about a minute of off time the returns are gone**, because the dark
+period is the floor and the floor is 60 mA. Buying the last few milliamps
+costs minutes of unreachability, which is a bad trade - the next lever is
+not a longer off period, it is the 60 mA itself.
+
+Two open items in that 60:
+
+- **~30 mA of it is the free-running MAX-M10**, which no firmware gates on
+  this board. `power_mode = psmct` is the config-only reduction and is
+  still untried; a load switch is the real fix and belongs on the respin.
+- **~5 mA looks like teardown residue.** The floor with BLE never
+  initialized at all should be the 49 mA `iso-no-ble,iso-no-app` reading
+  plus the 6 mA application, i.e. ~55. Dark measures 60. One flash of
+  `--features iso-no-ble` settles whether that gap is real, and if it is,
+  `Controller::drop` not disabling the radio power domain is the suspect.
 
 ### The isolation builds
 
@@ -647,6 +687,12 @@ Two results, and one of them is a relief:
   answered: it did, and it costs nothing. The port's architecture is fine.
 - **BLE costs 71 mA**, against the ~31 mA the module datasheet quotes for
   advertising. That is the entire problem, and it is one subsystem.
+
+**And the duty cycle recovers it.** With `ble-off 30` the board reads
+~130 mA while a window is open and **60 mA** through the dark period - a
+~70 mA step, which is the 71 mA line above arriving where it was predicted.
+The LoRa beacon keeps transmitting throughout, confirmed on the console by
+the `tx` counter climbing between "ble down" and "ble back up".
 
 Inside the 49 mA floor, by subtraction and estimate: the free-running
 MAX-M10 at 25-31 mA, the S3 itself around 12, the USB PHY 3-5, the idle
