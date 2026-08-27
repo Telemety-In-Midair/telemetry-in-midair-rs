@@ -304,6 +304,9 @@ unsafe extern "C" fn custom_queue_create(
 
 pub(crate) fn ble_init(config: &Config) -> PhyInitGuard<'static> {
     let phy_init_guard;
+    // LOCAL PATCH: a previous connector's queued packets must not reach
+    // this one's host. See `super::reset_hci_state`.
+    super::reset_hci_state();
     unsafe {
         (*addr_of_mut!(HCI_OUT_COLLECTOR)).write(HciOutCollector::new());
         // turn on logging
@@ -388,6 +391,10 @@ pub(crate) fn ble_deinit() {
     esp_hal::rng::TrngSource::decrease_entropy_source_counter(unsafe {
         esp_hal::Internal::conjure()
     });
+
+    // LOCAL PATCH: hand nothing forward to the next connector, and give the
+    // queued packets' allocations back now rather than at the next init.
+    super::reset_hci_state();
 
     unsafe extern "C" {
         fn btdm_controller_deinit();

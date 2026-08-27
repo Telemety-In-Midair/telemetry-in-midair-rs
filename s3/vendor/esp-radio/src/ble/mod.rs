@@ -58,6 +58,28 @@ static BT_STATE: NonReentrantMutex<BleState> = NonReentrantMutex::new(BleState {
     hci_read_data: Vec::new(),
 });
 
+/// LOCAL PATCH: drop everything the controller queued for a host that no
+/// longer exists.
+///
+/// `BT_STATE` lives for the life of the process, but a `BleConnector` does
+/// not - and upstream never clears it, because upstream assumes the
+/// connector is built once. Tear the stack down and build it again and the
+/// new host's first reads are the old host's leftovers: a Disconnection
+/// Complete for a handle the new controller never issued, or half an ACL
+/// fragment. That is a correctness bug, not a leak - it surfaces as an
+/// intermittent host error on the *second* window and looks like anything
+/// but stale state.
+///
+/// Called from both ends of the lifetime: `ble_deinit` so the allocations
+/// go back promptly, and `ble_init` so a fresh stack is clean no matter how
+/// the last one ended.
+pub(crate) fn reset_hci_state() {
+    BT_STATE.with(|state| {
+        state.rx_queue.clear();
+        state.hci_read_data.clear();
+    });
+}
+
 static mut HCI_OUT_COLLECTOR: MaybeUninit<HciOutCollector> = MaybeUninit::uninit();
 
 #[derive(PartialEq, Debug)]

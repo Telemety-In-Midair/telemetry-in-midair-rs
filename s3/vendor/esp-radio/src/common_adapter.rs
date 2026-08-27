@@ -343,6 +343,73 @@ pub(crate) unsafe fn phy_disable_clock() {
     // unsafe { ModemClockControllerPeripheral::steal() }.decrease_phy_clock_ref_count();
 }
 
+/// LOCAL PATCH: the other half of [`enable_wifi_power_domain`], which
+/// upstream never wrote because upstream never tears the radio down.
+///
+/// `wifi_force_pd` appears exactly once in the published crate and is only
+/// ever *cleared*; `Controller::drop` does `shutdown_radio_isr` and nothing
+/// else, so the modem digital domain stays powered for the rest of the
+/// program even after every BLE object has been dropped. On a board that
+/// duty-cycles BLE that is a standing cost through every dark period.
+///
+/// Mirrors ESP-IDF's `esp_wifi_bt_power_domain_off`: pulse the modem reset,
+/// isolate, then force the domain down. Safe only once the controller has
+/// been deinitialized, which is why the caller is `Controller::drop` and
+/// not anything earlier.
+pub(crate) fn disable_wifi_power_domain() {
+    #[cfg(not(any(soc_has_pmu, esp32c2)))]
+    {
+        cfg_if::cfg_if! {
+            if #[cfg(soc_has_lpwr)] {
+                let rtc_cntl = esp_hal::peripherals::LPWR::regs();
+            } else {
+                let rtc_cntl = esp_hal::peripherals::RTC_CNTL::regs();
+            }
+        }
+
+        #[cfg(not(esp32))]
+        unsafe {
+            cfg_if::cfg_if! {
+                if #[cfg(soc_has_apb_ctrl)] {
+                    let syscon = esp_hal::peripherals::APB_CTRL::regs();
+                } else {
+                    let syscon = esp_hal::peripherals::SYSCON::regs();
+                }
+            }
+            const WIFIBB_RST: u32 = 1 << 0;
+            const FE_RST: u32 = 1 << 1;
+            const WIFIMAC_RST: u32 = 1 << 2;
+            const BTBB_RST: u32 = 1 << 3;
+            const BTMAC_RST: u32 = 1 << 4;
+            const RW_BTMAC_RST: u32 = 1 << 9;
+            const RW_BTMAC_REG_RST: u32 = 1 << 11;
+
+            const MODEM_RESET_FIELD_WHEN_PD: u32 = WIFIBB_RST
+                | FE_RST
+                | WIFIMAC_RST
+                | if cfg!(soc_has_bt) {
+                    BTBB_RST | BTMAC_RST | RW_BTMAC_RST | RW_BTMAC_REG_RST
+                } else {
+                    0
+                };
+
+            syscon
+                .wifi_rst_en()
+                .modify(|r, w| w.bits(r.bits() | MODEM_RESET_FIELD_WHEN_PD));
+            syscon
+                .wifi_rst_en()
+                .modify(|r, w| w.bits(r.bits() & !MODEM_RESET_FIELD_WHEN_PD));
+        }
+
+        rtc_cntl
+            .dig_iso()
+            .modify(|_, w| w.wifi_force_iso().set_bit());
+        rtc_cntl
+            .dig_pwc()
+            .modify(|_, w| w.wifi_force_pd().set_bit());
+    }
+}
+
 pub(crate) fn enable_wifi_power_domain() {
     #[cfg(not(any(soc_has_pmu, esp32c2)))]
     {

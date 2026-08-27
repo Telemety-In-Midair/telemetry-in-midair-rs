@@ -530,10 +530,30 @@ async fn main(spawner: Spawner) -> ! {
             // Declared before the stack so it outlives it: dropping the
             // connector needs the radio still initialized, and locals drop
             // in reverse declaration order.
-            let radio = esp_radio::init().expect("radio init");
+            //
+            // Neither of these may panic. They ran once per boot before the
+            // duty cycle and now run every window - thousands of times a
+            // day on a deployed board - so a transient failure has to cost
+            // one window rather than the whole node. A tracker that stops
+            // beaconing because its BLE modem would not come back up is a
+            // worse outcome than one nobody can connect to.
+            let radio = match esp_radio::init() {
+                Ok(radio) => radio,
+                Err(e) => {
+                    qprintln!("radio init failed ({:?}), retrying", e);
+                    Timer::after(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
             let transport =
-                esp_radio::ble::controller::BleConnector::new(&radio, bt, ble_config)
-                    .expect("ble connector");
+                match esp_radio::ble::controller::BleConnector::new(&radio, bt, ble_config) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        qprintln!("ble connector failed ({:?}), retrying", e);
+                        Timer::after(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
             let controller = ExternalController::<_, 20>::new(transport);
 
             let mut resources: HostResources<
@@ -590,7 +610,13 @@ async fn main(spawner: Spawner) -> ! {
             status_println!("sleep on command: {} s, from a BLE-down period", secs);
             enter_deep_sleep(&mut rtc, secs).await;
         }
-        qprintln!("ble back up");
+        // Free heap alongside it, because the duty cycle turned a
+        // once-per-boot allocation into a few thousand a day: the whole
+        // trouble-host stack and the controller's queues are built and torn
+        // down every window. A slow drift here across a soak is
+        // fragmentation, and it is the failure this change is most likely
+        // to introduce - it will not show up in a single cycle.
+        qprintln!("ble back up ({} B heap free)", esp_alloc::HEAP.free());
     }
     }
 

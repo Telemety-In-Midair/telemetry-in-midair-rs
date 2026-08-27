@@ -235,6 +235,12 @@ impl Drop for Controller<'_> {
 
         shutdown_radio_isr();
 
+        // LOCAL PATCH: put the modem domain back down. `init` clears
+        // `wifi_force_pd` and upstream never sets it again, so without this
+        // the radio stays powered for the rest of the program however many
+        // times the controller is dropped.
+        crate::common_adapter::disable_wifi_power_domain();
+
         #[cfg(esp32)]
         // Allow using `ADC2` again
         release_adc2(unsafe { esp_hal::Internal::conjure() });

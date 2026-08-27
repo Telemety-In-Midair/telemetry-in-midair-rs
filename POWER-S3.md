@@ -629,21 +629,30 @@ dark figure rather than to zero:
 | 5 / 60 | ~65 mA | 60 s |
 | 5 / 300 | ~61 mA | 5 min |
 
-**Past about a minute of off time the returns are gone**, because the dark
-period is the floor and the floor is 60 mA. Buying the last few milliamps
-costs minutes of unreachability, which is a bad trade - the next lever is
-not a longer off period, it is the 60 mA itself.
+**Past about a minute of off time the returns from this lever are gone**,
+because the average asymptotes to the dark reading. Buying the last few
+milliamps costs minutes of unreachability, which is a bad trade.
+
+That is a statement about the duty cycle, not about the board: **60 mA is
+not a floor**, it is a number with parts, and only one of them has been
+measured. Roughly 30 mA of ungated MAX-M10, ~12 of S3 core that never
+sleeps, 3-5 of USB PHY, ~2 of idle SX1262. Every one of those is an open
+item below.
 
 Two open items in that 60:
 
 - **~30 mA of it is the free-running MAX-M10**, which no firmware gates on
   this board. `power_mode = psmct` is the config-only reduction and is
   still untried; a load switch is the real fix and belongs on the respin.
-- **~5 mA looks like teardown residue.** The floor with BLE never
-  initialized at all should be the 49 mA `iso-no-ble,iso-no-app` reading
-  plus the 6 mA application, i.e. ~55. Dark measures 60. One flash of
-  `--features iso-no-ble` settles whether that gap is real, and if it is,
-  `Controller::drop` not disabling the radio power domain is the suspect.
+- **~5 mA was teardown residue, and it is now sourced rather than
+  suspected.** `esp_radio::init` clears `wifi_force_pd`; that field appears
+  exactly once in the published crate and is never set again, and
+  `Controller::drop` does `shutdown_radio_isr` and nothing else. The modem
+  digital domain therefore stayed powered through every dark period. The
+  vendored copy now mirrors ESP-IDF's `esp_wifi_bt_power_domain_off` on
+  drop. Unmeasured - `--features iso-no-ble` is still the check, and the
+  dark period should now land nearer the 55 mA the isolation builds
+  predict.
 
 ### The isolation builds
 
