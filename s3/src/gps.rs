@@ -375,6 +375,26 @@ impl<'d> Gps<'d> {
     /// hardware [`wake`](Self::wake) leans on the UART one - which is why
     /// that is not a board change this firmware is blocked on.
     pub fn sleep(&mut self) {
+        self.sleep_for(0);
+    }
+
+    /// Backup mode for a fixed number of milliseconds, then wake without
+    /// being asked to.
+    ///
+    /// `0` is the open-ended form [`Gps::sleep`] sends: stay down until a
+    /// wake source fires. Anything else arms the receiver's own timer as
+    /// well, which is the safer of the two on this board - the wake sources
+    /// live in the same backup domain as the timer, and `V_BCKP` is not fed
+    /// here, so neither is guaranteed. A timed request that comes back on
+    /// its own proves the domain survives on `VCC` alone; one that does not
+    /// costs a power cycle rather than a board that has to be unplugged to
+    /// be recovered.
+    ///
+    /// That makes it the right shape for measuring what the receiver costs:
+    /// ask for twenty seconds, watch the meter, and either it returns or
+    /// the answer is that backup mode is unusable until `V_BCKP` is tied to
+    /// +3V3.
+    pub fn sleep_for(&mut self, ms: u32) {
         // UART RX is one of the wake sources, so sending the request to a
         // module that is already in backup would wake it just to put it
         // back.
@@ -385,6 +405,7 @@ impl<'d> Gps<'d> {
         // until wake source), flags (bit1 = backup), wakeupSources
         // (bit3 = uartrx, bit5 = extint0).
         let mut payload = [0u8; 16];
+        payload[4..8].copy_from_slice(&ms.to_le_bytes());
         payload[8..12].copy_from_slice(&2u32.to_le_bytes()); // flags: backup
         payload[12..16].copy_from_slice(&((1u32 << 3) | (1u32 << 5)).to_le_bytes());
         self.ubx(0x02, 0x41, &payload); // class RXM, id PMREQ

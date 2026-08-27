@@ -1249,8 +1249,19 @@ async fn hardware_task(
     // the way back.
     #[cfg(feature = "iso-gps-backup")]
     {
-        gps.sleep();
-        status_println!("iso-gps-backup: GPS asked for backup mode");
+        // Timed rather than open-ended, so the test recovers itself. Read
+        // the meter across the gap: the drop is the receiver's own draw,
+        // and the sentence counter climbing again on the far side is the
+        // proof that backup mode is usable on a board whose V_BCKP is not
+        // fed. If it never comes back, that is the answer too - and it
+        // costs a power cycle rather than a board that cannot be recovered
+        // without one.
+        const ISO_GPS_BACKUP_MS: u32 = 20_000;
+        gps.sleep_for(ISO_GPS_BACKUP_MS);
+        status_println!(
+            "iso-gps-backup: GPS in backup for {} s - watch the meter, then the nmea count",
+            ISO_GPS_BACKUP_MS / 1000
+        );
     }
     if stored.gps_sleep() {
         gps.sleep();
@@ -1294,7 +1305,7 @@ async fn hardware_task(
         .wrapping_add((cfg.address as u32 % 8) * 1_000)
         .wrapping_add(2_000);
     let mut next_status = boot.wrapping_add(5_000);
-    let mut idle_mark = wio_s3_gps::idle::totals();
+    let mut idle_mark = wio_s3_gps::idle::entries();
     let mut idle_at = boot;
     let mut next_pos = boot;
     let mut next_gps_cfg = boot;
@@ -1629,18 +1640,14 @@ async fn hardware_task(
             // Idle fraction over the window just ended, not since boot: a
             // cumulative figure would average away exactly the thing worth
             // seeing, which is a core that stopped halting at some point.
-            let idle_now = wio_s3_gps::idle::totals();
-            let (idle_pct, wake_hz) = wio_s3_gps::idle::window(
-                idle_mark,
-                idle_now,
-                u64::from(now.wrapping_sub(idle_at)) * 1_000,
-            );
+            let idle_now = wio_s3_gps::idle::entries();
+            let idle_hz = wio_s3_gps::idle::rate(idle_mark, idle_now, now.wrapping_sub(idle_at));
             idle_mark = idle_now;
             idle_at = now;
             next_status = now.wrapping_add(10_000);
             let (mode, err) = node.radio_mut().health();
             status_println!(
-                "t={}s radio {} err {:04x} rx {} tx {} | gps {} nmea fix {} sats {} | sd {} | nodes {} | idle {}% {} Hz",
+                "t={}s radio {} err {:04x} rx {} tx {} | gps {} nmea fix {} sats {} | sd {} | nodes {} | idle {} Hz",
                 now_ms / 1000,
                 mode,
                 err,
@@ -1651,8 +1658,7 @@ async fn hardware_task(
                 gps.packet().sats,
                 if sdlog.ready() { "mounted" } else { "absent" },
                 state::remote_count(),
-                idle_pct,
-                wake_hz
+                idle_hz
             );
             // Verbose only: break down what the radio heard but did not
             // deliver, so "a couple of random RXs" can be read as mostly

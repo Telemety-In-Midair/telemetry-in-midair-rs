@@ -11,21 +11,32 @@
 //! without a meter and indistinguishable from "this chip is just thirsty".
 //!
 //! `esp_rtos::start_with_idle_hook` takes the idle task's body, so this
-//! substitutes one that brackets each `waiti` with a timestamp. What comes
-//! out is the fraction of wall time the core spent halted, which is the
-//! direct answer rather than an inference from current.
+//! substitutes one that counts entries before halting. The rate that comes
+//! out answers the question directly - above zero means the core reaches
+//! `waiti` - without inferring it from a current reading.
 //!
-//! Cost is one systimer read either side of each halt. At the wake rates
-//! this firmware produces - a 100 Hz poll loop plus interrupts - that is
-//! well under a microsecond per millisecond of wall time.
+//! It is a rate and not a percentage on purpose. esp-rtos documents that
+//! the idle hook's context is not preserved: when an interrupt makes a task
+//! ready the scheduler switches away and discards the idle context, so
+//! nothing after the `waiti` ever executes. A first version of this
+//! timestamped both sides of the halt and reported a flat `idle 0% 0 Hz`,
+//! because the second timestamp was unreachable code. Measuring the halted
+//! *fraction* needs the exit time, and the exit is only observable from the
+//! scheduler's context switch, which is not exposed.
+//!
+//! Cost is one relaxed increment per idle entry.
 
-use esp_hal::time::Instant;
 use portable_atomic::{AtomicU64, Ordering};
 
-/// Microseconds spent halted, cumulative since boot.
-static IDLE_US: AtomicU64 = AtomicU64::new(0);
-/// Times the core came out of `waiti`, cumulative since boot.
-static WAKEUPS: AtomicU64 = AtomicU64::new(0);
+/// Times the idle task has been entered, cumulative since boot.
+///
+/// Entries, not wakeups. esp-rtos documents that "the idle hook's context
+/// is not preserved": when an interrupt makes a task ready the scheduler
+/// switches away and **discards** the idle context, so execution never
+/// resumes after the `waiti`. Anything written past that instruction is
+/// dead code, which is why this is a count taken on the way in rather than
+/// a duration measured across the halt.
+static ENTRIES: AtomicU64 = AtomicU64::new(0);
 
 /// The idle task body. Installed by `main` via
 /// [`esp_rtos::start_with_idle_hook`].
@@ -33,46 +44,38 @@ static WAKEUPS: AtomicU64 = AtomicU64::new(0);
 /// Never returns: this *is* the idle task, not something called from it.
 pub extern "C" fn hook() -> ! {
     loop {
-        let entered = Instant::now();
+        ENTRIES.fetch_add(1, Ordering::Relaxed);
         // SAFETY: `waiti 0` halts until an interrupt of any priority. It
         // needs no operands and touches no state; the only requirement is
         // that interrupts are enabled, which they are in task context.
+        //
+        // Execution may never continue past here - see `ENTRIES`. Do not
+        // add accounting below this line expecting it to run.
         unsafe { core::arch::asm!("waiti 0") };
-        let halted = Instant::now()
-            .duration_since_epoch()
-            .as_micros()
-            .saturating_sub(entered.duration_since_epoch().as_micros());
-        IDLE_US.fetch_add(halted, Ordering::Relaxed);
-        WAKEUPS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-/// Cumulative microseconds halted, and wakeup count.
-pub fn totals() -> (u64, u64) {
-    (
-        IDLE_US.load(Ordering::Relaxed),
-        WAKEUPS.load(Ordering::Relaxed),
-    )
+/// Cumulative idle-task entries.
+pub fn entries() -> u64 {
+    ENTRIES.load(Ordering::Relaxed)
 }
 
-/// Percent of wall time the core spent halted over a window, and the wake
-/// rate in hertz across it.
+/// Idle entries per second across a window.
 ///
-/// Take `totals()` at each end of the window and pass both, along with how
-/// long the window was. Returns `(idle %, wakeups per second)`.
+/// **Above zero means the core is reaching `waiti` and halting**, which is
+/// the question worth answering; zero means something is polling instead of
+/// awaiting and the core never stops. The rate itself is a coarse read on
+/// what is doing the waking - in the same order as the 100 Hz hardware loop
+/// is expected, far above it means a driver spinning on a status register.
 ///
-/// A healthy board here is high nineties. Anything low means something is
-/// polling rather than awaiting, and the wake rate says which: a rate near
-/// the 100 Hz loop is the loop, and a much higher one is a driver spinning
-/// on a status register.
-pub fn window(before: (u64, u64), after: (u64, u64), elapsed_us: u64) -> (u32, u32) {
-    if elapsed_us == 0 {
-        return (0, 0);
+/// This is deliberately not a percentage. Getting a halted *fraction* would
+/// need the exit time, and the discarded idle context means the exit is not
+/// observable from here; it would have to come from the scheduler's context
+/// switch, which esp-rtos does not expose. A rate that answers "yes it
+/// halts" honestly beats a percentage that would have to be invented.
+pub fn rate(before: u64, after: u64, elapsed_ms: u32) -> u32 {
+    if elapsed_ms == 0 {
+        return 0;
     }
-    let idle = after.0.saturating_sub(before.0).min(elapsed_us);
-    let wakes = after.1.saturating_sub(before.1);
-    (
-        ((idle * 100) / elapsed_us) as u32,
-        ((wakes * 1_000_000) / elapsed_us) as u32,
-    )
+    ((after.saturating_sub(before) * 1_000) / u64::from(elapsed_ms)) as u32
 }
