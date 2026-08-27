@@ -391,9 +391,21 @@ pub(crate) fn ble_deinit() {
 
     unsafe extern "C" {
         fn btdm_controller_deinit();
+        // LOCAL PATCH: not declared upstream, because upstream never calls
+        // it. ESP-IDF's teardown is esp_bt_controller_disable() and then
+        // esp_bt_controller_deinit(), and the second is only valid from the
+        // INITED state - deinit on a controller that is still ENABLED is
+        // outside the state machine. `ble_init` ends with
+        // btdm_controller_enable, so without this the controller is still
+        // enabled here and the deinit does not bring it down.
+        //
+        // Measured on the Wio-S3: dropping BleConnector left the board at
+        // 130 mA rather than the 55 the teardown was for.
+        fn btdm_controller_disable();
     }
 
     unsafe {
+        btdm_controller_disable();
         btdm_controller_deinit();
     }
     // Disabling the PHY happens automatically, when the BLEController gets dropped.
