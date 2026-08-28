@@ -176,6 +176,20 @@ impl<'d> Gps<'d> {
                     self.rx_sentences = self.rx_sentences.saturating_add(1);
                     self.fold(sentence);
                     self.updated = true;
+                    // A receiver that talks is not in backup, whatever this
+                    // driver last believed. A timed `sleep_for` ends on the
+                    // module's own timer with nothing to tell the host, so
+                    // without this the flags stay stale forever: `sleeping`
+                    // gates the config retry, so the module would run its
+                    // factory defaults - every NMEA sentence enabled, the
+                    // wrong constellations, the wrong rate - while the
+                    // firmware reported the settings it asked for and never
+                    // got. Clearing `configured` is what sends the retry
+                    // back out.
+                    if self.sleeping {
+                        self.sleeping = false;
+                        self.configured = false;
+                    }
                 }
                 self.in_line = false;
                 self.len = 0;

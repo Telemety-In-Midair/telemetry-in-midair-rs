@@ -1310,6 +1310,9 @@ async fn hardware_task(
     let mut next_pos = boot;
     let mut next_gps_cfg = boot;
     let mut gps_cfg_tries: u8 = 0;
+    // Last seen backup state, so a receiver that wakes on its own timer is
+    // noticed. `sleep_for` ends with nothing sent to the host.
+    let mut gps_was_sleeping = gps.sleeping;
     let mut gps_nmea_seen = false;
     let mut gps_checked = false;
     let gps_grace_until = boot.wrapping_add(5_000);
@@ -1335,6 +1338,9 @@ async fn hardware_task(
                     // is talking.
                     gps_cfg_tries = 0;
                     next_gps_cfg = now;
+                    // Already accounted for; keep the self-wake detector
+                    // below from reporting this one a second time.
+                    gps_was_sleeping = false;
                     status_println!("gps: woken");
                 }
                 Request::RadioStandby(true) => {
@@ -1394,6 +1400,17 @@ async fn hardware_task(
 
         // ---- GPS ---------------------------------------------------------
         gps.poll();
+        // A timed backup ends on the module's own clock, so the only signal
+        // is that sentences started again - the driver clears its own flag
+        // on the first one. Re-arm the config retry here, because the
+        // settings do not survive backup and the budget may already be
+        // spent from an earlier attempt.
+        if gps_was_sleeping && !gps.sleeping {
+            gps_cfg_tries = 0;
+            next_gps_cfg = now;
+            status_println!("gps: woke itself from backup, reconfiguring");
+        }
+        gps_was_sleeping = gps.sleeping;
         let fix = gps.has_fix();
         if fix != had_fix {
             had_fix = fix;
