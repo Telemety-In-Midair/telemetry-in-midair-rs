@@ -615,8 +615,25 @@ Measured with `adv-window` at its 15 s default:
 
 | Phase | Reading |
 |-|-|
-| Advertising window open | ~130 mA |
-| BLE down | **60 mA** |
+| Advertising window open | ~126-130 mA |
+| BLE down | **60 mA**, spiking to ~100 |
+
+**A note on the meter, because it cost a round of wrong readings.** A
+supply that averages heavily turns this board into nonsense: the same
+firmware read "150 mA for 40 s then 50 mA" on one and a clean 60 with
+spikes on another. Every steady-state figure in this document survives
+that - a plateau averages to itself - but nothing about a *transition*
+should be read off a slow instrument. The duty cycle alternates on a 45 s
+period and a supply that smooths over tens of seconds will show neither
+phase.
+
+**The spikes are the LoRa beacon and they are expected.** One 288 ms
+transmit at 22 dBm per ~30 s: 127 mA for 1% of the time, which is ~1.3 mA
+averaged and invisible in any steady figure. Seeing them at all is a sign
+the instrument is fast enough to trust. What should *also* be visible is
+the advertising window as a ~15 s plateau near 126 mA - if the board sits
+at 60 continuously with only beacon spikes, BLE is not coming back up and
+that is a fault, not a saving.
 
 The average is whatever the two settings make it, and it asymptotes to the
 dark figure rather than to zero:
