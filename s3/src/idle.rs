@@ -64,9 +64,15 @@ pub fn entries() -> u64 {
 ///
 /// **Above zero means the core is reaching `waiti` and halting**, which is
 /// the question worth answering; zero means something is polling instead of
-/// awaiting and the core never stops. The rate itself is a coarse read on
-/// what is doing the waking - in the same order as the 100 Hz hardware loop
-/// is expected, far above it means a driver spinning on a status register.
+/// awaiting and the core never stops.
+///
+/// A *lower* rate is not worse - it is longer halts. Measured on this
+/// board: ~120 Hz while advertising, ~99 Hz through the 100 Hz poll loop,
+/// and ~29 Hz in the first window after the BLE controller goes down,
+/// which is its interrupt load disappearing and the core staying halted
+/// longer per entry. What would be wrong is zero, or a rate far above the
+/// loop, which is a driver spinning on a status register rather than
+/// awaiting its interrupt.
 ///
 /// This is deliberately not a percentage. Getting a halted *fraction* would
 /// need the exit time, and the discarded idle context means the exit is not

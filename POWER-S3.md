@@ -641,9 +641,19 @@ item below.
 
 Two open items in that 60:
 
-- **~30 mA of it is the free-running MAX-M10**, which no firmware gates on
-  this board. `power_mode = psmct` is the config-only reduction and is
-  still untried; a load switch is the real fix and belongs on the respin.
+- **The MAX-M10 can be parked after all.** A timed UBX-RXM-PMREQ backup
+  (20 s, `--features iso-gps-backup`) put the receiver down and it came
+  back **on its own timer** - no UART traffic from this firmware, which
+  gates its config retry on `gps.sleeping`. So the backup domain survives
+  on `VCC` here despite V_BCKP going nowhere, and finding 2's assumption
+  that this was blocked is wrong. GPS duty-cycling is available, on the
+  same shape as the BLE one.
+
+  Not shown by that test: whether the BBR keeps the ephemeris across a
+  backup. This board has never held a fix, so warm-vs-cold start was not
+  observable and TTFF after backup is still unknown - which is the whole
+  question for a tracker. `power_mode = psmct` remains the config-only
+  alternative and is still untried.
 - **~5 mA was teardown residue, and it is now sourced rather than
   suspected.** `esp_radio::init` clears `wifi_force_pd`; that field appears
   exactly once in the published crate and is never set again, and

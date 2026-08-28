@@ -1430,7 +1430,11 @@ async fn hardware_task(
                 status_println!("gps: settings still not accepted, giving up");
             }
         }
-        if !gps_checked && due(now, gps_grace_until) {
+        // Not while the receiver is in a backup this firmware asked for:
+        // silence is the request working, and reporting it as a wiring or
+        // baud fault sends whoever is measuring the GPS off after a bug
+        // that is not there.
+        if !gps_checked && !gps.sleeping && due(now, gps_grace_until) {
             gps_checked = true;
             if !gps.present() {
                 if gps.rx_bytes() == 0 {
