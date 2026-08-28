@@ -65,10 +65,18 @@ def set_key(text: str, key: str, value: str) -> tuple[str, bool]:
     of the value being replaced is kept, which keeps a string value quoted
     for editors that read the file as real TOML (the firmware's own parser
     accepts it either way).
+
+    A key that is commented out is uncommented in place rather than appended
+    a second time. The reference file ships several keys that way - the RF
+    path ones, and all three under [power] - so without this, setting one of
+    them would leave the file carrying both the comment and a stray copy at
+    the end, and would warn that a real key was not in the file. Prose in the
+    header cannot be hit by accident: a comment line only matches when what
+    precedes its '=' is exactly the key.
     """
     lines = text.splitlines()
     for i, line in enumerate(lines):
-        if line.split("=", 1)[0].strip() != key:
+        if line.split("=", 1)[0].strip().lstrip("#").strip() != key:
             continue
         old = line.split("=", 1)[1].strip()
         quoted = len(old) >= 2 and old[0] == old[-1] and old[0] in "\"'"

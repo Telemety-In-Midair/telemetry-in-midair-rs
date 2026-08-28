@@ -32,6 +32,7 @@
 //! interval_s = 10           # position broadcast period
 //! ```
 
+use crate::ble;
 use crate::lora;
 
 /// Which halves of the air interface a node uses.
@@ -325,6 +326,36 @@ impl Default for GpsConfig {
     }
 }
 
+/// The duty cycle: how long the board is reachable, and how long it is not.
+///
+/// These are the only settings in this file that the board also keeps a copy
+/// of - in RTC RAM, so they survive a deep sleep, and in flash, so they
+/// survive a flat cell (see [`crate::session::Stored`]). An app can change
+/// them live over BLE, which nothing else here can do.
+///
+/// That is why every field is an `Option`. Elsewhere in this file an absent
+/// key means "the default"; here it means "leave the board's current value
+/// alone", so that pushing an unrelated radio change does not silently undo a
+/// duty cycle somebody set from the app. A key that *is* present wins at the
+/// next boot, because the file is what survives a reflash and the RTC copy is
+/// not.
+///
+/// The ranges are the ones [`crate::ble`] clamps a live write to, but a file
+/// is edited by hand and read once, so an out-of-range value is reported as
+/// [`ConfigError::OutOfRange`] rather than quietly clamped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PowerConfig {
+    /// Seconds the BLE controller stays powered down between advertising
+    /// windows; 0 never takes it down. This is the largest lever the
+    /// firmware has - the controller is most of the board's current and its
+    /// lifetime is the only thing that changes it.
+    pub ble_off_s: Option<u32>,
+    /// Seconds each advertising window lasts; 0 means the firmware default.
+    pub adv_window_s: Option<u32>,
+    /// Seconds between deep-sleep wake checks; 0 never deep-sleeps.
+    pub sleep_interval_s: Option<u32>,
+}
+
 /// Parsed and validated radio configuration.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RadioConfig {
@@ -439,6 +470,8 @@ pub struct RadioConfig {
     pub tcxo_startup_ms: u16,
     /// GPS receiver configuration.
     pub gps: GpsConfig,
+    /// Duty cycle, i.e. how much of the time the board is reachable.
+    pub power: PowerConfig,
 }
 
 impl Default for RadioConfig {
@@ -504,6 +537,9 @@ impl Default for RadioConfig {
             tcxo_volts: TcxoVolts::V3_3,
             tcxo_startup_ms: 10,
             gps: GpsConfig::default(),
+            // All-absent: a file that says nothing about the duty cycle
+            // leaves whatever the board is running untouched.
+            power: PowerConfig::default(),
         }
     }
 }
@@ -752,6 +788,12 @@ impl RadioConfig {
                 meas_rate_ms: u16at(24),
                 dyn_model: DynModel::from_dynmodel(b[26])?,
             },
+            // Not carried in the blob, and it would be the wrong place for
+            // it: this reports the radio config the board parsed, while the
+            // duty cycle the board is actually running is reported live on
+            // the settings characteristic ([`crate::ble::Settings`]). Two
+            // read-backs of the same three numbers could disagree.
+            power: PowerConfig::default(),
         })
     }
 }
@@ -958,6 +1000,36 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                     "airborne4g" => DynModel::Airborne4g,
                     _ => return Err(ConfigError::BadValue(lineno)),
                 };
+            }
+            // -- [power] ----------------------------------------------------
+            // Each of these is stored as `Some` even when the value equals
+            // the firmware default, because what the board does with them
+            // turns on whether the key was written at all, not on what it
+            // says. See [`PowerConfig`].
+            "ble_off_s" => {
+                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
+                if v != 0 && !(ble::BLE_OFF_MIN_S as u64..=ble::BLE_OFF_MAX_S as u64).contains(&v) {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+                cfg.power.ble_off_s = Some(v as u32);
+            }
+            "adv_window_s" => {
+                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
+                // 0 is legal and means "the firmware default", which is why
+                // the floor is not `ESP_ADV_MIN_S`.
+                if v != 0 && !(ble::ESP_ADV_MIN_S as u64..=ble::ESP_ADV_MAX_S as u64).contains(&v) {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+                cfg.power.adv_window_s = Some(v as u32);
+            }
+            "sleep_interval_s" => {
+                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
+                if v != 0
+                    && !(ble::ESP_SLEEP_MIN_S as u64..=ble::ESP_SLEEP_MAX_S as u64).contains(&v)
+                {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+                cfg.power.sleep_interval_s = Some(v as u32);
             }
             _ => {} // unknown key: ignore
         }
@@ -1457,6 +1529,9 @@ mod tests {
                 meas_rate_ms: 500,
                 dyn_model: DynModel::Airborne4g,
             },
+            // Left at the default: the blob does not carry the duty cycle,
+            // so a non-default here would fail the round trip by design.
+            power: PowerConfig::default(),
         };
         let bytes = cfg.encode();
         assert_eq!(bytes.len(), RADIO_CONFIG_LEN);
@@ -1547,4 +1622,50 @@ mod tests {
             assert_eq!(parse(&toml).unwrap().gps.dyn_model, dm);
         }
     }
+    /// An absent `[power]` section must leave every field `None`, because
+    /// `None` is what the firmware reads as "do not touch the board's live
+    /// duty cycle". A default that was `Some(0)` would make every config
+    /// push silently disable the BLE off period.
+    #[test]
+    fn a_file_with_no_power_section_asks_for_nothing() {
+        let cfg = parse("frequency_hz = 915000000").unwrap();
+        assert_eq!(cfg.power, PowerConfig::default());
+        assert_eq!(cfg.power.ble_off_s, None);
+    }
+
+    /// A zero is a value, not an absence: writing `ble_off_s = 0` is how a
+    /// file says "keep BLE up", and it has to override a board that was left
+    /// duty-cycling.
+    #[test]
+    fn an_explicit_zero_is_still_a_request() {
+        let cfg = parse("ble_off_s = 0\nsleep_interval_s = 0\nadv_window_s = 0").unwrap();
+        assert_eq!(cfg.power.ble_off_s, Some(0));
+        assert_eq!(cfg.power.sleep_interval_s, Some(0));
+        assert_eq!(cfg.power.adv_window_s, Some(0));
+    }
+
+    #[test]
+    fn power_values_parse_and_range_check() {
+        let cfg = parse("[power]\nble_off_s = 30\nadv_window_s = 10\nsleep_interval_s = 120")
+            .unwrap();
+        assert_eq!(cfg.power.ble_off_s, Some(30));
+        assert_eq!(cfg.power.adv_window_s, Some(10));
+        assert_eq!(cfg.power.sleep_interval_s, Some(120));
+
+        // Below the floor but not zero, and above the ceiling, on each key.
+        for bad in [
+            "ble_off_s = 1",
+            "ble_off_s = 301",
+            "adv_window_s = 61",
+            "sleep_interval_s = 1",
+            "sleep_interval_s = 301",
+        ] {
+            assert_eq!(
+                parse(bad),
+                Err(ConfigError::OutOfRange(1)),
+                "{bad} should have been rejected"
+            );
+        }
+    }
 }
+

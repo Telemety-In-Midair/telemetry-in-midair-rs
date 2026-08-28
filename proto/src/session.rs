@@ -131,6 +131,32 @@ impl Stored {
         }
     }
 
+    /// Fold a config file's `[power]` section into these settings, and say
+    /// whether that changed anything.
+    ///
+    /// Only the keys the file actually carried are applied - an absent one
+    /// leaves the board's live value alone, which is the whole reason
+    /// [`crate::radiocfg::PowerConfig`] is optional field by field. The
+    /// parser has already range-checked whatever is present, so there is
+    /// nothing to clamp here.
+    ///
+    /// The return value is what decides whether the caller pays for a flash
+    /// write: a board that reads the same card on every boot would otherwise
+    /// rewrite the same record forever.
+    pub fn adopt_power(&mut self, p: &crate::radiocfg::PowerConfig) -> bool {
+        let before = *self;
+        if let Some(s) = p.ble_off_s {
+            self.ble_off_s = s;
+        }
+        if let Some(s) = p.adv_window_s {
+            self.adv_window_s = s;
+        }
+        if let Some(s) = p.sleep_interval_s {
+            self.sleep_interval_s = s;
+        }
+        *self != before
+    }
+
     /// Encode the flash record. Erased-flash bytes past the end are none of
     /// this function's business; the crc covers what it wrote.
     pub fn encode_record(&self) -> [u8; RECORD_LEN] {
@@ -1128,5 +1154,52 @@ mod tests {
                 "asked {asked}, cadence {cadence}"
             );
         }
+    }
+
+    /// The file only speaks about what it mentions. A push that changes the
+    /// beacon interval must not reset a duty cycle set from the app, and the
+    /// no-change return is what keeps a board from rewriting the same flash
+    /// record on every boot.
+    #[test]
+    fn an_absent_power_key_leaves_the_live_value_alone() {
+        let mut stored = Stored {
+            sleep_interval_s: 60,
+            flags: 0,
+            adv_window_s: 10,
+            ble_off_s: 45,
+        };
+        let before = stored;
+
+        assert!(!stored.adopt_power(&crate::radiocfg::PowerConfig::default()));
+        assert_eq!(stored, before);
+
+        // One key present changes that key and nothing else.
+        let p = crate::radiocfg::PowerConfig {
+            ble_off_s: Some(30),
+            ..Default::default()
+        };
+        assert!(stored.adopt_power(&p));
+        assert_eq!(stored.ble_off_s, 30);
+        assert_eq!(stored.sleep_interval_s, 60);
+        assert_eq!(stored.adv_window_s, 10);
+
+        // Adopting the same file again is a no-op, so no flash write.
+        assert!(!stored.adopt_power(&p));
+    }
+
+    /// A file that explicitly asks for zero turns the duty cycle off, rather
+    /// than reading as "unset" - the distinction the `Option` exists for.
+    #[test]
+    fn an_explicit_zero_turns_the_duty_cycle_off() {
+        let mut stored = Stored {
+            ble_off_s: 45,
+            ..Stored::new()
+        };
+        let p = crate::radiocfg::PowerConfig {
+            ble_off_s: Some(0),
+            ..Default::default()
+        };
+        assert!(stored.adopt_power(&p));
+        assert_eq!(stored.ble_off_s, 0);
     }
 }

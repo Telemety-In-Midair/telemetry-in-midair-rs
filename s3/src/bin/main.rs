@@ -446,7 +446,7 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     spawner
-        .spawn(hardware_task(lora, gps, sdlog, j5, d5, d2))
+        .spawn(hardware_task(lora, gps, sdlog, j5, d5, d2, !woke_from_sleep))
         .expect("spawn hardware task");
     }
 
@@ -1188,6 +1188,7 @@ async fn hardware_task(
     mut j5: Option<J5>,
     d5: Output<'static>,
     d2: Output<'static>,
+    cold: bool,
 ) {
     let mut rx_led = Blinker::new(d5);
     let mut tx_led = Blinker::new(d2);
@@ -1232,6 +1233,7 @@ async fn hardware_task(
     state::set_verbose(cfg.verbose);
     state::set_radio_config(cfg.encode());
     state::set_tx_worst_case_ms(cfg.tx_poll_timeout_ms());
+    adopt_power(&cfg, cold).await;
 
     let mut node = Node::new(lora, &cfg);
     node.radio_mut().init(&cfg).await;
@@ -1757,6 +1759,47 @@ fn draw_screen(
     oled::render_compass(oled, &target, heading, fix, sats);
 }
 
+/// Let a config file set the duty cycle.
+///
+/// `cold` gates this to a cold boot, and the distinction is the whole
+/// design. The three settings in `[power]` are also kept in RTC RAM so they
+/// survive a deep sleep, and an app can change them live over BLE - so
+/// re-reading the card on every wake check would undo a live change once an
+/// interval, forever. On a cold boot there is nothing live to undo and the
+/// card is the only thing that outlives a reflash, so it wins.
+///
+/// A file that mentions none of the three changes nothing and costs no
+/// flash write, which is the common case.
+///
+/// One thing this cannot catch up with: the advertising window of the very
+/// first window is fixed before the card is mounted, so a `adv_window_s`
+/// from the file takes effect from the second window on. `ble_off_s` is
+/// re-read at the end of every window and has no such lag.
+async fn adopt_power(cfg: &RadioConfig, cold: bool) {
+    let asked = cfg.power;
+    if !cold {
+        if asked != Default::default() {
+            qprintln!("config: [power] ignored on a wake, the live settings win");
+        }
+        return;
+    }
+    if !settings::adopt_power(&asked) {
+        return;
+    }
+    let now = settings::get();
+    status_println!(
+        "config: [power] adopted - ble off {} s, adv window {} s, sleep interval {} s",
+        now.ble_off_s,
+        now.adv_window(),
+        now.sleep_interval_s
+    );
+    // Mirrored to flash for the same reason a BLE write to any of these is:
+    // they decide whether the board is reachable at all, and a board that
+    // came back from a flat cell without them would advertise continuously
+    // until it died again.
+    settings::save().await;
+}
+
 /// Adopt a radio config that arrived over BLE or USB.
 ///
 /// The transfer already parsed it - a config that would not parse never
@@ -1776,6 +1819,10 @@ async fn apply_radio_config(
     };
     let regps = new_cfg.gps != cfg.gps;
     *cfg = new_cfg;
+    // Unlike at boot this is unconditional: a push is somebody deliberately
+    // sending this file now, so it outranks whatever is live. It is also the
+    // only way `[power]` reaches a board that is already running.
+    adopt_power(cfg, true).await;
     node.radio_mut().init(cfg).await;
     node.reconfigure(cfg);
     state::set_verbose(cfg.verbose);

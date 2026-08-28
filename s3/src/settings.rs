@@ -71,6 +71,22 @@ pub fn set(s: Stored) {
     MAGIC_WORD.store(MAGIC, Ordering::Relaxed);
 }
 
+/// Adopt the `[power]` section of a config file, returning whether anything
+/// changed. The policy - which keys apply and which are absent - is
+/// [`Stored::adopt_power`], so it is host-tested rather than decided here.
+///
+/// The caller decides *when* this is allowed to run, and the answer is a
+/// cold boot only. On a deep-sleep wake the RTC copy may hold a duty cycle
+/// an app set live, and re-reading the card would undo it every interval.
+pub fn adopt_power(p: &midair_proto::radiocfg::PowerConfig) -> bool {
+    let mut stored = get();
+    if !stored.adopt_power(p) {
+        return false;
+    }
+    set(stored);
+    true
+}
+
 /// Note the sleep that is about to happen, so the wake on the far side can
 /// report it. Called immediately before `sleep_deep`.
 pub fn note_sleep(interval_s: u32) {
