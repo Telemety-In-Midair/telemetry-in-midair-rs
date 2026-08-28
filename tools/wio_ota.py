@@ -3,7 +3,7 @@
 
     pixi run wio-ota
 
-With no arguments this builds the firmware in ../s3, converts it to an
+With no arguments this builds the firmware in ../firmware, converts it to an
 ESP-IDF application image, and streams it into whichever OTA slot the board
 is not running from. The board verifies the CRC, points the bootloader at
 the new slot and reboots into it.
@@ -37,10 +37,10 @@ from pathlib import Path
 
 import wio_link as link
 
-S3 = link.ROOT / "s3"
-ELF = S3 / "target" / "xtensa-esp32s3-none-elf" / "release" / "wio-s3-gps"
+FIRMWARE = link.ROOT / "firmware"
+ELF = FIRMWARE / "target" / "xtensa-esp32s3-none-elf" / "release" / "wio-s3-gps"
 
-# An OTA slot on this board's partition table (see s3/partitions.csv). The
+# An OTA slot on this board's partition table (see firmware/partitions.csv). The
 # firmware refuses an image larger than the slot at OP_BEGIN; checking here
 # too means a mistake costs a message rather than a whole upload.
 SLOT_MAX = 0x3F0000
@@ -51,8 +51,8 @@ def build_image(out: Path) -> Path:
     for tool in ("cargo", "espflash"):
         if shutil.which(tool) is None:
             sys.exit(f"{tool} not found on PATH; build the image yourself and pass --image")
-    print(f"building {S3}")
-    subprocess.run(["cargo", "build", "--release"], cwd=S3, check=True)
+    print(f"building {FIRMWARE}")
+    subprocess.run(["cargo", "build", "--release"], cwd=FIRMWARE, check=True)
     if not ELF.is_file():
         sys.exit(f"expected {ELF} after the build, but it is not there")
     print("converting to an application image")
@@ -76,7 +76,7 @@ def main() -> int:
     ap.add_argument(
         "--image",
         type=Path,
-        help="application image to send (default: build one from ../s3)",
+        help="application image to send (default: build one from ../firmware)",
     )
     ap.add_argument("--port", help="serial port (auto-detected if omitted)")
     ap.add_argument(
@@ -122,7 +122,7 @@ def main() -> int:
             ser, link.KIND_OTA, data, version=0,
             hint="\nA board flashed with a single-app partition table has no "
                  "second slot to write into, and says so at begin. Reflash it "
-                 "over USB once (cargo run --release in s3/) to move it onto "
+                 "over USB once (cargo run --release in firmware/) to move it onto "
                  "the two-slot table.",
         )
     except (TimeoutError, RuntimeError) as e:

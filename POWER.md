@@ -4,8 +4,10 @@ Every knob that changes what the Wio-S3 draws, what it costs, and where it
 is set. All of them live in `RADIO.CFG` - the TOML file in the root of the
 SD card, documented key by key in `RADIO.example.toml`.
 
-This is the reference. `POWER-S3.md` is the investigation behind the
+This is the reference. `docs/POWER-S3.md` is the investigation behind the
 numbers: how they were measured, and what was ruled out.
+`docs/POWER-AUDIT.md` reads that investigation critically and lists the
+levers it left unpulled, in the order they are worth pulling.
 
 ## The budget these settings act on
 
@@ -206,7 +208,7 @@ cold boot.
 ## What is not configurable, and why
 
 - **CPU clock.** Pinned at 80 MHz, the documented floor for the radio, in
-  `s3/src/bin/main.rs`. It cannot come from the file: the clock is
+  `firmware/src/bin/main.rs`. It cannot come from the file: the clock is
   configured before the SPI bus that reads the card exists. Worth ~10-15 mA
   against 160 MHz, which is already taken.
 - **BLE modem sleep.** Would save ~60 mA whether or not a phone is

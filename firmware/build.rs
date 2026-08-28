@@ -47,7 +47,7 @@ fn emit_ble_address() {
     println!("cargo:rustc-env=BLE_ADDRESS={normalized}");
 }
 
-// The esp32c6-gps crate also installed a `--error-handling-script` here to
-// translate undefined-symbol errors into the missing dependency they
+// The retired ESP32-C6 firmware also installed a `--error-handling-script`
+// here, to translate undefined-symbol errors into the missing dependency they
 // usually mean. That is an lld flag, and this target links through
 // xtensa-esp32s3-elf-gcc, which rejects it outright.

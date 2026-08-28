@@ -1,3 +1,7 @@
+# TODO
+
+Done items move to `TODO_complete.md`.
+
 ## Before the beacon transmits
 
 Everything below is written and builds; almost none of it has been run.
@@ -25,10 +29,18 @@ Keep a USB cable on the first one.
 
 ## Bench work
 
-Measure power. The numbers in `README.md` are the old board's, kept only as
-a baseline to beat. Deep sleep is worth measuring first: the radio is
-parked before the board sleeps, but the MAX-M10 keeps acquiring, and the
-whole question is how much the 9.3 uA module matters beside it.
+Work the power list in `docs/POWER-AUDIT.md`, which is ordered by what it
+is worth. The board is measured - ~126 mA awake, a 60 mA floor with BLE
+dark - so the open items are levers, not unknowns. The first three are
+clearing `BT_STATE` in `ble_init`, restoring the Wi-Fi clock and power-down
+bits after the BLE connector drops, and running `--features iso-gps-backup`
+to get the one reading the investigation never took.
+
+Soak the BLE duty cycle. `esp_radio::init` and `BleConnector::new` now run
+once per window rather than once at boot, thousands of times a day at a
+45 s cycle, and both are `expect`s on a heap that the controller allocates
+from every cycle. Leave a board running overnight with `ble-off 30` and
+check the wake counter and the free heap.
 
 Check whether an OTA over BLE survives its own flash writes. Each sector
 takes tens of milliseconds with interrupts off, which should cost a
@@ -82,32 +94,36 @@ Will a sleeping board ever be connected to if an awake board is nearby?
 
 The `PMode::Boost` value: the WIO-E5 build wrote 0x97 to the RX gain
 register, which its HAL documented as best sensitivity, but Semtech's
-datasheet documents only 0x94 and 0x96. The s3 port writes the register
+datasheet documents only 0x94 and 0x96. The S3 port writes the register
 directly and uses the documented 0x96. With the WIO firmware gone there is
 no longer an A/B to run, so this is settled unless RM0453 says otherwise.
 
-## Done
+## Board changes
 
-Port parity with the two-MCU pair. The bulk transfer handler and the USB
-console `wio-config` needs; deep sleep with settings in RTC RAM and an nvs
-mirror; the remote-node roster replay on connect; OTA through the ESP-IDF
-bootloader's two slots; per-board BLE addresses from the eFuse MAC with a
-`BLE_ADDRESS` build override.
+These need a respin, not a flash.
 
-The beacon itself, which the port never had: a position on the configured
-interval, a ping while there is no fix, `(src, id)` dedup, jittered
-repeating, and the radio re-checked before it keys up.
+Smaller?
+Probably need to drop a module.
 
-`RADIO.CFG` read from the card at boot and honored, rather than compiled-in
-defaults with the file sitting unread.
+Software toggle shunt? Or charging IC that handles all of this.
 
-Antenna for BLE - the module brings the Wi-Fi/BT RF port out on its own
-connector. Note the board as drawn routes it to test point BLE1 and stops
-there, so a 2.4 GHz antenna is still a board change.
+Battery bypass LDO? (Just esp?) USB must not.
 
-Swap to Wio-S3. Done; `wio/` and `esp/` are deleted.
+Add power switch? 
 
-Try a slow preset now that nothing caps the listen window - defaults are
-SF12/BW500.
+Add current monitor? (INA219/226?)
 
-Reduce packet size: payloads go out at their true length.
+Add an LP-GPIO wake button so a deep sleep can be interrupted. Deep sleep
+is timer-only, so the 5 min clamp on 0x13 is the only thing keeping the
+board reachable.
+
+Route the module's Wi-Fi/BT RF port to an antenna. It reaches test point
+BLE1 and stops there on the board as drawn, so the 2.4 GHz side has no
+antenna despite the module bringing the port out.
+
+Battery sense divider. There is none, so telemetry cannot report cell
+voltage without a board change.
+
+Route GPS EXTINT to the MCU, and TIMEPULSE for PPS discipline. Neither is
+connected today; backup mode still wakes on UART traffic, but PPS is simply
+unavailable.

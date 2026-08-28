@@ -9,15 +9,16 @@ intent and `ARCHITECTURE.md` for the UML views.
 This replaced a two-MCU board (ESP32-C6 for BLE and power, WIO-E5 for
 GPS/LoRa/SD, a framed UART link between them). That firmware is gone from
 the tree as of the single-module cleanup; `git log` still has it, and
-`PORT-WIO-S3.md` records what the merge deleted and why.
+`docs/PORT-WIO-S3.md` records what the merge deleted and why.
 
 ## Layout
 
 | Directory | What | Target |
 |-|-|-|
 | `proto/` | Shared no_std protocol crate: LoRa payloads, BLE extensions, `RADIO.CFG` parser, USB bulk framing. Host-testable (`cargo test`). | any |
-| `s3/` | Wio-S3 firmware (embassy + trouble BLE): radio, GPS, SD and the GATT service. | `xtensa-esp32s3-none-elf` (`esp` channel) |
+| `firmware/` | Wio-S3 firmware (embassy + trouble BLE): radio, GPS, SD and the GATT service. | `xtensa-esp32s3-none-elf` (`esp` channel) |
 | `tools/` | Host tools (Python/pixi): push a radio config, push a firmware image, read a board's BLE address. | host |
+| `docs/` | Deep dives and history: the power investigation and its audit, the port record, the module datasheet, the V1 board's issues. | - |
 
 Depends on the sibling repo `../gps-proto` for the BLE position protocol
 and NMEA parsing (shared with `../esp32c3-gps` and `../gps-gui-rs`).
@@ -35,14 +36,14 @@ espup install
 cd proto && cargo test
 
 # firmware: builds, flashes over USB Serial/JTAG, and stays on the console
-cd s3 && cargo run --release
+cd firmware && cargo run --release
 ```
 
 The console is on the USB Serial/JTAG port (GPIO19/20 to the USB-C
 connector), not UART0 - GPIO43 is UART0_TX on this board and drives the D5
 LED, so expect the ROM bootloader's own log to flicker it on every reset.
 
-`cargo run` flashes through `s3/partitions.csv`, which has two application
+`cargo run` flashes through `firmware/partitions.csv`, which has two application
 slots rather than one factory app - that is what OTA needs somewhere to
 write. It also erases `otadata` on every flash, so the image just written is
 the one that boots; without that, a board that had taken an over-the-air
@@ -54,7 +55,7 @@ from its eFuse MAC:
 
 ```sh
 cd tools && pixi run gen-ble-address        # prints e.g. FF:C6:A1:53:50:47
-cd ../s3 && BLE_ADDRESS=FF:C6:A1:53:50:47 cargo run --release
+cd ../firmware && BLE_ADDRESS=FF:C6:A1:53:50:47 cargo run --release
 ```
 
 `build.rs` rejects anything that is not a static-random address, so a bad
@@ -579,7 +580,7 @@ a longer name is not a missing file but one that can never be opened.
 ## Firmware update
 
 ```sh
-cd tools && pixi run wio-ota          # builds ../s3 and pushes the image
+cd tools && pixi run wio-ota          # builds ../firmware and pushes the image
 pixi run wio-ota --image firmware.bin # or send one you already have
 ```
 
@@ -704,27 +705,29 @@ moves the JTAG source; both are survivable.
 Adjustable current. 500 mA @ 2k ohm programming resistor.
 
 
-## Inital power testing 
+## Power
 
-**Measured on the two-MCU board.** Kept as a baseline to beat, not as a
-description of this one - the single module should come in well under
-these, and nothing has been measured on it yet.
+`POWER.md` is the reference: every setting that changes what the board
+draws, what it costs, and where it is set. `docs/POWER-S3.md` is the
+investigation behind those numbers and `docs/POWER-AUDIT.md` is a critical
+read of it.
 
-Everything running (BLE connected, Satalite fix, SD logging)
-`75 mA`
-Everything running no SD (BLE connected, Satalite fix, pulse on LoRa TX)
-`66 mA`
+The short version. Awake, BLE advertising, GPS tracking, LoRa listening and
+nothing transmitting, the board measures **~126 mA at the 4.2 V input**. The
+BLE controller is 71 mA of that and the MAX-M10 is most of what is left, so
+`ble_off_s` and the GPS `power_mode` are the two settings that matter. The
+regulator is an LDO, so that current passes straight through from the cell.
 
-Fully running (BLE connected, Satalite fix, pulse on LoRa TX, SD logging)
-`120 mA`
-
-ESP only BLE connected
-`46 mA`
+The two-MCU board this one replaced measured 66 mA in the same scenario.
+Roughly 50 mA of the gap is the part swap - an S3's BLE radio costs about
+twice a C6's for the same job - and roughly 20 mA is a hardware feature the
+old board had and this one does not: a GPIO under the GPS and LoRa rail.
 
 For reference, the Wio-S3 datasheet quotes 9.3 uA deep sleep, 1.43 mA
 standby, 5.5 mA LoRa RX and 125 mA LoRa TX at 22 dBm. The 5.5 mA RX figure
 is only reachable with the SX1262's DC-DC, which is how we know the module
 carries the SMPS inductor and why `dcdc_enabled` defaults on.
 
-GPS Board v1
-![GPS Board v1 diagram](./images/GPSv1.svg)
+## GPS board v1
+
+![GPS Board v1](images/GPSv1.svg)

@@ -2,11 +2,11 @@
 """Generate a random BLE static-random address.
 
 Prints an address in the display format the firmware uses (most-significant
-octet first), ready for the BLE_ADDRESS build env var that s3/build.rs
+octet first), ready for the BLE_ADDRESS build env var that firmware/build.rs
 validates:
 
   pixi run gen-ble-address
-  cd ../s3 && BLE_ADDRESS=FF:C6:A1:53:50:47 cargo run --release
+  cd ../firmware && BLE_ADDRESS=FF:C6:A1:53:50:47 cargo run --release
 
 Only needed to pin a board to a fixed address. Left unset, each board
 derives its own from its eFuse MAC, so two boards are already distinct out

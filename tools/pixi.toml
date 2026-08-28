@@ -24,7 +24,7 @@ wio-config = "python wio_config.py"
 # from, with no reflash and no BOOT button:
 #   pixi run wio-ota
 #   pixi run wio-ota --image firmware.bin
-# With no --image it builds ../s3 and converts the ELF itself.
+# With no --image it builds ../firmware and converts the ELF itself.
 wio-ota = "python wio_ota.py"
 
 # Read the board's protocol version and BLE address:
@@ -52,7 +52,7 @@ wio-sleep = "python wio_sleep.py"
 # firmware expects:
 #   pixi run gen-ble-address
 #
-# Only needed to pin a board to a fixed address - `s3/build.rs` validates
+# Only needed to pin a board to a fixed address - `firmware/build.rs` validates
 # BLE_ADDRESS and the firmware otherwise derives one per chip from the eFuse
 # MAC, so boards are already distinct without it.
 gen-ble-address = "python gen_ble_address.py"

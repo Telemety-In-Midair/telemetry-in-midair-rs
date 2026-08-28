@@ -1,6 +1,6 @@
 # The ESP32-S3 is Xtensa, not RISC-V, so this crate cannot build on the
-# stable toolchain the esp32c6-gps crate uses. `espup install` provides the
-# `esp` channel and the xtensa-esp32s3-none-elf target.
+# stable toolchain the retired ESP32-C6 firmware used. `espup install` provides
+# the `esp` channel and the xtensa-esp32s3-none-elf target.
 [toolchain]
 channel    = "esp"
 components = ["rust-src"]

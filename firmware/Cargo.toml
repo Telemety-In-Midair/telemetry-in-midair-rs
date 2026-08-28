@@ -33,7 +33,7 @@ iso-no-app = []
 iso-gps-backup = []
 
 [dependencies]
-# Same versions the esp32c6-gps crate runs, retargeted at the S3: the
+# Same versions the retired ESP32-C6 firmware ran, retargeted at the S3: the
 # matched esp-rtos 0.2 / esp-radio 0.17 pair expects esp-hal 1.0.x.
 esp-hal = { version = "~1.0", features = ["esp32s3", "unstable"] }
 

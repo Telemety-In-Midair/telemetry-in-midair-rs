@@ -42,4 +42,4 @@ reached the WIO either over SWD or streamed through the C6 into a DFU
 partition. Roughly a third of that firmware existed only to bridge the
 split - the link, its heartbeat, the ack/retry around every command, the
 `RADIO_BUSY` negotiation, the WIO's soft sleep, and the swap bootloader.
-`PORT-WIO-S3.md` records the merge; `git log` still has the code.
+`docs/PORT-WIO-S3.md` records the merge; `git log` still has the code.
