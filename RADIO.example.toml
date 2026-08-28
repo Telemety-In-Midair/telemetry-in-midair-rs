@@ -166,7 +166,8 @@ dynamic_model_type = "enum:portable,stationary,pedestrian,automotive,sea,airborn
 # a duty cycle off. Live changes made over BLE or `wio-set` last until the
 # next cold boot, where an uncommented key here takes over again.
 #
-# ble_off_s is the large one. See POWER.md.
+# ble_off_s is the large one: the BLE controller is about 71 mA of the
+# board's 126, and ending its lifetime is the only thing that reduces it.
 [power]
 # ble_off_s = 0
 # ble_off_s_description = "Seconds the BLE controller is powered down between advertising windows, 0 or 5-300. This is the biggest single saving the firmware has: the controller is about 71 mA of the board's 126 and nothing but ending its lifetime reduces it, so the board drops to ~60 mA for this long and is unreachable over BLE while it does. LoRa, GPS and logging keep running throughout, so it is still a working tracker. 0 keeps BLE up continuously."
