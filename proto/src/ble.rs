@@ -333,10 +333,10 @@ pub const OP_ABORT: u8 = 0x04;
 
 /// Bulk kind: radio TOML config, applied live and saved to SD.
 pub const KIND_TOML: u8 = 1;
-/// Bulk kind 2 was a WIO-E5 firmware image for its DFU partition, streamed
-/// through the ESP32-C6. The Wio-S3 updates itself through ESP-IDF OTA, so
-/// the kind is retired rather than reused - an old tool pushing an STM32
-/// image at this firmware should be rejected, not misread.
+// Bulk kind 2 was a WIO-E5 firmware image for its DFU partition, streamed
+// through the ESP32-C6. The Wio-S3 updates itself through ESP-IDF OTA, so
+// the kind is retired rather than reused - an old tool pushing an STM32
+// image at this firmware should be rejected, not misread.
 
 /// Bulk kind: an ESP-IDF application image for the inactive OTA slot.
 ///

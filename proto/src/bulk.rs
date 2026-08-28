@@ -737,7 +737,7 @@ mod tests {
         for len in [0usize, 1, 7, 192, 193, 1000] {
             let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             let mut running = 0;
-            for chunk in data.chunks(192.max(1)) {
+            for chunk in data.chunks(192) {
                 running = crc32_continue(running, chunk);
             }
             assert_eq!(running, crc32(&data), "len {len}");

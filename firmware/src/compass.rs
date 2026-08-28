@@ -79,9 +79,9 @@ impl Extremes {
     }
 
     fn feed(&mut self, raw: [i16; 3]) {
-        for i in 0..3 {
-            self.min[i] = self.min[i].min(raw[i]);
-            self.max[i] = self.max[i].max(raw[i]);
+        for (axis, reading) in raw.into_iter().enumerate() {
+            self.min[axis] = self.min[axis].min(reading);
+            self.max[axis] = self.max[axis].max(reading);
         }
         self.seen = true;
     }

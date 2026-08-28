@@ -1592,8 +1592,9 @@ mod tests {
     /// (see [`crate::link::MAX_PAYLOAD`]) and a single BLE read.
     #[test]
     fn radio_config_blob_fits_its_transports() {
-        assert!(RADIO_CONFIG_LEN <= crate::link::MAX_PAYLOAD);
-        assert!(RADIO_CONFIG_LEN <= 244); // conservative ATT_MTU-3 floor
+        const { assert!(RADIO_CONFIG_LEN <= crate::link::MAX_PAYLOAD) };
+        // Conservative ATT_MTU-3 floor.
+        const { assert!(RADIO_CONFIG_LEN <= 244) };
     }
 
     /// Every enum's string form has to parse back to the same variant, since
