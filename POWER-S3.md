@@ -580,10 +580,17 @@ direction. Everything below item 1 is provisional until item 1 is done.
    The
    trouble-host stack is built inside the advertising window and dropped
    when the window closes, so `BleConnector::drop` runs `ble_deinit` and
-   takes the `PhyInitGuard` with it. Off by default; turn it on with
+   takes the `PhyInitGuard` with it. Off by default; turn it on for this
+   session with
 
    ```
    pixi run wio-set ble-off 30
+   ```
+
+   or put it on the card, where it survives a reflash:
+
+   ```
+   cd tools && pixi run wio-config --set ble_off_s=30
    ```
 
    and read the meter across a whole cycle. Expect **~55 mA** through the
@@ -596,9 +603,22 @@ direction. Everything below item 1 is provisional until item 1 is done.
    that it comes back - the console prints `ble down for N s` and
    `ble back up` around the gap, and a phone should find it in the next
    window.
-4. **Push `power_mode = psmct` and measure.** The key already exists
-   (`CFG-PM-OPERATEMODE`, `PowerMode::PsmCyclic`) and defaults to `full`.
-   No code at all.
+4. **Push `power_mode = psmct` and measure, outdoors.** The key already
+   exists (`CFG-PM-OPERATEMODE`, `PowerMode::PsmCyclic`) and defaults to
+   `full`. No code at all:
+
+   ```
+   cd tools && pixi run wio-config --set power_mode=psmct
+   ```
+
+   This has to be done under open sky. Every reading in this document was
+   taken in a basement, which is why the board shows `sats 0` throughout -
+   the receiver is not faulty, it cannot see a satellite. That does not
+   affect the current measurements, since an acquiring receiver draws its
+   full ~30 mA whether or not it succeeds, but it does make the two
+   questions that matter here unanswerable indoors: what `psmct` costs in
+   fix latency, and whether the BBR keeps the ephemeris across a
+   `UBX-RXM-PMREQ` backup. Both need a board that can hold a fix.
 5. **Next board spin: tie V_BCKP to +3V3, and add a load switch under the
    GPS and SX1262.** The old board's 46 mA reading exists because it had
    one. V_BCKP is separately the gate on the whole deep-sleep story
@@ -667,8 +687,8 @@ Two open items in that 60:
   same shape as the BLE one.
 
   Not shown by that test: whether the BBR keeps the ephemeris across a
-  backup. This board has never held a fix, so warm-vs-cold start was not
-  observable and TTFF after backup is still unknown - which is the whole
+  backup. The bench is a basement, so this board has never held a fix,
+  warm-vs-cold start was not observable and TTFF after backup is unknown - which is the whole
   question for a tracker. `power_mode = psmct` remains the config-only
   alternative and is still untried.
 - **~5 mA was teardown residue, and it is now sourced rather than
