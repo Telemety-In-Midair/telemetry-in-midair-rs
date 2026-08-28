@@ -162,7 +162,7 @@ impl Roster {
     }
 
     /// The most recently heard node that reported a position, as
-    /// `(src, packet bytes, age in seconds)`.
+    /// `(src, packet bytes, age in seconds, rssi)`.
     ///
     /// This is what the compass points at. Newest rather than nearest,
     /// deliberately: "nearest" needs a distance to every node on every
@@ -173,7 +173,10 @@ impl Roster {
     ///
     /// Ping-only nodes are skipped - they carry no position, so there is
     /// nothing to point at.
-    pub fn newest_position(&self, now_ms: u64) -> Option<(u8, [u8; packet::POSITION_PACKET_LEN], u16)> {
+    pub fn newest_position(
+        &self,
+        now_ms: u64,
+    ) -> Option<(u8, [u8; packet::POSITION_PACKET_LEN], u16, i16)> {
         let mut pick: Option<(&Slot, u64)> = None;
         for slot in self.slots.iter().flatten() {
             if !matches!(slot.report, Report::Position(_)) {
@@ -194,7 +197,7 @@ impl Roster {
         // Layout is [src, rssi u16, packet]; see `ble::REMOTE_LEN`.
         pkt.copy_from_slice(&b[3..]);
         let age = (now_ms.saturating_sub(at_ms) / 1000).min(ble::AGE_MAX_S as u64) as u16;
-        Some((b[0], pkt, age))
+        Some((b[0], pkt, age, i16::from_le_bytes([b[1], b[2]])))
     }
 
     /// Nodes currently remembered.
@@ -468,7 +471,8 @@ mod tests {
         let mut r = Roster::new();
         r.record(1_000, position(7, -80));
         r.record(2_000, position(9, -95));
-        let (src, pkt, _) = r.newest_position(2_500).expect("a target");
+        let (src, pkt, _, rssi) = r.newest_position(2_500).expect("a target");
+        assert_eq!(rssi, -95, "the rssi of that node's report, not another's");
         assert_eq!(src, 9);
         assert_eq!(i32::from_le_bytes(pkt[0..4].try_into().unwrap()), 9);
 
@@ -503,14 +507,16 @@ mod tests {
         assert!(r.newest_position(1_001 + TTL_MS).is_none(), "past it");
     }
 
-    /// The age comes back with the target, so a display can say how stale
-    /// the bearing it is drawing actually is.
+    /// The age and signal strength come back with the target, so a display
+    /// can say how stale the bearing it is drawing actually is and how well
+    /// the node it points at is being heard.
     #[test]
     fn the_target_carries_its_age() {
         let mut r = Roster::new();
         r.record(1_000, position(2, -60));
         assert_eq!(r.newest_position(1_000).unwrap().2, 0);
         assert_eq!(r.newest_position(46_000).unwrap().2, 45);
+        assert_eq!(r.newest_position(1_000).unwrap().3, -60, "rssi rides along");
     }
 
     #[test]
