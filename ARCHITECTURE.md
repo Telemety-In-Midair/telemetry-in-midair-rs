@@ -452,6 +452,13 @@ deep sleep first, so a board with `sleep_interval_s` set never reaches the
 `ble_off_s` branch at all - the awake duty cycle only exists on a board that
 has deep sleep off.
 
+Read the axis with one caveat. The window, off-period and sleep-interval
+lengths are the config keys and are exact; the beacon spacing is the
+interval without its jitter; and **boot, Park and the session timings are
+illustrative** - no boot or wake time has ever been measured on this board,
+and the connect, transfer and disconnect instants in the third chart are one
+plausible session rather than a recorded one.
+
 ### The awake duty cycle
 
 `adv_window_s = 15`, `ble_off_s = 30`, `sleep_interval_s = 0`. The modem
@@ -474,10 +481,12 @@ gantt
 
     section BLE
     stack built             :milestone, b0, 4, 0s
-    reachable by a phone    :active, b1, 4, 35s
-    stack dropped - 71 mA goes :milestone, b2, 39, 0s
-    reachable by a phone    :active, b3, 69, 15s
-    stack dropped           :milestone, b4, 84, 0s
+    advertising - anyone may connect :active, b1, 4, 5s
+    in session - CONNECTIONS_MAX is 1 :crit, b2, 9, 25s
+    advertising - the phone may return :active, b3, 34, 5s
+    stack dropped - 71 mA goes :milestone, b4, 39, 0s
+    advertising - anyone may connect :active, b5, 69, 15s
+    stack dropped           :milestone, b6, 84, 0s
 
     section LoRa
     continuous RX           :active, r1, 3, 111s
@@ -574,9 +583,18 @@ gantt
 
 The GPS lane running unbroken through both sleeps is the board fact that
 makes deep sleep worth ~30 mA and not less - the MAX-M10 has no rail to cut.
-`Park` is short but not free: it waits for a beacon already in flight, which
-is 289 ms at the defaults and up to 9.7 s at the slowest settings the config
-accepts.
+
+`Park` is drawn a second wide to stay legible and is normally one 10 ms pass
+of the hardware loop. It only becomes long when a beacon is already in
+flight, which it then waits out: 289 ms at the defaults, and up to 9.7 s at
+the slowest settings the config accepts.
+
+The SD lane is drawn stopping at `Park`, and that is worse than it looks.
+`log_position` buffers into RAM and only `sdlog.poll` writes it out, on a
+5 s cadence - but `PrepareSleep` does not flush, and the `standby` gate it
+sets skips the poll for the rest of the pass. So every deep sleep discards
+whatever had not reached the card: 0-5 s of fixes, once per cycle. On a
+15 s window at 1 Hz that is up to a third of each wake's log.
 
 ### Inside one connected window
 
@@ -596,8 +614,12 @@ gantt
     section BLE out
     position notify every 1000 ms :active, y1, 0, 52s
     remote reports pushed as heard :active, y2, 0, 52s
-    status lines             :active, y3, 0, 20s
-    status lines             :active, y4, 37, 15s
+    status lines - a transfer does not gate these :active, y3, 0, 52s
+
+    section USB console
+    firmware text            :active, y4, 0, 20s
+    quiet - the transfer owns the IN FIFO :done, y5, 20, 15s
+    firmware text            :active, y6, 35, 17s
 
     section LoRa
     beacon - notifications hold :milestone, z1, 10, 0s
@@ -621,7 +643,10 @@ one board, one supply, one USB FIFO:
   22 dBm of LoRa PA beside a 2.4 GHz radio is a supply problem.
 - A bulk transfer holds the beacon *and* silences the console
   (`state::transfer_active`), because the console and the transfer's ack
-  frames share the USB Serial/JTAG IN FIFO with no arbitration.
+  frames share the USB Serial/JTAG IN FIFO with no arbitration. Only the
+  console half is gated: `status_println!` still queues every line to the
+  log characteristic, so a phone watching the log sees what the console
+  cannot show it.
 - A commanded sleep is taken after the session ends, not under it, so the
   ack has left before the board disappears.
 
@@ -629,13 +654,13 @@ one board, one supply, one USB FIFO:
 
 | State | Entered by | Connectable | LoRa | GPS | SD log | USB console | Leaves when | Draw |
 |-|-|-|-|-|-|-|-|-|
-| **Boot** | power-on, reset, OTA reboot | no | init | configured | mounted | yes | init done (~2-4 s) | ~126 mA |
-| **Boot (wake check)** | deep-sleep timer | no | init | configured | mounted | yes | init done | ~126 mA |
+| **Boot** | power-on, reset, OTA reboot | no | init | configured | mounted | yes | init done (never measured) | ~126 mA |
+| **Boot (wake check)** | deep-sleep timer | no | init | configured | mounted | yes | init done (never measured) | ~126 mA |
 | **Advertise** | boot, or a spent BLE-down period | yes | beacon + RX | tracking | yes | yes | a central connects, the window expires, or `SLEEP_NOW` | ~126-130 mA |
 | **Connected** | a central accepts | in session | beacon + RX | tracking | yes | yes | disconnect, or `CFG_SLEEP_NOW` | ~130 mA |
 | **Linger** | disconnect | yes | beacon + RX | tracking | yes | yes | 5 s, or the phone returns | ~126-130 mA |
 | **BLE down** | window spent with `ble_off_s` set | **no** | beacon + RX | tracking | yes | yes | `ble_off_s` elapses, or USB `SLEEP` | **60 mA** |
-| **Park** | any path into deep sleep | no | going to cold sleep | tracking | flushed | yes | radio parked, or the TX budget expires | ~126 mA |
+| **Park** | any path into deep sleep | no | going to cold sleep | tracking | **not flushed** | yes | radio parked, or the TX budget expires | ~126 mA |
 | **Deep sleep** | window spent with `sleep_interval_s` set, or a commanded sleep | no | cold sleep | **still acquiring** | no | **no** | the timer fires - a full reset | **~30 mA** |
 
 Three of these are modal rather than positional - they overlay whichever
