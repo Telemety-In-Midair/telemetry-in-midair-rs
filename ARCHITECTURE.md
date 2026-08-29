@@ -442,6 +442,215 @@ settings that decide whether a board is reachable at all are mirrored; the
 GPS and radio sleep flags are not, because a board that cold-boots with its
 GPS running is the safer of the two failures.
 
+## The states over time
+
+The diagram above says what follows what. This says what the board can
+still *do* while it is in each state, and for how long.
+
+Two charts, because the two duty cycles never run together. `serve` checks
+deep sleep first, so a board with `sleep_interval_s` set never reaches the
+`ble_off_s` branch at all - the awake duty cycle only exists on a board that
+has deep sleep off.
+
+### The awake duty cycle
+
+`adv_window_s = 15`, `ble_off_s = 30`, `sleep_interval_s = 0`. The modem
+goes down; the tracker does not.
+
+```mermaid
+gantt
+    title Awake duty cycle - only BLE is duty-cycled
+    dateFormat X
+    axisFormat %M:%S
+
+    section Board state
+    Boot (cold)             :done,   s1, 0, 4s
+    Advertise               :active, s2, 4, 5s
+    Connected               :crit,   s3, 9, 25s
+    Linger 5 s              :active, s4, 34, 5s
+    BLE down 30 s           :done,   s5, 39, 30s
+    Advertise               :active, s6, 69, 15s
+    BLE down 30 s           :done,   s7, 84, 30s
+
+    section BLE
+    stack built             :milestone, b0, 4, 0s
+    reachable by a phone    :active, b1, 4, 35s
+    stack dropped - 71 mA goes :milestone, b2, 39, 0s
+    reachable by a phone    :active, b3, 69, 15s
+    stack dropped           :milestone, b4, 84, 0s
+
+    section LoRa
+    continuous RX           :active, r1, 3, 111s
+    beacon                  :milestone, r2, 5, 0s
+    beacon                  :milestone, r3, 25, 0s
+    beacon                  :milestone, r4, 45, 0s
+    beacon                  :milestone, r5, 65, 0s
+    beacon                  :milestone, r6, 85, 0s
+    beacon                  :milestone, r7, 105, 0s
+
+    section GPS
+    tracking - never gated  :active, g1, 1, 113s
+
+    section SD card
+    logging every fix       :active, d1, 1, 113s
+
+    section USB console
+    alive throughout        :active, u1, 0, 114s
+
+    section J5 panel
+    refreshing              :active, o1, 4, 110s
+```
+
+Nothing below the BLE lane changes shape. That is the whole point of this
+cycle: a board in a BLE-down period is still beaconing, still logging and
+still answering the USB console - it is only unreachable from a phone,
+for at most `ble_off_s`.
+
+Two timings worth reading off the chart. A **session is not bounded by the
+window** - the deadline is only consulted at the top of the serve loop, so a
+phone that stays connected keeps the board up indefinitely. And the
+**linger** after a disconnect is spent advertising rather than merely awake,
+so the phone can come straight back.
+
+### The deep-sleep duty cycle
+
+`adv_window_s = 15`, `sleep_interval_s = 45`. The chip goes away; the GPS
+does not.
+
+```mermaid
+gantt
+    title Deep-sleep duty cycle - everything stops except the ungated GPS
+    dateFormat X
+    axisFormat %M:%S
+
+    section Board state
+    Boot (cold)             :done,   t1, 0, 4s
+    Advertise               :active, t2, 4, 15s
+    Park                    :crit,   t3, 19, 1s
+    Deep sleep 45 s         :done,   t4, 20, 45s
+    Boot (wake check)       :done,   t5, 65, 4s
+    Advertise               :active, t6, 69, 3s
+    Connected               :crit,   t7, 72, 28s
+    Linger 5 s              :active, t8, 100, 5s
+    Park                    :crit,   t9, 105, 1s
+    Deep sleep 45 s         :done,   t10, 106, 45s
+
+    section BLE
+    reachable by a phone    :active, c1, 4, 15s
+    unreachable             :done,   c2, 19, 50s
+    reachable by a phone    :active, c3, 69, 36s
+    unreachable             :done,   c4, 105, 46s
+
+    section LoRa
+    continuous RX           :active, q1, 3, 16s
+    beacon                  :milestone, q2, 5, 0s
+    cold sleep - 9.3 uA     :done,  q3, 19, 46s
+    continuous RX           :active, q4, 68, 37s
+    beacon                  :milestone, q5, 70, 0s
+    beacon                  :milestone, q6, 90, 0s
+    cold sleep - 9.3 uA     :done,  q7, 105, 46s
+
+    section GPS
+    acquiring - ~30 mA even asleep :active, p1, 1, 150s
+
+    section SD card
+    logging every fix       :active, e1, 1, 18s
+    powered but idle        :done,   e2, 19, 46s
+    logging every fix       :active, e3, 66, 39s
+    powered but idle        :done,   e4, 105, 46s
+
+    section USB console
+    alive                   :active, v1, 0, 19s
+    dead - the chip is off  :done,   v2, 19, 46s
+    alive                   :active, v3, 65, 40s
+    dead - the chip is off  :done,   v4, 105, 46s
+
+    section J5 panel
+    refreshing              :active, n1, 4, 15s
+    blanked by Park         :done,   n2, 19, 46s
+    refreshing              :active, n3, 69, 36s
+    blanked by Park         :done,   n4, 105, 46s
+```
+
+The GPS lane running unbroken through both sleeps is the board fact that
+makes deep sleep worth ~30 mA and not less - the MAX-M10 has no rail to cut.
+`Park` is short but not free: it waits for a beacon already in flight, which
+is 289 ms at the defaults and up to 9.7 s at the slowest settings the config
+accepts.
+
+### Inside one connected window
+
+What a session can be doing, and what each thing suspends while it runs.
+
+```mermaid
+gantt
+    title One session - notifications transfers and the interlocks between them
+    dateFormat X
+    axisFormat %Ss
+
+    section Session
+    connected               :crit, x1, 0, 52s
+    roster replayed - settings and radio config published :milestone, x2, 0, 0s
+    disconnect              :milestone, x3, 52, 0s
+
+    section BLE out
+    position notify every 1000 ms :active, y1, 0, 52s
+    remote reports pushed as heard :active, y2, 0, 52s
+    status lines             :active, y3, 0, 20s
+    status lines             :active, y4, 37, 15s
+
+    section LoRa
+    beacon - notifications hold :milestone, z1, 10, 0s
+    beacon declined - a transfer owns the board :milestone, z2, 30, 0s
+    beacon                   :milestone, z3, 40, 0s
+
+    section Bulk transfer
+    config push - console quiet beacon held :crit, w1, 20, 15s
+    ApplyConfig - radio re-init GPS re-pushed RADIO.CFG rewritten :active, w2, 35, 2s
+
+    section Commanded sleep
+    CFG_SLEEP_NOW written    :milestone, k1, 50, 0s
+    ack leaves then the session ends :active, k2, 50, 2s
+    Park then deep sleep     :crit, k3, 52, 1s
+```
+
+Three interlocks show up here, and all three exist for the same reason -
+one board, one supply, one USB FIFO:
+
+- A beacon in flight holds BLE notifications (`state::radio_busy`), because
+  22 dBm of LoRa PA beside a 2.4 GHz radio is a supply problem.
+- A bulk transfer holds the beacon *and* silences the console
+  (`state::transfer_active`), because the console and the transfer's ack
+  frames share the USB Serial/JTAG IN FIFO with no arbitration.
+- A commanded sleep is taken after the session ends, not under it, so the
+  ack has left before the board disappears.
+
+### Every state, and what is possible in it
+
+| State | Entered by | Connectable | LoRa | GPS | SD log | USB console | Leaves when | Draw |
+|-|-|-|-|-|-|-|-|-|
+| **Boot** | power-on, reset, OTA reboot | no | init | configured | mounted | yes | init done (~2-4 s) | ~126 mA |
+| **Boot (wake check)** | deep-sleep timer | no | init | configured | mounted | yes | init done | ~126 mA |
+| **Advertise** | boot, or a spent BLE-down period | yes | beacon + RX | tracking | yes | yes | a central connects, the window expires, or `SLEEP_NOW` | ~126-130 mA |
+| **Connected** | a central accepts | in session | beacon + RX | tracking | yes | yes | disconnect, or `CFG_SLEEP_NOW` | ~130 mA |
+| **Linger** | disconnect | yes | beacon + RX | tracking | yes | yes | 5 s, or the phone returns | ~126-130 mA |
+| **BLE down** | window spent with `ble_off_s` set | **no** | beacon + RX | tracking | yes | yes | `ble_off_s` elapses, or USB `SLEEP` | **60 mA** |
+| **Park** | any path into deep sleep | no | going to cold sleep | tracking | flushed | yes | radio parked, or the TX budget expires | ~126 mA |
+| **Deep sleep** | window spent with `sleep_interval_s` set, or a commanded sleep | no | cold sleep | **still acquiring** | no | **no** | the timer fires - a full reset | **~30 mA** |
+
+Three of these are modal rather than positional - they overlay whichever
+state the board is in:
+
+| Overlay | Set by | What it changes |
+|-|-|-|
+| **Radio standby** (`PFLAG_WIO_SLEEP`) | `CFG_WIO_SLEEP`, survives deep sleep | The hardware loop skips GPS, beacon and telemetry entirely and polls at 20 Hz. Only BLE and the console stay alive. |
+| **GPS backup** (`PFLAG_GPS_SLEEP`) | `CFG_GPS_SLEEP`, survives deep sleep | The receiver is parked with `UBX-RXM-PMREQ`. It loses its settings, so the loop re-pushes them when sentences resume. |
+| **Transfer active** | a bulk op over BLE or USB | Beacon held off, console quiet, and the transfer is bounded so a host that walks away cannot hold the board. |
+
+And one that does nothing here: `PFLAG_PWR_OFF` and `Action::Rail` are the
+old board's GPS/LoRa rail switch. This carrier has no such rail, so the
+firmware logs the request and honors nothing.
+
 ## What the board forces on the firmware
 
 Board facts that firmware cannot work around, from the carrier design:
