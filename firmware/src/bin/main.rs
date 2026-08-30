@@ -37,7 +37,7 @@
 
 use bt_hci::controller::ExternalController;
 use embassy_executor::Spawner;
-use embassy_futures::select::{select, select3, Either};
+use embassy_futures::select::{select, select3, Either3};
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
@@ -47,7 +47,9 @@ use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
 use esp_hal::rtc_cntl::Rtc;
 use esp_hal::spi::master::{Config as SpiConfig, Spi};
-use esp_hal::spi::Mode;
+// Renamed: `Mode` in this file is the board's mode, which appears on
+// nearly every page of it.
+use esp_hal::spi::Mode as SpiMode;
 use esp_hal::time::Rate;
 use esp_hal::timer::timg::TimerGroup;
 use esp_hal::uart::{Config as UartConfig, Uart};
@@ -57,7 +59,8 @@ use gps_proto::packet;
 use midair_proto::bulk::{self, Owner};
 use midair_proto::radiocfg::{self, RadioConfig};
 use midair_proto::roster::{Report, Value};
-use midair_proto::{ble, link, lora, session};
+use midair_proto::ble::{self, Mode};
+use midair_proto::{link, lora, session};
 use trouble_host::prelude::*;
 use wio_s3_gps::gps::{Gps, BAUD as GPS_BAUD};
 use wio_s3_gps::node::Node;
@@ -319,12 +322,37 @@ async fn main(spawner: Spawner) -> ! {
     // its RTC RAM copy.
     if let Some(saved) = settings::restore().await {
         println!(
-            "nvs: restored sleep {} s, adv window {} s, flags {:#x}",
+            "nvs: restored mode {}, sleep {} s, adv window {} s, flags {:#x}",
+            saved.mode.as_str(),
             saved.sleep_interval_s,
             saved.adv_window(),
             saved.flags
         );
     }
+
+    // What this boot raises. Three flavors and one decision, taken here
+    // because everything below - which peripherals are spoken to, whether
+    // the card is mounted, what the serve loop budgets on - follows from it.
+    //
+    // The stored mode only ever says stored or tracking; idle is what a
+    // cold boot turns "stored" into, so a board that has just been flashed,
+    // or has just come back from a flat cell, is reachable for an idle
+    // timeout before it stores itself. See `session::boot_mode`.
+    let boot = session::boot_mode(settings::get().mode, woke_from_sleep);
+    // The live mode, published so the serve loop, the settings
+    // characteristic and the USB console all read the same answer. RTC RAM
+    // only; idle never reaches flash.
+    settings::set_mode(boot);
+    // An isolation build exists to measure a board with everything running,
+    // so it raises the tracker whatever the record says. Without this a
+    // freshly flashed measurement board would come up idle - GPS parked,
+    // radio down - and the reading would be of a different machine.
+    #[cfg(any(feature = "iso-no-ble", feature = "iso-gps-backup"))]
+    let boot = {
+        let _ = boot;
+        settings::set_mode(Mode::Tracking);
+        Mode::Tracking
+    };
 
     // Resolve and publish the BLE address before any task can be asked for
     // it over USB.
@@ -353,7 +381,7 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.SPI2,
         SpiConfig::default()
             .with_frequency(Rate::from_hz(LORA_SPI_HZ))
-            .with_mode(Mode::_0),
+            .with_mode(SpiMode::_0),
     )
     .expect("lora spi")
     .with_sck(peripherals.GPIO4)
@@ -404,6 +432,16 @@ async fn main(spawner: Spawner) -> ! {
     .with_tx(peripherals.GPIO2);
     let gps = Gps::new(gps_uart);
 
+    // Release the TX pad hold that `enter_deep_sleep` set, in the same
+    // order and for the same reason as NSS above: reconfigure first, then
+    // release, or the pad glitches through whatever state it had in
+    // between. UART RX activity is one of the M10's backup wake sources, so
+    // an edge on this line while the digital domain is down is a receiver
+    // that comes out of backup and acquires for the whole sleep interval.
+    unsafe {
+        esp_hal::gpio::RtcPin::rtcio_pad_hold(&esp_hal::peripherals::GPIO2::steal(), false);
+    }
+
     // microSD on SPI3. Three of these four lines are ESP32-S3 strapping
     // pins - see BOARD-REVIEW.md in the board repo; R17 on GPIO45 is DNP
     // for that reason.
@@ -411,7 +449,7 @@ async fn main(spawner: Spawner) -> ! {
         peripherals.SPI3,
         SpiConfig::default()
             .with_frequency(Rate::from_hz(SD_SPI_HZ))
-            .with_mode(Mode::_0),
+            .with_mode(SpiMode::_0),
     )
     .expect("sd spi")
     .with_sck(peripherals.GPIO46)
@@ -446,7 +484,16 @@ async fn main(spawner: Spawner) -> ! {
     }
 
     spawner
-        .spawn(hardware_task(lora, gps, sdlog, j5, d5, d2, !woke_from_sleep))
+        .spawn(hardware_task(
+            lora,
+            gps,
+            sdlog,
+            j5,
+            d5,
+            d2,
+            boot,
+            !woke_from_sleep,
+        ))
         .expect("spawn hardware task");
     }
 
@@ -482,6 +529,15 @@ async fn main(spawner: Spawner) -> ! {
     } else {
         status_println!("cold boot (not a deep-sleep wake)");
     }
+    status_println!(
+        "mode {} - {}",
+        boot.as_str(),
+        match boot {
+            Mode::Stored => "wake check, nothing raised",
+            Mode::Idle => "reachable, gps in backup (CFG_MODE tracking to track)",
+            Mode::Tracking => "gps, radio and card up",
+        }
+    );
 
     // The attribute table is built once and reused by every window.
     //
@@ -593,25 +649,38 @@ async fn main(spawner: Spawner) -> ! {
         }
 
         // Everything above is dropped by here, `ble_deinit` included.
-        let off_s = settings::get().ble_off_s;
-        if off_s == 0 {
-            // `serve` only returns when the period is set, so this is a
-            // setting cleared mid-window. Go straight back to advertising
-            // rather than spinning on a zero-length wait.
+        let session::Next::BleDown { off_s } = settings::get().at_expiry() else {
+            // `serve` only returns for a BLE-down period, so anything else
+            // is a setting - or a mode - that moved while the modem was
+            // coming down. Go straight back to advertising rather than
+            // spinning on a zero-length wait.
             continue;
-        }
+        };
         status_println!("ble down for {} s (lora and gps stay up)", off_s);
-        // A board told to sleep over the USB console must not have to wait
-        // out the whole dark period first - the console is alive throughout,
-        // and it is the only way in while the radio is down.
+        // A board told to sleep - or told to change mode - over the USB
+        // console must not have to wait out the whole dark period first.
+        // The console is alive throughout, and while the modem is down it is
+        // the only way in.
         let commanded = async { state::SLEEP_NOW_SIGNAL.wait().await };
-        if let Either::Second(()) =
-            select(Timer::after(Duration::from_secs(off_s as u64)), commanded).await
+        let remoded = async { state::MODE_SIGNAL.wait().await };
+        match select3(
+            Timer::after(Duration::from_secs(off_s as u64)),
+            commanded,
+            remoded,
+        )
+        .await
         {
-            let secs = state::take_sleep_now()
-                .unwrap_or_else(|| ble::resolve_sleep_now(0, settings::get().sleep_interval_s));
-            status_println!("sleep on command: {} s, from a BLE-down period", secs);
-            enter_deep_sleep(&mut rtc, secs).await;
+            Either3::Second(()) => {
+                let secs = state::take_sleep_now()
+                    .unwrap_or_else(|| ble::resolve_sleep_now(0, settings::get().sleep_interval_s));
+                status_println!("sleep on command: {} s, from a BLE-down period", secs);
+                enter_deep_sleep(&mut rtc, secs).await;
+            }
+            // A mode that is no longer tracking has no BLE-down period to
+            // sit out. Bring the modem straight back up; `serve` re-budgets
+            // on the new mode.
+            Either3::Third(()) => status_println!("mode changed, ending the BLE-down period early"),
+            Either3::First(()) => {}
         }
         // Free heap alongside it, because the duty cycle turned a
         // once-per-boot allocation into a few thousand a day: the whole
@@ -709,9 +778,11 @@ fn current_settings() -> ble::Settings {
 /// 9.3 uA asleep. The hardware loop owns the radio, so this asks and waits
 /// rather than reaching for it.
 ///
-/// The MAX-M10 keeps acquiring throughout, which is the dominant draw and a
-/// board fact rather than a firmware choice; `CFG_GPS_SLEEP` is the lever
-/// for that and it is the app's to pull.
+/// The GPS goes with it. `PrepareSleep` puts the receiver into backup and
+/// holds the UART TX pad across the sleep, which together are what make a
+/// sleeping board actually cheap: an M10 left acquiring is around 30 mA
+/// against a chip that is otherwise in microamps, and a sleeping S3 cannot
+/// use a fix anyway.
 async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
     // A command that got this far has been acted on; nothing on the far
     // side of the sleep should find it still pending and sleep again.
@@ -753,14 +824,23 @@ async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
     // SD CS (GPIO44) has the same problem and is not fixable the same way -
     // the S3's RTC pins stop at 21, so a digital pad needs the
     // `RTC_CNTL_DIG_PAD_HOLD` register that esp-hal 1.0 does not expose.
+    //
+    // GPIO2 is UART1 TX into the M10's RX, and UART RX activity is one of
+    // the receiver's two backup wake sources. A floating edge there undoes
+    // the backup `PrepareSleep` just asked for and leaves the receiver
+    // acquiring for the whole interval, which is the largest load a
+    // sleeping board can carry. It is inside the RTC range too, so it is
+    // held at the level the UART idles at.
     unsafe {
         esp_hal::gpio::RtcPin::rtcio_pad_hold(&esp_hal::peripherals::GPIO21::steal(), true);
+        esp_hal::gpio::RtcPin::rtcio_pad_hold(&esp_hal::peripherals::GPIO2::steal(), true);
     }
 
     settings::note_sleep(interval_s);
     println!(
-        "deep sleep for {} s (radio parked, gps still acquiring)",
-        interval_s
+        "deep sleep for {} s (mode {}, radio and gps parked)",
+        interval_s,
+        settings::get().mode.as_str()
     );
     let timer = TimerWakeupSource::new(core::time::Duration::from_secs(interval_s as u64));
     rtc.sleep_deep(&[&timer])
@@ -768,13 +848,20 @@ async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
 
 /// Advertise, accept one central, serve it, repeat.
 ///
-/// A spent window ends one of three ways, in this order of precedence:
+/// What a spent budget means is a property of the mode, not a race between
+/// two settings ([`session::Stored::at_expiry`]):
 ///
-/// - **Deep sleep**, if `sleep_interval_s` is set. Does not return.
-/// - **Returning**, if `ble_off_s` is set instead. The caller drops the BLE
-///   stack, which powers the modem down, waits, and calls this again.
-/// - **Advertising on**, if neither is set. Does not return, and is what an
-///   unconfigured board does - reachable forever, at 126 mA.
+/// - **Stored** - a wake check. The budget is the advertising window, and
+///   spending it is deep sleep again. Does not return.
+/// - **Idle** - the budget is the idle timeout, and spending it stores the
+///   board. Does not return.
+/// - **Tracking** - the budget is the advertising window and spending it
+///   returns, so the caller can drop the BLE stack for `ble_off_s` and call
+///   this again. The board stays a working tracker throughout.
+///
+/// With no cadence to sleep on (`sleep_interval_s = 0`) the first two
+/// simply keep advertising, which is what a bench board and an unconfigured
+/// board both want.
 ///
 /// The budget is a deadline rather than a per-attempt timeout, so no retry
 /// path below can extend it - see [`session::Window`].
@@ -799,23 +886,33 @@ async fn serve<C: Controller>(
     )
     .expect("scan data fits");
 
-    let mut window = session::Window::new(Instant::now().as_millis(), settings::get().adv_window());
+    let mut mode = settings::get().mode;
+    let mut window = session::Window::new(Instant::now().as_millis(), settings::get().budget_s());
 
     loop {
+        // Consumed before the read it stands for, so a write that lands
+        // between the two is still pending on the next pass rather than
+        // reset unseen.
+        state::MODE_SIGNAL.reset();
         let stored = settings::get();
-        let sleep_interval = stored.sleep_interval_s;
-        let ble_off = stored.ble_off_s;
-        // Budget spent, whatever used it up.
-        if let session::Next::Sleep { interval_s } =
-            window.next(Instant::now().as_millis(), sleep_interval)
-        {
-            enter_deep_sleep(rtc, interval_s).await;
+        // A mode that moved under the loop budgets differently - a wake
+        // check's window and an idle timeout are the same deadline field
+        // holding two very different numbers - so the budget restarts on the
+        // new mode's terms rather than carrying the old one's deadline into
+        // it.
+        if stored.mode != mode {
+            mode = stored.mode;
+            window = session::Window::new(Instant::now().as_millis(), stored.budget_s());
+            status_println!("mode {} ({} s budget)", mode.as_str(), stored.budget_s());
         }
-        // Same deadline, cheaper exit: with deep sleep off but the BLE duty
-        // cycle on, hand control back so the caller can drop the stack. The
-        // board stays awake and on the air over LoRa; only the modem goes.
-        if ble_off > 0 && window.remaining_ms(Instant::now().as_millis()) == 0 {
-            return;
+        // Budget spent, whatever used it up.
+        match window.next(Instant::now().as_millis(), &stored) {
+            session::Next::Sleep { interval_s } => enter_deep_sleep(rtc, interval_s).await,
+            // Cheaper exit than deep sleep and it stops nothing else: hand
+            // control back so the caller can drop the stack. The board stays
+            // awake and on the air over LoRa; only the modem goes.
+            session::Next::BleDown { .. } => return,
+            session::Next::Advertise => {}
         }
         qprintln!("advertising as {}", ble::DEVICE_NAME);
         let advertiser = match peripheral
@@ -841,16 +938,26 @@ async fn serve<C: Controller>(
         // connected goes down without first having to be connected to. The
         // BLE path signals this too, but from inside a session, where
         // `gatt_session` is the arm that picks it up.
+        //
+        // `bounded` is whether the budget ends in anything. It does not for a board
+        // that advertises forever - a bench board, or an unconfigured one -
+        // and waiting on `accept` with no deadline is then the whole
+        // intent. Derived from `at_expiry` rather than from the settings
+        // directly, so a spent budget that resolves to "keep advertising"
+        // cannot arm a zero-length timeout and spin.
+        let bounded = stored.at_expiry() != session::Next::Advertise;
         let accepted = {
             let commanded = async {
                 state::SLEEP_NOW_SIGNAL.wait().await;
             };
+            // A mode written over USB or BLE while nothing is connected
+            // would otherwise wait out the whole budget - which in idle is
+            // ten minutes - before the loop noticed.
+            let remoded = async {
+                state::MODE_SIGNAL.wait().await;
+            };
             let accept = async {
-                // Bounded whenever the window means anything - either
-                // ending sends the board somewhere. Unbounded only for a
-                // board configured to advertise forever, where waiting on
-                // `accept` with no deadline is the whole intent.
-                if sleep_interval > 0 || ble_off > 0 {
+                if bounded {
                     let left =
                         Duration::from_millis(window.remaining_ms(Instant::now().as_millis()));
                     // `None` is the window expiring with nobody interested.
@@ -859,12 +966,43 @@ async fn serve<C: Controller>(
                     Some(advertiser.accept().await)
                 }
             };
-            select(accept, commanded).await
+            select3(accept, commanded, remoded).await
         };
 
+        // A connect during a wake check is a doorbell, not a leash.
+        //
+        // Before this, a held session was the only thing that kept a stored
+        // board up: reaching one meant catching the window, connecting, and
+        // then not letting go. Now the attempt alone promotes the board to
+        // idle with the timeout armed, and the app can take its time -
+        // including reconnecting after a handshake that fizzled, which
+        // phones do routinely.
+        //
+        // On the attempt rather than on a completed session, because the
+        // intent was unambiguous either way and the failure mode of the
+        // stricter rule is a board that goes back down for five minutes
+        // over one bad handshake. A promotion that turns out to be a
+        // misfire costs one idle timeout of awake current, bounded and
+        // small.
+        if mode == Mode::Stored && matches!(accepted, Either3::First(Some(_))) {
+            mode = Mode::Idle;
+            settings::set_mode(mode);
+            // Raises what a wake check left down: the card, so config reads
+            // and log pulls work. The GPS and the radio stay parked - an
+            // app looking at a stored object's settings should not cost an
+            // acquisition.
+            state::request(Request::Mode(mode));
+            let stored = settings::get();
+            window = session::Window::new(Instant::now().as_millis(), stored.budget_s());
+            status_println!(
+                "promoted to idle by a connect ({} s before it stores itself)",
+                stored.budget_s()
+            );
+        }
+
         let conn = match accepted {
-            Either::First(Some(Ok(c))) => c,
-            Either::First(Some(Err(_))) => {
+            Either3::First(Some(Ok(c))) => c,
+            Either3::First(Some(Err(_))) => {
                 // A central started a connection and it did not complete.
                 // The pause keeps a repeated failure off a hot spin, and it
                 // comes out of the wake budget like everything else.
@@ -872,28 +1010,28 @@ async fn serve<C: Controller>(
                 Timer::after(Duration::from_millis(200)).await;
                 continue;
             }
-            // The advertising budget ran out with nobody interested. Deep
-            // sleep first if it is configured, because it saves more; the
-            // duty cycle is what a board that must stay on the air does
-            // instead.
-            Either::First(None) => {
-                if sleep_interval > 0 {
-                    enter_deep_sleep(rtc, sleep_interval).await
+            // The budget ran out with nobody interested, so whatever this
+            // mode does with a spent budget is what happens now.
+            Either3::First(None) => match stored.at_expiry() {
+                session::Next::Sleep { interval_s } => enter_deep_sleep(rtc, interval_s).await,
+                _ => {
+                    qprintln!("advertising window over");
+                    return;
                 }
-                qprintln!("advertising window over");
-                return;
-            }
+            },
             // Told to sleep while advertising to nobody.
-            Either::Second(()) => {
+            Either3::Second(()) => {
                 // The cell is always set before the signal is raised, so the
                 // fallback is for a shape that should not occur - and it
                 // resolves the same way a request of 0 would rather than
                 // inventing a duration nothing else in the system uses.
                 let secs = state::take_sleep_now()
-                    .unwrap_or_else(|| ble::resolve_sleep_now(0, sleep_interval));
+                    .unwrap_or_else(|| ble::resolve_sleep_now(0, stored.sleep_interval_s));
                 status_println!("sleep on command: {} s, from advertising", secs);
                 enter_deep_sleep(rtc, secs).await
             }
+            // A mode write. The top of the loop re-budgets on it.
+            Either3::Third(()) => continue,
         };
 
         let Ok(conn) = conn.with_attribute_server(server) else {
@@ -917,12 +1055,13 @@ async fn serve<C: Controller>(
             enter_deep_sleep(rtc, secs).await;
         }
 
-        // Linger by advertising, not by idling. The point is to let the
+        // Re-arm by advertising, not by idling. The point is to let the
         // phone come straight back, which it cannot do if the board is
         // awake but not discoverable. Looping back re-advertises, and the
-        // deadline check at the top sends the board down when the linger
-        // runs out.
-        window.linger(Instant::now().as_millis());
+        // deadline check at the top sends the board wherever its mode sends
+        // it when the budget runs out - a five second linger while
+        // tracking, the whole timeout again while idle.
+        window.after_disconnect(Instant::now().as_millis(), &settings::get());
     }
 }
 
@@ -1188,6 +1327,7 @@ async fn hardware_task(
     mut j5: Option<J5>,
     d5: Output<'static>,
     d2: Output<'static>,
+    boot: Mode,
     cold: bool,
 ) {
     let mut rx_led = Blinker::new(d5);
@@ -1197,50 +1337,61 @@ async fn hardware_task(
     // `PrepareSleep` is answered. A separate task would need the ordering
     // negotiated; here it is a function call in the right place.
     let mut next_oled = 0u32;
+    // What the board is doing, which is what decides how much of this task
+    // runs. Moved by `Request::Mode`, never by this task on its own.
+    let mut live = boot;
 
-    // Give the card a chance to mount before its config is asked for.
-    sdlog.poll(0);
-
-    // Radio config: the SD file, else defaults. Unlike the two-MCU board
-    // there is no second copy in the MCU's own flash - the card is the
-    // store, and a config pushed over BLE or USB is written back to it.
-    let mut cfg_buf = [0u8; CONFIG_MAX];
-    let from_sd = sdlog
-        .read_config(&mut cfg_buf)
-        .and_then(|n| match radiocfg::parse_bytes(&cfg_buf[..n]) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                println!("config: RADIO.CFG invalid ({:?}), using defaults", e);
-                None
-            }
-        });
-    let (mut cfg, mut cfg_loaded) = match from_sd {
-        Some(c) => {
-            println!("config: RADIO.CFG loaded (address {})", c.address);
-            (c, true)
-        }
-        None => {
-            println!("config: none stored, using defaults");
-            (RadioConfig::default(), false)
-        }
-    };
-    // Honor sd_enabled only now: the setting itself lives on the card, so
-    // the card has to be read before it can say to stop using it.
-    if !cfg.sd_enabled {
-        println!("SD: disabled by config");
-        sdlog.disable(0);
+    // A wake check reads no card. It exists to ask whether anyone wants the
+    // board back, and that question needs BLE and nothing else - so a wake
+    // nobody answers never pays to mount a filesystem, and a promotion
+    // reads the card then instead.
+    let mut card_up = boot != Mode::Stored;
+    if !card_up {
+        sdlog.defer();
     }
-    state::set_verbose(cfg.verbose);
-    state::set_radio_config(cfg.encode());
-    state::set_tx_worst_case_ms(cfg.tx_poll_timeout_ms());
-    adopt_power(&cfg, cold).await;
+
+    let mut cfg = RadioConfig::default();
+    let mut cfg_loaded = false;
+    if card_up {
+        cfg_loaded = adopt_card_config(&mut sdlog, &mut cfg, 0, cold).await;
+    }
 
     let mut node = Node::new(lora, &cfg);
-    node.radio_mut().init(&cfg).await;
-    if !node.radio_mut().print_diagnostics() {
-        println!("radio did not answer - check the pin map in main");
+
+    // What this boot raises, which is the whole difference between the
+    // three flavors.
+    match boot {
+        Mode::Tracking => {
+            node.radio_mut().init(&cfg).await;
+            if !node.radio_mut().print_diagnostics() {
+                println!("radio did not answer - check the pin map in main");
+            }
+            gps.configure(&cfg.gps).await;
+        }
+        Mode::Idle => {
+            // Reachable and nothing else. This is a cold boot, so the
+            // receiver is at its power-on default and acquiring; park it.
+            gps.park().await;
+            node.radio_mut().sleep();
+        }
+        Mode::Stored => {
+            // The park that caused this sleep left the receiver in an
+            // open-ended backup, and a reset does not change that - so the
+            // driver is told what the module is actually doing rather than
+            // being left with its power-on assumption. Without it a
+            // promotion straight to tracking would find `wake` a no-op, and
+            // the receiver would stay in backup with nothing to notice it:
+            // the settings retry is gated on a sentence having been seen,
+            // and in backup there are none.
+            gps.sleeping = true;
+            // A wake check speaks to neither. `gps.configure` alone would
+            // undo the sleep the last park asked for - UART RX is one of
+            // the M10's backup wake sources, so the boot path would wake the
+            // receiver on every single wake just to have the park path put
+            // it back - and any SPI transaction pulls NSS low, which is the
+            // edge the SX1262 leaves cold sleep on.
+        }
     }
-    gps.configure(&cfg.gps).await;
 
     // The settings that survive a deep sleep are re-applied here, because
     // the wake that restored them is a fresh boot to everything else.
@@ -1265,26 +1416,51 @@ async fn hardware_task(
             ISO_GPS_BACKUP_MS / 1000
         );
     }
-    if stored.gps_sleep() {
-        gps.sleep();
+    // The two manual overrides, which still mean what they always meant:
+    // they park one subsystem where a mode parks all of them. Only a boot
+    // that raised something can lower it again.
+    if boot == Mode::Tracking {
+        if stored.gps_sleep() {
+            gps.park().await;
+        }
+        if stored.wio_sleep() {
+            node.radio_mut().standby();
+        }
     }
-    if stored.wio_sleep() {
-        node.radio_mut().standby();
-    }
-    let mut standby = stored.wio_sleep();
+    let mut standby = boot != Mode::Tracking || stored.wio_sleep();
 
-    status_println!(
-        "node {} up ({}), {} Hz SF{} BW{}",
-        cfg.address,
-        cfg.role.as_str(),
-        cfg.frequency_hz,
-        cfg.spreading_factor,
-        cfg.bandwidth_khz
-    );
+    match boot {
+        Mode::Tracking => status_println!(
+            "tracking: node {} ({}), {} Hz SF{} BW{}",
+            cfg.address,
+            cfg.role.as_str(),
+            cfg.frequency_hz,
+            cfg.spreading_factor,
+            cfg.bandwidth_khz
+        ),
+        Mode::Idle => match stored.sleep_interval_s {
+            // No cadence to sleep on, so the timeout has nowhere to send
+            // it: this board stays reachable until something says
+            // otherwise. The bench case, and the unconfigured one.
+            0 => status_println!("idle: gps in backup, radio asleep, no sleep cadence set"),
+            _ => status_println!(
+                "idle: gps in backup, radio asleep, {} s before it stores itself",
+                stored.idle_timeout()
+            ),
+        },
+        Mode::Stored => status_println!(
+            "wake check: nothing raised, {} s window then back down",
+            stored.adv_window()
+        ),
+    }
 
     // Something on the panel before the first telemetry, so a board that
-    // fails during init does not look like a board with a dead display.
-    if let Some(j) = j5.as_mut()
+    // fails during init does not look like a board with a dead display. Not
+    // on a wake check: the park path blanked the panel and the panel keeps
+    // its own state across the sleep, so lighting it here would put the
+    // display's current back into every wake.
+    if boot != Mode::Stored
+        && let Some(j) = j5.as_mut()
         && let Some(o) = j.oled.as_mut()
     {
         wio_s3_gps::oled::render(o, None, cfg.address);
@@ -1329,7 +1505,7 @@ async fn hardware_task(
         while let Some(r) = state::take_request() {
             match r {
                 Request::GpsSleep(true) => {
-                    gps.sleep();
+                    gps.park().await;
                     status_println!("gps: backup mode");
                 }
                 Request::GpsSleep(false) => {
@@ -1355,14 +1531,81 @@ async fn hardware_task(
                     standby = false;
                     status_println!("radio: back from standby");
                 }
+                Request::Mode(m) => {
+                    live = m;
+                    // The card first: a config that has not been read yet
+                    // is the one the radio is about to be initialized from.
+                    if !card_up {
+                        card_up = true;
+                        cfg_loaded = adopt_card_config(&mut sdlog, &mut cfg, now, false).await;
+                        node.reconfigure(&cfg);
+                    }
+                    match m {
+                        Mode::Tracking => {
+                            gps.wake().await;
+                            // `wake` marks the module unconfigured: backup
+                            // mode loses the RAM layer the settings live in.
+                            gps_cfg_tries = 0;
+                            next_gps_cfg = now;
+                            gps_was_sleeping = false;
+                            node.radio_mut().init(&cfg).await;
+                            standby = false;
+                            status_println!(
+                                "tracking: node {} ({}), gps and radio up",
+                                cfg.address,
+                                cfg.role.as_str()
+                            );
+                        }
+                        // Idle, or the lowering half of a store - the sleep
+                        // itself belongs to `PrepareSleep`, because deep
+                        // sleep is entered from the side that owns the
+                        // `Rtc`. Cold sleep rather than standby: nothing is
+                        // going to use the radio, and `init` runs again
+                        // whenever something does.
+                        _ => {
+                            gps.park().await;
+                            gps_was_sleeping = true;
+                            node.radio_mut().sleep();
+                            standby = true;
+                            status_println!("{}: gps in backup, radio asleep", m.as_str());
+                        }
+                    }
+                }
                 Request::ApplyConfig => {
                     if apply_radio_config(&mut node, &mut gps, &mut sdlog, &mut cfg, now).await {
                         cfg_loaded = true;
                         gps_cfg_tries = 0;
                         next_gps_cfg = now.wrapping_add(2_000);
+                        // Applying a config re-inits the radio, which is
+                        // the one thing that brings it back up. A board
+                        // that was not using it - idle, or a standby the
+                        // app asked for - gets it put straight back down,
+                        // because a config push is not a request to start
+                        // listening.
+                        if standby {
+                            node.radio_mut().sleep();
+                        }
                     }
                 }
                 Request::PrepareSleep => {
+                    // Everything a sleeping board cannot use, in the order
+                    // that loses the least: the card first, because it is
+                    // the only one holding data that a reset would destroy.
+                    //
+                    // Deep sleep is a full reset, so the pending log buffer
+                    // is simply gone - up to five fixes at the 1 Hz rate,
+                    // and always the five at the end of the wake, which is
+                    // the part a reader would use to work out where the
+                    // board was when it went down.
+                    sdlog.park(now);
+                    // The receiver is the largest load a sleeping board can
+                    // carry, at around 30 mA against a chip that is
+                    // otherwise in microamps - and a sleeping S3 cannot use
+                    // a fix anyway. Re-issued on every park rather than
+                    // assumed: a reset leaves this driver believing the
+                    // module is awake, and the module is not obliged to
+                    // agree with either of us.
+                    gps.park().await;
                     // Cold sleep, not standby: `init` runs again on the
                     // wake, which is a full reset anyway.
                     node.radio_mut().sleep();
@@ -1378,6 +1621,10 @@ async fn hardware_task(
                     state::SLEEP_READY.signal(());
                 }
                 Request::Reboot => {
+                    // Same hole as a deep sleep, and the same fix: the
+                    // pending buffer is RAM, and a reset is a reset whether
+                    // it is for an update or for a sleep.
+                    sdlog.park(now);
                     // Long enough for the ack that asked for this to leave
                     // the USB FIFO or the BLE connection.
                     Timer::after(Duration::from_millis(500)).await;
@@ -1394,211 +1641,217 @@ async fn hardware_task(
             xfer::expire(now_ms).await;
         }
 
-        if standby {
-            // Only BLE and the console stay alive.
-            Timer::after(Duration::from_millis(50)).await;
-            continue;
-        }
-
-        // ---- GPS ---------------------------------------------------------
-        gps.poll();
-        // A timed backup ends on the module's own clock, so the only signal
-        // is that sentences started again - the driver clears its own flag
-        // on the first one. Re-arm the config retry here, because the
-        // settings do not survive backup and the budget may already be
-        // spent from an earlier attempt.
-        if gps_was_sleeping && !gps.sleeping {
-            gps_cfg_tries = 0;
-            next_gps_cfg = now;
-            status_println!("gps: woke itself from backup, reconfiguring");
-        }
-        gps_was_sleeping = gps.sleeping;
-        let fix = gps.has_fix();
-        if fix != had_fix {
-            had_fix = fix;
-            if fix {
-                ever_had_fix = true;
-                status_println!("gps fix acquired ({} sats)", gps.packet().sats);
-            } else {
-                status_println!("gps fix lost");
+        // The GPS, the beacon and the receiver, none of which a board
+        // that is idle, storing itself or in a radio standby the app asked
+        // for has any use for.
+        //
+        // What follows this block still runs. A board that is idle rather
+        // than asleep is one somebody may be looking at, so the card keeps
+        // flushing and mounting, telemetry stays fresh, the panel keeps its
+        // frame and the status line keeps printing - and none of that costs
+        // anything on a wake check, where the card is off the bus and the
+        // panel is dark.
+        if !standby {
+            // ---- GPS ---------------------------------------------------------
+            gps.poll();
+            // A timed backup ends on the module's own clock, so the only signal
+            // is that sentences started again - the driver clears its own flag
+            // on the first one. Re-arm the config retry here, because the
+            // settings do not survive backup and the budget may already be
+            // spent from an earlier attempt.
+            if gps_was_sleeping && !gps.sleeping {
+                gps_cfg_tries = 0;
+                next_gps_cfg = now;
+                status_println!("gps: woke itself from backup, reconfiguring");
             }
-        }
-        if !gps_nmea_seen && gps.present() {
-            gps_nmea_seen = true;
-            status_println!("gps: NMEA up ({} bytes)", gps.rx_bytes());
-        }
-        // Settings retry. Two things leave the module running its own
-        // defaults while the firmware reports the ones it asked for: a
-        // boot-time push that landed before the receiver had finished
-        // starting, and a wake from backup mode, which cuts power to the
-        // receiver core and takes the whole RAM configuration layer with it
-        // - including the four NMEA sentences this firmware silences to fit
-        // 9600 baud. Driving the retry off `configured` rather than off the
-        // first sentence covers both, since `wake` clears it.
-        if !gps.configured
-            && !gps.sleeping
-            && gps.present()
-            && gps_cfg_tries < GPS_CFG_TRIES
-            && due(now, next_gps_cfg)
-        {
-            next_gps_cfg = now.wrapping_add(2_000);
-            gps_cfg_tries += 1;
-            if gps.configure(&cfg.gps).await {
-                status_println!("gps: settings applied");
-            } else if gps_cfg_tries == GPS_CFG_TRIES {
-                status_println!("gps: settings still not accepted, giving up");
-            }
-        }
-        // Not while the receiver is in a backup this firmware asked for:
-        // silence is the request working, and reporting it as a wiring or
-        // baud fault sends whoever is measuring the GPS off after a bug
-        // that is not there.
-        if !gps_checked && !gps.sleeping && due(now, gps_grace_until) {
-            gps_checked = true;
-            if !gps.present() {
-                if gps.rx_bytes() == 0 {
-                    status_println!("gps: silent on UART1 (power/wiring?)");
+            gps_was_sleeping = gps.sleeping;
+            let fix = gps.has_fix();
+            if fix != had_fix {
+                had_fix = fix;
+                if fix {
+                    ever_had_fix = true;
+                    status_println!("gps fix acquired ({} sats)", gps.packet().sats);
                 } else {
-                    status_println!("gps: {} bytes but no NMEA (baud?)", gps.rx_bytes());
+                    status_println!("gps fix lost");
                 }
             }
-        }
-        if gps.take_updated() && due(now, next_pos) {
-            next_pos = now.wrapping_add(1_000);
-            let p = gps.packet();
-            state::set_position(p);
-            if gps.has_fix() {
-                sdlog.log_position(now, 0, 0, &p);
+            if !gps_nmea_seen && gps.present() {
+                gps_nmea_seen = true;
+                status_println!("gps: NMEA up ({} bytes)", gps.rx_bytes());
             }
-        }
-
-        // ---- LoRa beacon: a position, or a ping without a fix ------------
-        //
-        // Gated on the role here rather than inside the transmit, so a
-        // receive-only node never claims the air for a broadcast it was
-        // never going to send.
-        //
-        // One transmission per interval either way. A fix goes out as a
-        // position; without one the slot carries a ping, so a node
-        // searching for the sky is a node a receiver can hear rather than
-        // one indistinguishable from out of range or dead. A ping is the
-        // smaller of the two on air, so this cannot push a node past the
-        // duty cycle its beacon already fits in.
-        // The sleep gate is not politeness: a transmit awaits for the frame's
-        // time on air, which at the slowest settings the config accepts is
-        // nearly ten seconds, and a sleep that arrives just after one starts
-        // waits all of it out. Declining to start one keeps the sleep path's
-        // parking budget covering a beacon already in flight rather than one
-        // this pass was about to begin.
-        if cfg.role.transmits()
-            && cfg.beacon_interval_s != 0
-            && due(now, next_beacon)
-            && !state::transfer_active()
-            && !state::sleep_now_pending()
-        {
-            // The SX1262 does not reset with the MCU. If it browned out and
-            // restarted on its own it is back at its power-up defaults -
-            // antenna switch unpowered, DIO2 not switching - and keying up
-            // into that ramps +22 dBm into an isolated port. Nothing about
-            // it looks wrong from the counters, so this is the only place
-            // it can be caught.
-            if node.radio_mut().looks_reset() {
-                status_println!("radio restarted underneath us, re-initializing");
-                node.radio_mut().init(&cfg).await;
+            // Settings retry. Two things leave the module running its own
+            // defaults while the firmware reports the ones it asked for: a
+            // boot-time push that landed before the receiver had finished
+            // starting, and a wake from backup mode, which cuts power to the
+            // receiver core and takes the whole RAM configuration layer with it
+            // - including the four NMEA sentences this firmware silences to fit
+            // 9600 baud. Driving the retry off `configured` rather than off the
+            // first sentence covers both, since `wake` clears it.
+            if !gps.configured
+                && !gps.sleeping
+                && gps.present()
+                && gps_cfg_tries < GPS_CFG_TRIES
+                && due(now, next_gps_cfg)
+            {
+                next_gps_cfg = now.wrapping_add(2_000);
+                gps_cfg_tries += 1;
+                if gps.configure(&cfg.gps).await {
+                    status_println!("gps: settings applied");
+                } else if gps_cfg_tries == GPS_CFG_TRIES {
+                    status_println!("gps: settings still not accepted, giving up");
+                }
             }
-            let payload_is_fix = gps.has_fix();
-            state::set_radio_busy(true);
-            tx_led.pulse(now);
-            let sent = if payload_is_fix {
-                let (pos, n) = lora::encode_position(&gps.packet(), cfg.beacon_fields);
-                node.broadcast(&pos[..n]).await
-            } else {
-                node.broadcast(
-                    &lora::Ping {
-                        uptime_s: (now_ms / 1_000).min(u16::MAX as u64) as u16,
-                        gps_present: gps.present(),
-                        had_fix: ever_had_fix,
+            // Not while the receiver is in a backup this firmware asked for:
+            // silence is the request working, and reporting it as a wiring or
+            // baud fault sends whoever is measuring the GPS off after a bug
+            // that is not there.
+            if !gps_checked && !gps.sleeping && due(now, gps_grace_until) {
+                gps_checked = true;
+                if !gps.present() {
+                    if gps.rx_bytes() == 0 {
+                        status_println!("gps: silent on UART1 (power/wiring?)");
+                    } else {
+                        status_println!("gps: {} bytes but no NMEA (baud?)", gps.rx_bytes());
                     }
-                    .encode(),
-                )
-                .await
-            };
-            state::set_radio_busy(false);
-            match sent {
-                Ok(()) => {
-                    tx_count = tx_count.saturating_add(1);
+                }
+            }
+            if gps.take_updated() && due(now, next_pos) {
+                next_pos = now.wrapping_add(1_000);
+                let p = gps.packet();
+                state::set_position(p);
+                if gps.has_fix() {
+                    sdlog.log_position(now, 0, 0, &p);
+                }
+            }
+
+            // ---- LoRa beacon: a position, or a ping without a fix ------------
+            //
+            // Gated on the role here rather than inside the transmit, so a
+            // receive-only node never claims the air for a broadcast it was
+            // never going to send.
+            //
+            // One transmission per interval either way. A fix goes out as a
+            // position; without one the slot carries a ping, so a node
+            // searching for the sky is a node a receiver can hear rather than
+            // one indistinguishable from out of range or dead. A ping is the
+            // smaller of the two on air, so this cannot push a node past the
+            // duty cycle its beacon already fits in.
+            // The sleep gate is not politeness: a transmit awaits for the frame's
+            // time on air, which at the slowest settings the config accepts is
+            // nearly ten seconds, and a sleep that arrives just after one starts
+            // waits all of it out. Declining to start one keeps the sleep path's
+            // parking budget covering a beacon already in flight rather than one
+            // this pass was about to begin.
+            if cfg.role.transmits()
+                && cfg.beacon_interval_s != 0
+                && due(now, next_beacon)
+                && !state::transfer_active()
+                && !state::sleep_now_pending()
+            {
+                // The SX1262 does not reset with the MCU. If it browned out and
+                // restarted on its own it is back at its power-up defaults -
+                // antenna switch unpowered, DIO2 not switching - and keying up
+                // into that ramps +22 dBm into an isolated port. Nothing about
+                // it looks wrong from the counters, so this is the only place
+                // it can be caught.
+                if node.radio_mut().looks_reset() {
+                    status_println!("radio restarted underneath us, re-initializing");
+                    node.radio_mut().init(&cfg).await;
+                }
+                let payload_is_fix = gps.has_fix();
+                state::set_radio_busy(true);
+                tx_led.pulse(now);
+                let sent = if payload_is_fix {
+                    let (pos, n) = lora::encode_position(&gps.packet(), cfg.beacon_fields);
+                    node.broadcast(&pos[..n]).await
+                } else {
+                    node.broadcast(
+                        &lora::Ping {
+                            uptime_s: (now_ms / 1_000).min(u16::MAX as u64) as u16,
+                            gps_present: gps.present(),
+                            had_fix: ever_had_fix,
+                        }
+                        .encode(),
+                    )
+                    .await
+                };
+                state::set_radio_busy(false);
+                match sent {
+                    Ok(()) => {
+                        tx_count = tx_count.saturating_add(1);
+                        vprintln!(
+                            "beacon {} ({} ms on air)",
+                            if payload_is_fix { "position" } else { "ping" },
+                            cfg.beacon_airtime_us() / 1000
+                        );
+                    }
+                    Err(e) => vprintln!("beacon TX failed: {:?}", e),
+                }
+                // Jitter on top of the interval so two nodes that happened to
+                // line up do not stay lined up.
+                //
+                // Timed from after the transmit, not from the top of this pass:
+                // the send awaited, and at the slowest settings the config
+                // accepts that is nearly ten seconds. Measuring the interval
+                // from a stale `now` would spend most of it inside the
+                // transmission it is supposed to follow.
+                let jitter = node.random(2_000);
+                next_beacon = (Instant::now().as_millis() as u32)
+                    .wrapping_add(cfg.beacon_interval_s as u32 * 1_000)
+                    .wrapping_add(jitter);
+            }
+
+            // ---- LoRa receive -------------------------------------------------
+            if let Some(rx) = node.poll(now) {
+                rx_count = rx_count.saturating_add(1);
+                rx_led.pulse(now);
+                if let Some(p) = lora::decode_position(rx.payload) {
+                    vprintln!("position from node {} rssi {}", rx.src, rx.rssi);
+                    let mut v = [0u8; ble::REMOTE_LEN];
+                    v[0] = rx.src;
+                    v[1..3].copy_from_slice(&rx.rssi.to_le_bytes());
+                    v[3..].copy_from_slice(&p.encode());
+                    state::record_remote(now_ms, Report::Position(v));
+                    sdlog.log_position(now, rx.src, rx.rssi, &p);
+                } else if let Some(ping) = lora::Ping::decode(rx.payload) {
+                    // A node on the air with no fix to report. Nothing to log
+                    // to SD - there is no position - but an app gets it as data
+                    // as well as prose, so it can show the node as
+                    // alive-without-a-fix rather than parse the line below.
+                    let mut v = [0u8; link::PING_LEN];
+                    v[0] = rx.src;
+                    v[1..3].copy_from_slice(&rx.rssi.to_le_bytes());
+                    v[3] = ping.flags();
+                    v[4..6].copy_from_slice(&ping.uptime_s.to_le_bytes());
+                    state::record_remote(now_ms, Report::Ping(v));
+                    status_println!(
+                        "node {} ping: rssi {}, up {}s, gps {}{}",
+                        rx.src,
+                        rx.rssi,
+                        ping.uptime_s,
+                        if ping.gps_present { "ok" } else { "silent" },
+                        if ping.had_fix { ", fix lost" } else { "" }
+                    );
+                } else {
                     vprintln!(
-                        "beacon {} ({} ms on air)",
-                        if payload_is_fix { "position" } else { "ping" },
-                        cfg.beacon_airtime_us() / 1000
+                        "node {} sent {} bytes this build does not decode",
+                        rx.src,
+                        rx.payload.len()
                     );
                 }
-                Err(e) => vprintln!("beacon TX failed: {:?}", e),
             }
-            // Jitter on top of the interval so two nodes that happened to
-            // line up do not stay lined up.
-            //
-            // Timed from after the transmit, not from the top of this pass:
-            // the send awaited, and at the slowest settings the config
-            // accepts that is nearly ten seconds. Measuring the interval
-            // from a stale `now` would spend most of it inside the
-            // transmission it is supposed to follow.
-            let jitter = node.random(2_000);
-            next_beacon = (Instant::now().as_millis() as u32)
-                .wrapping_add(cfg.beacon_interval_s as u32 * 1_000)
-                .wrapping_add(jitter);
-        }
 
-        // ---- LoRa receive -------------------------------------------------
-        if let Some(rx) = node.poll(now) {
-            rx_count = rx_count.saturating_add(1);
-            rx_led.pulse(now);
-            if let Some(p) = lora::decode_position(rx.payload) {
-                vprintln!("position from node {} rssi {}", rx.src, rx.rssi);
-                let mut v = [0u8; ble::REMOTE_LEN];
-                v[0] = rx.src;
-                v[1..3].copy_from_slice(&rx.rssi.to_le_bytes());
-                v[3..].copy_from_slice(&p.encode());
-                state::record_remote(now_ms, Report::Position(v));
-                sdlog.log_position(now, rx.src, rx.rssi, &p);
-            } else if let Some(ping) = lora::Ping::decode(rx.payload) {
-                // A node on the air with no fix to report. Nothing to log
-                // to SD - there is no position - but an app gets it as data
-                // as well as prose, so it can show the node as
-                // alive-without-a-fix rather than parse the line below.
-                let mut v = [0u8; link::PING_LEN];
-                v[0] = rx.src;
-                v[1..3].copy_from_slice(&rx.rssi.to_le_bytes());
-                v[3] = ping.flags();
-                v[4..6].copy_from_slice(&ping.uptime_s.to_le_bytes());
-                state::record_remote(now_ms, Report::Ping(v));
-                status_println!(
-                    "node {} ping: rssi {}, up {}s, gps {}{}",
-                    rx.src,
-                    rx.rssi,
-                    ping.uptime_s,
-                    if ping.gps_present { "ok" } else { "silent" },
-                    if ping.had_fix { ", fix lost" } else { "" }
-                );
-            } else {
-                vprintln!(
-                    "node {} sent {} bytes this build does not decode",
-                    rx.src,
-                    rx.payload.len()
-                );
-            }
-        }
-
-        // ---- Repeat forwarding --------------------------------------------
-        // Only a node configured as a repeater ever has one of these
-        // queued; a leaf-only network never enters this branch.
-        if node.repeat_due(now) && !state::transfer_active() {
-            state::set_radio_busy(true);
-            tx_led.pulse(now);
-            let went = node.send_due_repeat(now).await;
-            state::set_radio_busy(false);
-            if went {
-                tx_count = tx_count.saturating_add(1);
+            // ---- Repeat forwarding --------------------------------------------
+            // Only a node configured as a repeater ever has one of these
+            // queued; a leaf-only network never enters this branch.
+            if node.repeat_due(now) && !state::transfer_active() {
+                state::set_radio_busy(true);
+                tx_led.pulse(now);
+                let went = node.send_due_repeat(now).await;
+                state::set_radio_busy(false);
+                if went {
+                    tx_count = tx_count.saturating_add(1);
+                }
             }
         }
 
@@ -1637,7 +1890,7 @@ async fn hardware_task(
         // so this is fast enough that a fix or a packet lands promptly and
         // slow enough that the 11 ms frame write is a couple of percent of
         // the loop. `flush` is a no-op when nothing changed.
-        if j5.is_some() && due(now, next_oled) {
+        if j5.is_some() && live != Mode::Stored && due(now, next_oled) {
             next_oled = now.wrapping_add(500);
             let telemetry = state::telemetry();
             let own = gps.packet();
@@ -1700,7 +1953,10 @@ async fn hardware_task(
             );
         }
 
-        Timer::after(Duration::from_millis(10)).await;
+        // 100 Hz while there is a radio to poll and a UART to drain; a
+        // fifth of that when there is neither, since the housekeeping above
+        // has nothing that moves faster than the panel's 2 Hz.
+        Timer::after(Duration::from_millis(if standby { 50 } else { 10 })).await;
     }
 }
 
@@ -1757,6 +2013,69 @@ fn draw_screen(
     };
     let (fix, sats) = (own.has_fix(), own.sats);
     oled::render_compass(oled, &target, heading, fix, sats);
+}
+
+/// Read the card and adopt what is on it.
+///
+/// A function rather than a stretch of `hardware_task` because a wake check
+/// defers all of it: the card stays off the bus until the board knows it is
+/// more than a check, and a promotion runs this then. Everything here is
+/// about the *stored* config - the radio settings, the console verbosity,
+/// the `[power]` section - so it costs nothing on a board with no card and
+/// nothing on a wake nobody answers.
+///
+/// Returns whether a config actually came off the card, which is what the
+/// `CFG_LOADED` telemetry flag reports.
+async fn adopt_card_config(
+    sdlog: &mut SdLog<'static>,
+    cfg: &mut RadioConfig,
+    now: u32,
+    cold: bool,
+) -> bool {
+    sdlog.resume(now);
+    // Give the card a chance to mount before its config is asked for.
+    sdlog.poll(now);
+
+    // Unlike the two-MCU board there is no second copy in the MCU's own
+    // flash - the card is the store, and a config pushed over BLE or USB is
+    // written back to it.
+    //
+    // Scoped so the kilobyte of buffer is not still alive at the await
+    // below, which would put it in this future rather than on the stack.
+    let from_sd = {
+        let mut cfg_buf = [0u8; CONFIG_MAX];
+        sdlog
+            .read_config(&mut cfg_buf)
+            .and_then(|n| match radiocfg::parse_bytes(&cfg_buf[..n]) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    println!("config: RADIO.CFG invalid ({:?}), using defaults", e);
+                    None
+                }
+            })
+    };
+    let loaded = match from_sd {
+        Some(c) => {
+            println!("config: RADIO.CFG loaded (address {})", c.address);
+            *cfg = c;
+            true
+        }
+        None => {
+            println!("config: none stored, using defaults");
+            false
+        }
+    };
+    // Honor sd_enabled only now: the setting itself lives on the card, so
+    // the card has to be read before it can say to stop using it.
+    if !cfg.sd_enabled {
+        println!("SD: disabled by config");
+        sdlog.disable(now);
+    }
+    state::set_verbose(cfg.verbose);
+    state::set_radio_config(cfg.encode());
+    state::set_tx_worst_case_ms(cfg.tx_poll_timeout_ms());
+    adopt_power(cfg, cold).await;
+    loaded
 }
 
 /// Let a config file set the duty cycle.

@@ -12,6 +12,7 @@
 //! kept in step.
 
 use gps_proto::packet;
+use midair_proto::ble::Mode;
 use midair_proto::session::{apply as apply_write, Action};
 
 use crate::state::{self, Request};
@@ -58,6 +59,29 @@ pub async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
             0 => status_println!("config: BLE stays up between windows"),
             s => status_println!("config: BLE down {} s between windows", s),
         },
+        // A mode is a posture rather than one subsystem, so the hardware
+        // loop raises or lowers the lot. Storing the board is the exception:
+        // it is a command that ends with the chip gone, so it goes to the
+        // serve loop by the same route `SleepNow` does - this function runs
+        // inside the GATT session with the ack still unsent, and the link
+        // does not survive the action.
+        Action::SetMode(mode) => match mode {
+            // The serve loop is told either way: it owns the budget, and
+            // the budget is a different number in every mode.
+            Mode::Stored => {
+                let secs = settings::get().sleep_cadence();
+                status_println!("mode: stored, sleeping {} s per wake check", secs);
+                state::request_sleep_now(secs);
+            }
+            other => {
+                state::request(Request::Mode(other));
+                state::MODE_SIGNAL.signal(());
+                status_println!("mode: {}", other.as_str());
+            }
+        },
+        Action::IdleTimeout(secs) => {
+            qprintln!("config: idle timeout {} s", secs);
+        }
         Action::None => {
             qprintln!("config: rejected write (status {})", outcome.ack[1]);
         }

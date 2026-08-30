@@ -15,6 +15,7 @@
 //! The magic word is what separates a real RTC RAM copy from whatever was
 //! in that memory at a cold boot; only a cold boot pays for the flash read.
 
+use midair_proto::ble::Mode;
 use midair_proto::session::Stored;
 use portable_atomic::{AtomicU32, Ordering};
 
@@ -33,6 +34,12 @@ static FLAGS: AtomicU32 = AtomicU32::new(0);
 static ADV_WINDOW: AtomicU32 = AtomicU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static BLE_OFF: AtomicU32 = AtomicU32::new(0);
+/// The *live* mode, which is the one difference between this copy and the
+/// flash record: RTC RAM may say idle, flash never does.
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static MODE: AtomicU32 = AtomicU32::new(0);
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static IDLE_TIMEOUT: AtomicU32 = AtomicU32::new(0);
 
 /// How many deep sleeps this board has woken from since its last cold
 /// boot, and the seconds it was last told to sleep for.
@@ -57,6 +64,10 @@ pub fn get() -> Stored {
             flags: FLAGS.load(Ordering::Relaxed),
             adv_window_s: ADV_WINDOW.load(Ordering::Relaxed),
             ble_off_s: BLE_OFF.load(Ordering::Relaxed),
+            // A word that is not a mode can only be corruption, and the
+            // safe reading of it is the mode a board can be woken out of.
+            mode: Mode::from_wire(MODE.load(Ordering::Relaxed) as u8).unwrap_or_default(),
+            idle_timeout_s: IDLE_TIMEOUT.load(Ordering::Relaxed),
         }
     } else {
         Stored::new()
@@ -68,7 +79,26 @@ pub fn set(s: Stored) {
     FLAGS.store(s.flags, Ordering::Relaxed);
     ADV_WINDOW.store(s.adv_window_s, Ordering::Relaxed);
     BLE_OFF.store(s.ble_off_s, Ordering::Relaxed);
+    MODE.store(u32::from(s.mode.as_wire()), Ordering::Relaxed);
+    IDLE_TIMEOUT.store(s.idle_timeout_s, Ordering::Relaxed);
     MAGIC_WORD.store(MAGIC, Ordering::Relaxed);
+}
+
+/// Set the live mode without touching flash.
+///
+/// The boot path and the wake-check promotion both use this. Neither is a
+/// settings change an app made, and neither may cost a flash write: a
+/// promotion happens every time somebody connects to a stored board, and
+/// the mode it moves to is one that never reaches flash anyway.
+pub fn set_mode(mode: Mode) {
+    let mut stored = get();
+    stored.mode = mode;
+    set(stored);
+}
+
+/// The live mode.
+pub fn mode() -> Mode {
+    get().mode
 }
 
 /// Adopt the `[power]` section of a config file, returning whether anything

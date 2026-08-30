@@ -85,6 +85,9 @@ pub struct SdLog<'d> {
     next_retry_ms: u32,
     /// Cleared by [`disable`](Self::disable) to shut the card down for good.
     enabled: bool,
+    /// Set by [`defer`](Self::defer) to hold the mount off until the board
+    /// knows it is more than a wake check.
+    deferred: bool,
 }
 
 impl<'d> SdLog<'d> {
@@ -98,7 +101,49 @@ impl<'d> SdLog<'d> {
             next_flush_ms: 0,
             next_retry_ms: 0,
             enabled: true,
+            deferred: false,
         }
+    }
+
+    /// Hold the card off the bus until something says otherwise.
+    ///
+    /// A wake check exists to ask whether anyone wants the board back, and
+    /// that question needs BLE and nothing else - so a wake nobody answers
+    /// never pays to mount a filesystem it will not read. Unlike
+    /// [`disable`](Self::disable) this is reversible: a promotion calls
+    /// [`resume`](Self::resume) and the card comes up then.
+    pub fn defer(&mut self) {
+        self.deferred = true;
+    }
+
+    /// Let the card mount again, starting now rather than at the next
+    /// retry deadline.
+    pub fn resume(&mut self, now_ms: u32) {
+        self.deferred = false;
+        self.next_retry_ms = now_ms;
+    }
+
+    /// Flush what is buffered and let the card go, for a board that is
+    /// about to lose the whole chip.
+    ///
+    /// The flush is the point. `log_position` appends to a RAM buffer that
+    /// only [`poll`](Self::poll) writes out, on a 5 s timer, so at the 1 Hz
+    /// fix rate there are up to five fixes in it at any instant - and deep
+    /// sleep is a full reset, so without this they are simply lost. The gap
+    /// always lands at the end of a wake, which is the part a reader would
+    /// use to work out where the board was when it went down.
+    ///
+    /// The unmount that follows costs nothing here (there is no rail to cut
+    /// on this board) but leaves the FAT directory entry closed rather than
+    /// trusting a sleeping card to have finished.
+    pub fn park(&mut self, now_ms: u32) {
+        if !self.enabled {
+            return;
+        }
+        if self.mounted.is_some() && self.pending_len > 0 {
+            self.flush(now_ms);
+        }
+        self.unmount(now_ms);
     }
 
     /// Shut the card down and stop touching it: unmounts, drops whatever is
@@ -116,7 +161,7 @@ impl<'d> SdLog<'d> {
 
     /// Whether a card is mounted and logging.
     pub fn ready(&self) -> bool {
-        self.enabled && self.mounted.is_some()
+        self.enabled && !self.deferred && self.mounted.is_some()
     }
 
     /// Drop the mount and card state so the retry path starts over.
@@ -161,7 +206,7 @@ impl<'d> SdLog<'d> {
     /// Periodic driver: mounts/retries the card and flushes the pending
     /// buffer.
     pub fn poll(&mut self, now_ms: u32) {
-        if !self.enabled {
+        if !self.enabled || self.deferred {
             return;
         }
         if self.mounted.is_none() {
@@ -264,7 +309,7 @@ impl<'d> SdLog<'d> {
     /// bytes are all header comment, so it parses clean as *every* setting
     /// at its default.
     pub fn read_config(&mut self, buf: &mut [u8]) -> Option<usize> {
-        if !self.enabled {
+        if !self.enabled || self.deferred {
             return None;
         }
         let root = self.mounted.as_ref()?.root;
@@ -285,7 +330,7 @@ impl<'d> SdLog<'d> {
 
     /// Replace `RADIO.CFG` with `bytes`. Returns whether it landed.
     pub fn write_config(&mut self, now_ms: u32, bytes: &[u8]) -> bool {
-        if !self.enabled {
+        if !self.enabled || self.deferred {
             return false;
         }
         let Some(m) = &self.mounted else {

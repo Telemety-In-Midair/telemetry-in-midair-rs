@@ -428,6 +428,33 @@ impl<'d> Gps<'d> {
         clear_fix_fields(&mut self.packet);
     }
 
+    /// Put the module into backup and be sure it got there, whatever state
+    /// it was in.
+    ///
+    /// [`sleep`](Self::sleep) is not enough on the path this exists for.
+    /// After a deep sleep the MCU has reset and this driver believes the
+    /// receiver is awake, while the module is very likely still in the
+    /// backup the last park put it into - and a module in backup consumes
+    /// the first bytes sent to it as the wake-up itself rather than parsing
+    /// them. A bare `PMREQ` would therefore be eaten, and the wake it
+    /// triggered would stand: the board would sleep with its receiver
+    /// acquiring, which is the largest load a sleeping board has.
+    ///
+    /// So the wake-up is paid for deliberately. The two throwaway bytes
+    /// wake a module that was down (and are ignored by a module that was
+    /// not), and the request that follows lands in a receiver that is
+    /// listening for it. The cost is a few milliseconds of receiver time
+    /// per park; the alternative is a whole sleep interval of it.
+    pub async fn park(&mut self) {
+        self.write_all(&[0xFF, 0xFF]);
+        Timer::after(Duration::from_millis(5)).await;
+        self.sleeping = false;
+        self.sleep();
+        // Backup takes the RAM configuration layer with it, so whatever
+        // this driver last pushed is gone on the far side.
+        self.configured = false;
+    }
+
     /// Wake the module from backup with UART traffic.
     ///
     /// Clears [`configured`](Self::configured), because backup mode cuts

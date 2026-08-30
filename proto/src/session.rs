@@ -11,7 +11,7 @@
 //! Everything here is pure. The firmware supplies the clock and performs
 //! the effects ([`Action`]); nothing below touches a timer, flash or radio.
 
-use crate::ble;
+use crate::ble::{self, Mode};
 use crate::link;
 use gps_proto::packet;
 
@@ -57,7 +57,20 @@ pub struct Stored {
     /// leaves the LoRa beacon and the GPS running. A board doing this is
     /// still a working tracker and is still logging - it just cannot be
     /// connected to until the next window.
+    ///
+    /// Honored in [`Mode::Tracking`] only: Idle exists to be reachable and
+    /// Stored has no controller to duty-cycle.
     pub ble_off_s: u32,
+    /// What the board is doing, and - once [`Mode::persisted`] has had it -
+    /// what it comes back doing after a flat cell.
+    ///
+    /// The RTC copy holds the live mode, [`Mode::Idle`] included; only
+    /// [`Stored::encode_record`] normalizes it, so flash never says idle.
+    pub mode: Mode,
+    /// How long [`Mode::Idle`] lasts before the board stores itself, 0 =
+    /// never configured. Read it through [`Stored::idle_timeout`], which
+    /// substitutes the default.
+    pub idle_timeout_s: u32,
 }
 
 impl Stored {
@@ -67,6 +80,12 @@ impl Stored {
             flags: 0,
             adv_window_s: 0,
             ble_off_s: 0,
+            // The resting mode, not the one a board comes up in: a cold
+            // boot turns this into [`Mode::Idle`] so a board that has just
+            // been flashed, or has just come back from a flat cell, is
+            // reachable before it stores itself. See [`boot_mode`].
+            mode: Mode::Stored,
+            idle_timeout_s: 0,
         }
     }
 
@@ -90,6 +109,79 @@ impl Stored {
         match self.adv_window_s {
             0 => ble::ESP_ADV_DEFAULT_S,
             s => s,
+        }
+    }
+
+    /// How long [`Mode::Idle`] runs before the board stores itself. A
+    /// stored 0 means never configured and resolves to the default, exactly
+    /// as the advertising window does.
+    ///
+    /// There is no value here that means "never". A board leaves Idle by
+    /// deep-sleeping, so a `sleep_interval_s` of 0 already is "never": with
+    /// no cadence to sleep on there is nowhere for the timeout to send the
+    /// board, and it stays awake and reachable. That is the bench setting,
+    /// and it is what an unconfigured board does.
+    pub fn idle_timeout(&self) -> u32 {
+        match self.idle_timeout_s {
+            0 => ble::IDLE_TIMEOUT_DEFAULT_S,
+            s => s,
+        }
+    }
+
+    /// The cadence a board that has been *told* to store itself sleeps on.
+    ///
+    /// `sleep_interval_s` when it is set. When it is not, an explicit
+    /// `CFG_MODE stored` is still an unambiguous instruction - the same
+    /// reading [`ble::resolve_sleep_now`] gives a commanded nap - so it
+    /// borrows the ceiling rather than being ignored. The passive path (an
+    /// idle timeout) does not do this: nobody asked for that one, so a
+    /// board with deep sleep off simply stays awake.
+    pub fn sleep_cadence(&self) -> u32 {
+        match self.sleep_interval_s {
+            0 => ble::ESP_SLEEP_MAX_S,
+            s => s,
+        }
+    }
+
+    /// How long the board advertises before [`Stored::at_expiry`] decides
+    /// something, which is a different budget in each mode.
+    ///
+    /// A wake check gets the advertising window - long enough for a phone
+    /// to catch it, short enough to be paid for every interval forever.
+    /// Idle gets the whole idle timeout, because being reachable is the
+    /// entire point of the state. Tracking gets the advertising window
+    /// again, as the on-half of the `ble_off_s` duty cycle.
+    pub fn budget_s(&self) -> u32 {
+        match self.mode {
+            Mode::Stored | Mode::Tracking => self.adv_window(),
+            Mode::Idle => self.idle_timeout(),
+        }
+    }
+
+    /// What happens when that budget runs out.
+    ///
+    /// Which duty cycle applies is a property of the mode rather than a
+    /// race between two settings: before the mode existed both were tested
+    /// in one place, deep sleep always won, and `ble_off_s` was dead config
+    /// on any board that had a wake-check cadence.
+    pub fn at_expiry(&self) -> Next {
+        match self.mode {
+            // Both end in storage: a wake check nobody answered goes back
+            // down, and an idle board nobody came for stores itself.
+            Mode::Stored | Mode::Idle => match self.sleep_interval_s {
+                // No cadence to sleep on, so there is nowhere to go. The
+                // board keeps advertising, which is what a bench board and
+                // an unconfigured board both want.
+                0 => Next::Advertise,
+                interval_s => Next::Sleep { interval_s },
+            },
+            // A tracker never deep-sleeps on a cadence - that would stop
+            // the beacon, the logging and the listening, which is the whole
+            // job. What it can drop is the modem.
+            Mode::Tracking => match self.ble_off_s {
+                0 => Next::Advertise,
+                off_s => Next::BleDown { off_s },
+            },
         }
     }
 
@@ -128,6 +220,8 @@ impl Stored {
             notify_interval_ms,
             adv_window_s: self.adv_window(),
             ble_off_s: self.ble_off_s,
+            mode: self.mode,
+            idle_timeout_s: self.idle_timeout(),
         }
     }
 
@@ -154,6 +248,9 @@ impl Stored {
         if let Some(s) = p.sleep_interval_s {
             self.sleep_interval_s = s;
         }
+        if let Some(s) = p.idle_timeout_s {
+            self.idle_timeout_s = s;
+        }
         *self != before
     }
 
@@ -167,6 +264,11 @@ impl Stored {
         rec[12..16].copy_from_slice(&self.flags.to_le_bytes());
         rec[16..20].copy_from_slice(&self.adv_window_s.to_le_bytes());
         rec[20..24].copy_from_slice(&self.ble_off_s.to_le_bytes());
+        // Normalized on the way out, and only here: the RTC copy may say
+        // idle, but a board that came back from a reset still believing it
+        // was idle would sit at awake current with nobody coming.
+        rec[24..28].copy_from_slice(&(self.mode.persisted().as_wire() as u32).to_le_bytes());
+        rec[28..32].copy_from_slice(&self.idle_timeout_s.to_le_bytes());
         let crc = link::crc32(&rec[0..RECORD_LEN - 4]);
         rec[RECORD_LEN - 4..RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
         rec
@@ -189,10 +291,20 @@ impl Stored {
         // defaults. Their trailing bytes are erased flash, so the crc has to
         // be checked where each version put it rather than where this one
         // does.
-        let (crc_at, adv_window_s, ble_off_s) = match word(4) {
-            2 => (V2_CRC_AT, 0, 0),
-            3 => (V3_CRC_AT, word(16), 0),
-            RECORD_VERSION => (RECORD_LEN - 4, word(16), word(20)),
+        let (crc_at, adv_window_s, ble_off_s, mode, idle_timeout_s) = match word(4) {
+            2 => (V2_CRC_AT, 0, 0, Mode::Stored, 0),
+            3 => (V3_CRC_AT, word(16), 0, Mode::Stored, 0),
+            4 => (V4_CRC_AT, word(16), word(20), Mode::Stored, 0),
+            RECORD_VERSION => (
+                RECORD_LEN - 4,
+                word(16),
+                word(20),
+                // A mode this build does not know reads as the safe one: a
+                // board that stores itself can be woken, where one that
+                // guessed at tracking would run its cell down.
+                Mode::from_wire(word(24) as u8).unwrap_or_default(),
+                word(28),
+            ),
             _ => return None,
         };
         if word(crc_at) != link::crc32(&rec[0..crc_at]) {
@@ -203,6 +315,8 @@ impl Stored {
             flags: word(12),
             adv_window_s,
             ble_off_s,
+            mode,
+            idle_timeout_s,
         })
     }
 }
@@ -214,21 +328,29 @@ pub const RECORD_MAGIC: u32 = 0x6D69_6441;
 ///
 /// Version 2 dropped a separate stow interval; a version 1 record is
 /// discarded rather than misread. Version 3 appended the advertising
-/// window and version 4 the BLE off period. Both are pure appends, so an
-/// older record still reads - a board updated in the field keeps the
-/// cadence it was left on instead of coming back advertising continuously.
-pub const RECORD_VERSION: u32 = 4;
+/// window, version 4 the BLE off period, and version 5 the [`Mode`] and its
+/// idle timeout. All are pure appends, so an older record still reads - a
+/// board updated in the field keeps the cadence it was left on instead of
+/// coming back advertising continuously.
+///
+/// A record from before version 5 carries no mode, which reads as
+/// [`Mode::Stored`]: an updated board comes back reachable (a cold boot
+/// lands in [`Mode::Idle`] whatever the record says) and then stores itself
+/// on the cadence it already had.
+pub const RECORD_VERSION: u32 = 5;
 
 /// magic, version, sleep interval, flags, advertising window, BLE off
-/// period, crc32 - all `u32`, so the length is already a multiple of the
-/// flash write word.
-pub const RECORD_LEN: usize = 28;
+/// period, mode, idle timeout, crc32 - all `u32`, so the length is already
+/// a multiple of the flash write word.
+pub const RECORD_LEN: usize = 36;
 
 /// Where the crc sits in a version 2 record, which is this layout minus its
-/// last three words.
+/// last five words.
 const V2_CRC_AT: usize = 16;
-/// Where the crc sits in a version 3 record - this layout minus one word.
+/// Where the crc sits in a version 3 record - this layout minus three.
 const V3_CRC_AT: usize = 20;
+/// Where the crc sits in a version 4 record - this layout minus two.
+const V4_CRC_AT: usize = 24;
 
 // ---------------------------------------------------------------------------
 // Config characteristic writes
@@ -269,6 +391,18 @@ pub enum Action {
     /// Set the position notify interval, in ms, already clamped. Not
     /// persisted: it is per-session state.
     NotifyInterval(u32),
+    /// Put the board into this mode - raise the tracker, lower it to idle,
+    /// or store the board.
+    ///
+    /// Already folded into the settings, so the mode an app reads back is
+    /// the one it asked for. [`Mode::Stored`] is a command like
+    /// [`Action::SleepNow`] and has the same requirement: the ack must
+    /// leave before the board acts, because the link does not survive it.
+    SetMode(Mode),
+    /// The idle timeout is now this many seconds. Already stored and
+    /// clamped; it takes effect at the next re-arm rather than shortening
+    /// the timeout already running.
+    IdleTimeout(u32),
     /// Nothing to do - the write was rejected, and the ack says why.
     None,
 }
@@ -417,6 +551,44 @@ pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
                     &secs.to_le_bytes(),
                 );
             }
+            ble::CFG_MODE => {
+                // Rejected rather than rounded: every value is a different
+                // amount of the board switched off, and a write this
+                // firmware does not understand is one it must not guess at.
+                let Some(mode) = value.first().copied().and_then(Mode::from_wire) else {
+                    return Outcome::reject(id, packet::ACK_BAD_VALUE);
+                };
+                stored.mode = mode;
+                return Outcome::new(
+                    // Saved, because this is the setting that decides what a
+                    // board does when it comes back from a flat cell.
+                    // `encode_record` is where idle stops being idle.
+                    Action::SetMode(mode),
+                    true,
+                    id,
+                    packet::ACK_OK,
+                    &[mode.as_wire()],
+                );
+            }
+            ble::CFG_IDLE_TIMEOUT_S => {
+                let Ok(bytes) = <[u8; 4]>::try_from(value) else {
+                    return Outcome::reject(id, packet::ACK_BAD_VALUE);
+                };
+                // Clamped unconditionally, like the advertising window and
+                // unlike the two intervals where 0 means off: here 0 means
+                // never configured, so storing it would be storing a
+                // timeout that reads back as the default anyway.
+                let secs = u32::from_le_bytes(bytes)
+                    .clamp(ble::IDLE_TIMEOUT_MIN_S, ble::IDLE_TIMEOUT_MAX_S);
+                stored.idle_timeout_s = secs;
+                return Outcome::new(
+                    Action::IdleTimeout(secs),
+                    true,
+                    id,
+                    packet::ACK_OK,
+                    &secs.to_le_bytes(),
+                );
+            }
             ble::CFG_SLEEP_NOW => {
                 let Ok(bytes) = <[u8; 4]>::try_from(value) else {
                     return Outcome::reject(id, packet::ACK_BAD_VALUE);
@@ -468,14 +640,49 @@ pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
 /// discoverable.
 pub const LINGER_S: u64 = 5;
 
+/// Which mode this boot comes up in, from the persisted mode and the wake
+/// cause.
+///
+/// Three flavors, and the difference between them is what the boot raises:
+/// a wake check raises nothing, idle raises BLE and the card, tracking
+/// raises everything.
+///
+/// The inversion worth noticing is the cold boot. The sleep flags were
+/// deliberately not mirrored to flash because "a board that cold-boots with
+/// its GPS running is the safer failure" - true for a tracker, and it
+/// drains the cell of a device in a bag. Landing a cold boot in
+/// [`Mode::Idle`] is safe in both senses: reachable, and with the GPS down.
+/// Only an explicit stored `tracking` raises everything.
+pub fn boot_mode(persisted: Mode, woke_from_sleep: bool) -> Mode {
+    match (persisted, woke_from_sleep) {
+        // Tracking survives the reset, whichever kind it was. A brownout on
+        // the object is the one time it must.
+        (Mode::Tracking, _) => Mode::Tracking,
+        // A timer wake with anything else stored is a wake check: raise
+        // nothing, ask whether anyone wants the board, go back down.
+        (_, true) => Mode::Stored,
+        // Any other cold boot gets a rescue window - a board just flashed,
+        // or one that came back from a flat cell, is reachable for an idle
+        // timeout before it stores itself.
+        (_, false) => Mode::Idle,
+    }
+}
+
 /// What the board should do right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Next {
-    /// Keep advertising. With sleep enabled, for at most
+    /// Keep advertising. With a budget that bites, for at most
     /// [`Window::remaining_ms`] longer.
     Advertise,
-    /// Deep sleep for this many seconds.
+    /// Deep sleep for this many seconds, which is the board going to
+    /// [`Mode::Stored`].
     Sleep { interval_s: u32 },
+    /// Take the BLE modem down for this many seconds and come back.
+    ///
+    /// [`Mode::Tracking`] only. Costs no reset and stops nothing else: the
+    /// beacon keeps transmitting, the GPS keeps tracking and the card keeps
+    /// logging. What it costs is reachability.
+    BleDown { off_s: u32 },
 }
 
 /// The advertising budget for one wake, held as a deadline rather than as a
@@ -517,18 +724,16 @@ impl Window {
         self.ends_ms.saturating_sub(now_ms)
     }
 
-    /// Advertise, or sleep because this wake's budget is spent.
+    /// Advertise, or do whatever this mode does with a spent budget.
     ///
-    /// The interval is passed in per call rather than captured, so enabling
-    /// or disabling sleep mode over BLE takes effect at the next decision
+    /// The settings are passed in per call rather than captured, so a
+    /// cadence or a mode changed over BLE takes effect at the next decision
     /// instead of at the next boot.
-    pub fn next(&self, now_ms: u64, sleep_interval_s: u32) -> Next {
-        if sleep_interval_s > 0 && now_ms >= self.ends_ms {
-            Next::Sleep {
-                interval_s: sleep_interval_s,
-            }
-        } else {
+    pub fn next(&self, now_ms: u64, stored: &Stored) -> Next {
+        if self.remaining_ms(now_ms) > 0 {
             Next::Advertise
+        } else {
+            stored.at_expiry()
         }
     }
 
@@ -536,6 +741,22 @@ impl Window {
     /// back.
     pub fn linger(&mut self, now_ms: u64) {
         self.ends_ms = now_ms.saturating_add(LINGER_S * 1000);
+    }
+
+    /// Re-arm the budget after a central disconnects.
+    ///
+    /// [`Mode::Idle`] restarts the whole timeout rather than spending what
+    /// is left of it: the state exists to be reachable, and a phone that
+    /// has just been talking to the board is the best evidence anyone has
+    /// that someone still wants it. Every other mode gets the linger, which
+    /// is spent advertising rather than merely awake - the point is to let
+    /// the phone come straight back, which it cannot do if the board is up
+    /// but not discoverable.
+    pub fn after_disconnect(&mut self, now_ms: u64, stored: &Stored) {
+        match stored.mode {
+            Mode::Idle => *self = Window::new(now_ms, stored.budget_s()),
+            _ => self.linger(now_ms),
+        }
     }
 }
 
@@ -569,6 +790,16 @@ mod tests {
         packet::parse_ack(o.ack()).expect("ack parses").id
     }
 
+    /// A stored board on `interval_s`, i.e. what a wake check runs on.
+    /// `0` is a board with deep sleep off.
+    fn cadence(interval_s: u32) -> Stored {
+        Stored {
+            sleep_interval_s: interval_s,
+            mode: Mode::Stored,
+            ..Stored::new()
+        }
+    }
+
     // -- settings ----------------------------------------------------------
 
     /// A board that has never been configured powers its GPS, never sleeps
@@ -594,6 +825,8 @@ mod tests {
                 notify_interval_ms: packet::UPDATE_INTERVAL_DEFAULT_MS,
                 adv_window_s: ble::ESP_ADV_DEFAULT_S,
                 ble_off_s: 0,
+                mode: Mode::Stored,
+                idle_timeout_s: ble::IDLE_TIMEOUT_DEFAULT_S,
             }
         );
     }
@@ -867,6 +1100,8 @@ mod tests {
             flags: PFLAG_PWR_OFF | PFLAG_GPS_SLEEP,
             adv_window_s: 45,
             ble_off_s: 90,
+            mode: Mode::Tracking,
+            idle_timeout_s: 900,
         };
         let rec = s.encode_record();
         assert_eq!(rec.len(), RECORD_LEN);
@@ -919,15 +1154,260 @@ mod tests {
         assert_eq!(s.ble_off_s, 0);
     }
 
+    /// The version this mode work replaced. A board updated in the field
+    /// keeps its cadence, window and off period, and reads as a stored
+    /// board - which a cold boot then turns into the idle rescue window.
+    #[test]
+    fn a_version_4_record_still_reads() {
+        let mut rec = [0xFFu8; RECORD_LEN]; // erased flash past the record
+        rec[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+        rec[4..8].copy_from_slice(&4u32.to_le_bytes());
+        rec[8..12].copy_from_slice(&120u32.to_le_bytes());
+        rec[12..16].copy_from_slice(&PFLAG_WIO_SLEEP.to_le_bytes());
+        rec[16..20].copy_from_slice(&45u32.to_le_bytes());
+        rec[20..24].copy_from_slice(&30u32.to_le_bytes());
+        let crc = link::crc32(&rec[0..V4_CRC_AT]);
+        rec[V4_CRC_AT..V4_CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
+
+        let s = Stored::decode_record(&rec).expect("a version 4 record still reads");
+        assert_eq!(s.sleep_interval_s, 120);
+        assert_eq!(s.adv_window_s, 45);
+        assert_eq!(s.ble_off_s, 30);
+        // No mode in that layout, and the safe one is what it reads as: an
+        // updated board is reachable first and stores itself after.
+        assert_eq!(s.mode, Mode::Stored);
+        assert_eq!(s.idle_timeout_s, 0);
+        assert_eq!(s.idle_timeout(), ble::IDLE_TIMEOUT_DEFAULT_S);
+        assert_eq!(boot_mode(s.mode, false), Mode::Idle);
+    }
+
+    /// Idle never reaches flash. The RTC copy carries it - that is what the
+    /// settings characteristic reports and what the serve loop budgets on -
+    /// but a record that said idle would bring a board back at awake
+    /// current with nobody coming.
+    #[test]
+    fn a_record_never_says_idle() {
+        let s = Stored {
+            mode: Mode::Idle,
+            ..Stored::new()
+        };
+        assert_eq!(s.mode, Mode::Idle, "the live copy keeps it");
+        let back = Stored::decode_record(&s.encode_record()).expect("record reads back");
+        assert_eq!(back.mode, Mode::Stored);
+
+        // Tracking is the one mode that does survive, because a brownout on
+        // the object is exactly when it must.
+        let t = Stored {
+            mode: Mode::Tracking,
+            ..Stored::new()
+        };
+        let back = Stored::decode_record(&t.encode_record()).expect("record reads back");
+        assert_eq!(back.mode, Mode::Tracking);
+    }
+
+    // -- modes -------------------------------------------------------------
+
+    /// The three boot flavors. Tracking survives any reset; a timer wake is
+    /// a wake check; every other cold boot gets the rescue window.
+    #[test]
+    fn a_boot_lands_in_the_right_mode() {
+        assert_eq!(boot_mode(Mode::Tracking, true), Mode::Tracking);
+        assert_eq!(boot_mode(Mode::Tracking, false), Mode::Tracking);
+        assert_eq!(boot_mode(Mode::Stored, true), Mode::Stored);
+        assert_eq!(boot_mode(Mode::Stored, false), Mode::Idle);
+        // Idle cannot be persisted, but a garbled record that produced one
+        // must still land somewhere sane.
+        assert_eq!(boot_mode(Mode::Idle, false), Mode::Idle);
+        assert_eq!(boot_mode(Mode::Idle, true), Mode::Stored);
+    }
+
+    /// A mode write is stored, acked with what it stored, and saved -
+    /// because it is the setting that decides what the board does when it
+    /// comes back from a flat cell.
+    #[test]
+    fn a_mode_write_persists_and_acts() {
+        let mut s = Stored::new();
+        let o = apply(&mut s, &write(ble::CFG_MODE, &[2]));
+        assert_eq!(o.action, Action::SetMode(Mode::Tracking));
+        assert!(o.save, "tracking must survive a brownout on the object");
+        assert_eq!(s.mode, Mode::Tracking);
+        assert_eq!(o.ack(), &[ble::CFG_MODE, packet::ACK_OK, 2]);
+
+        let o = apply(&mut s, &write(ble::CFG_MODE, &[1]));
+        assert_eq!(o.action, Action::SetMode(Mode::Idle));
+        assert_eq!(s.mode, Mode::Idle);
+
+        let o = apply(&mut s, &write(ble::CFG_MODE, &[0]));
+        assert_eq!(o.action, Action::SetMode(Mode::Stored));
+        assert_eq!(s.mode, Mode::Stored);
+    }
+
+    /// A mode this firmware does not know is rejected rather than rounded:
+    /// each value is a different amount of the board switched off.
+    #[test]
+    fn an_unknown_mode_is_rejected() {
+        let mut s = Stored {
+            mode: Mode::Tracking,
+            ..Stored::new()
+        };
+        for bad in [&[3u8][..], &[255][..], &[][..]] {
+            let o = apply(&mut s, &write(ble::CFG_MODE, bad));
+            assert_eq!(o.action, Action::None);
+            assert_eq!(ack_status(&o), packet::ACK_BAD_VALUE);
+            assert_eq!(s.mode, Mode::Tracking, "a rejected write changed nothing");
+        }
+    }
+
+    /// The idle timeout clamps like the advertising window: 0 is "never
+    /// configured" and reads back as the default, so there is no way to
+    /// store a timeout nothing could fire.
+    #[test]
+    fn the_idle_timeout_clamps_and_defaults() {
+        let mut s = Stored::new();
+        assert_eq!(s.idle_timeout_s, 0);
+        assert_eq!(s.idle_timeout(), ble::IDLE_TIMEOUT_DEFAULT_S);
+
+        let o = apply(&mut s, &u32_write(ble::CFG_IDLE_TIMEOUT_S, 900));
+        assert_eq!(o.action, Action::IdleTimeout(900));
+        assert!(o.save);
+        assert_eq!(ack_u32(&o), 900);
+        assert_eq!(s.idle_timeout(), 900);
+
+        for (asked, applied) in [
+            (0, ble::IDLE_TIMEOUT_MIN_S),
+            (1, ble::IDLE_TIMEOUT_MIN_S),
+            (u32::MAX, ble::IDLE_TIMEOUT_MAX_S),
+        ] {
+            let o = apply(&mut s, &u32_write(ble::CFG_IDLE_TIMEOUT_S, asked));
+            assert_eq!(ack_u32(&o), applied);
+            assert_eq!(s.idle_timeout_s, applied);
+        }
+    }
+
+    /// Which duty cycle applies is a property of the mode, not a race
+    /// between two settings. The regression: `ble_off_s` used to be dead
+    /// config on any board that had a wake-check cadence, because deep
+    /// sleep was tested first and always won.
+    #[test]
+    fn each_mode_has_its_own_duty_cycle() {
+        let both = Stored {
+            sleep_interval_s: 120,
+            ble_off_s: 30,
+            ..Stored::new()
+        };
+
+        // A wake check goes back down on the cadence and ignores the modem
+        // period - there is no controller to duty-cycle for a board that is
+        // about to lose the whole chip.
+        let wake = Stored {
+            mode: Mode::Stored,
+            ..both
+        };
+        assert_eq!(wake.at_expiry(), Next::Sleep { interval_s: 120 });
+        assert_eq!(wake.budget_s(), wake.adv_window());
+
+        // Idle stores itself, on the same cadence but its own budget.
+        let idle = Stored {
+            mode: Mode::Idle,
+            ..both
+        };
+        assert_eq!(idle.at_expiry(), Next::Sleep { interval_s: 120 });
+        assert_eq!(idle.budget_s(), idle.idle_timeout());
+
+        // Tracking takes the modem down and never the whole chip: deep
+        // sleep would stop the beacon, the logging and the listening.
+        let tracking = Stored {
+            mode: Mode::Tracking,
+            ..both
+        };
+        assert_eq!(tracking.at_expiry(), Next::BleDown { off_s: 30 });
+        assert_eq!(tracking.budget_s(), tracking.adv_window());
+    }
+
+    /// With no cadence there is nowhere for an idle timeout to send the
+    /// board, so it stays awake and reachable. That is the bench setting,
+    /// and it is what an unconfigured board does.
+    #[test]
+    fn no_cadence_means_the_board_never_stores_itself() {
+        let s = Stored {
+            mode: Mode::Idle,
+            sleep_interval_s: 0,
+            idle_timeout_s: 60,
+            ..Stored::new()
+        };
+        assert_eq!(s.at_expiry(), Next::Advertise);
+        let w = Window::new(0, s.budget_s());
+        assert_eq!(w.next(60_000, &s), Next::Advertise);
+
+        // An explicit command to store the board is different: somebody
+        // asked for it, so it borrows the ceiling rather than being
+        // ignored.
+        assert_eq!(s.sleep_cadence(), ble::ESP_SLEEP_MAX_S);
+        assert_eq!(cadence(120).sleep_cadence(), 120);
+    }
+
+    /// A disconnect in idle re-arms the whole timeout rather than the five
+    /// second linger: the state exists to be reachable, and a phone that
+    /// has just been talking to the board is the best evidence anyone still
+    /// wants it.
+    #[test]
+    fn a_disconnect_in_idle_restarts_the_timeout() {
+        let s = Stored {
+            mode: Mode::Idle,
+            sleep_interval_s: 120,
+            idle_timeout_s: 600,
+            ..Stored::new()
+        };
+        let mut w = Window::new(0, s.budget_s());
+        let disconnected_at = 900_000;
+        assert_eq!(
+            w.next(disconnected_at, &s),
+            Next::Sleep { interval_s: 120 },
+            "the budget was already spent while connected"
+        );
+        w.after_disconnect(disconnected_at, &s);
+        assert_eq!(w.remaining_ms(disconnected_at), 600_000);
+        assert_eq!(
+            w.next(disconnected_at + 600_000, &s),
+            Next::Sleep { interval_s: 120 }
+        );
+    }
+
+    /// A promotion: a wake check that somebody connected to becomes idle,
+    /// with the idle budget rather than what was left of the advertising
+    /// window. The connect itself is the doorbell.
+    #[test]
+    fn a_promotion_swaps_the_budget() {
+        let mut s = Stored {
+            sleep_interval_s: 300,
+            adv_window_s: 15,
+            idle_timeout_s: 600,
+            ..Stored::new()
+        };
+        assert_eq!(boot_mode(s.mode, true), Mode::Stored);
+        let w = Window::new(0, s.budget_s());
+        assert_eq!(w.remaining_ms(0), 15_000);
+
+        // Somebody connects at 8 s in.
+        s.mode = Mode::Idle;
+        let w = Window::new(8_000, s.budget_s());
+        assert_eq!(w.remaining_ms(8_000), 600_000);
+        assert_eq!(w.next(20_000, &s), Next::Advertise, "the wake check would have slept");
+        assert_eq!(
+            w.next(608_000, &s),
+            Next::Sleep { interval_s: 300 },
+            "and then it stores itself"
+        );
+    }
+
     /// Anything that is not this firmware's record leaves the board
     /// unconfigured rather than acting on someone else's bytes.
     #[test]
     fn a_record_that_is_not_ours_is_ignored() {
         let good = Stored {
             sleep_interval_s: 60,
-            flags: 0,
             adv_window_s: 15,
-            ble_off_s: 0,
+            ..Stored::new()
         }
         .encode_record();
 
@@ -962,27 +1442,29 @@ mod tests {
     /// window says - the window only paces a wake check.
     #[test]
     fn sleep_off_means_the_board_never_sleeps() {
+        let s = cadence(0);
         let w = Window::new(0, 15);
-        assert_eq!(w.next(0, 0), Next::Advertise);
-        assert_eq!(w.next(15_000, 0), Next::Advertise);
-        assert_eq!(w.next(u64::MAX, 0), Next::Advertise);
+        assert_eq!(w.next(0, &s), Next::Advertise);
+        assert_eq!(w.next(15_000, &s), Next::Advertise);
+        assert_eq!(w.next(u64::MAX, &s), Next::Advertise);
     }
 
     /// The wake advertises for the configured window and then sleeps for
     /// the configured interval.
     #[test]
     fn a_spent_window_ends_in_deep_sleep() {
+        let s = cadence(60);
         let w = Window::new(1_000, 15);
         assert_eq!(w.ends_ms(), 16_000);
-        assert_eq!(w.next(1_000, 60), Next::Advertise);
+        assert_eq!(w.next(1_000, &s), Next::Advertise);
         assert_eq!(w.remaining_ms(1_000), 15_000);
-        assert_eq!(w.next(15_999, 60), Next::Advertise);
+        assert_eq!(w.next(15_999, &s), Next::Advertise);
         assert_eq!(w.remaining_ms(15_999), 1);
-        assert_eq!(w.next(16_000, 60), Next::Sleep { interval_s: 60 });
+        assert_eq!(w.next(16_000, &s), Next::Sleep { interval_s: 60 });
         assert_eq!(w.remaining_ms(16_000), 0);
         // A clock past the deadline is still a spent budget, not a wrap.
         assert_eq!(w.remaining_ms(u64::MAX), 0);
-        assert_eq!(w.next(u64::MAX, 60), Next::Sleep { interval_s: 60 });
+        assert_eq!(w.next(u64::MAX, &s), Next::Sleep { interval_s: 60 });
     }
 
     /// The regression the deadline exists for: a central that keeps failing
@@ -990,15 +1472,16 @@ mod tests {
     /// asks again, and the answer is still measured from the wake.
     #[test]
     fn retries_cannot_extend_the_window() {
+        let s = cadence(30);
         let w = Window::new(0, 15);
         let mut now = 0;
         // A connect attempt that fails every 200 ms, as the firmware's
         // retry pause does.
-        while let Next::Advertise = w.next(now, 30) {
+        while let Next::Advertise = w.next(now, &s) {
             now += 200;
             assert!(now <= 15_200, "the window never ended");
         }
-        assert_eq!(w.next(now, 30), Next::Sleep { interval_s: 30 });
+        assert_eq!(w.next(now, &s), Next::Sleep { interval_s: 30 });
         assert_eq!(w.ends_ms(), 15_000, "the deadline moved");
     }
 
@@ -1006,19 +1489,20 @@ mod tests {
     /// back instead of waiting out a whole sleep interval.
     #[test]
     fn a_disconnect_lingers_then_sleeps() {
+        let s = cadence(60);
         let mut w = Window::new(0, 15);
         // A session that outlasted the original window.
         let disconnected_at = 400_000;
         assert_eq!(
-            w.next(disconnected_at, 60),
+            w.next(disconnected_at, &s),
             Next::Sleep { interval_s: 60 },
             "the budget was already spent while connected"
         );
-        w.linger(disconnected_at);
-        assert_eq!(w.next(disconnected_at, 60), Next::Advertise);
+        w.after_disconnect(disconnected_at, &s);
+        assert_eq!(w.next(disconnected_at, &s), Next::Advertise);
         assert_eq!(w.remaining_ms(disconnected_at), LINGER_S * 1000);
         assert_eq!(
-            w.next(disconnected_at + LINGER_S * 1000, 60),
+            w.next(disconnected_at + LINGER_S * 1000, &s),
             Next::Sleep { interval_s: 60 }
         );
     }
@@ -1028,8 +1512,11 @@ mod tests {
     #[test]
     fn enabling_sleep_takes_effect_within_the_window() {
         let w = Window::new(0, 15);
-        assert_eq!(w.next(20_000, 0), Next::Advertise);
-        assert_eq!(w.next(20_000, 300), Next::Sleep { interval_s: 300 });
+        assert_eq!(w.next(20_000, &cadence(0)), Next::Advertise);
+        assert_eq!(
+            w.next(20_000, &cadence(300)),
+            Next::Sleep { interval_s: 300 }
+        );
     }
 
     /// The window a wake runs on is the one that was stored when it woke.
@@ -1062,13 +1549,10 @@ mod tests {
         let mut now = 0;
         for _ in 0..3 {
             assert!(!s.rail_at_boot(true), "a wake check comes up dark");
-            let w = Window::new(now, s.adv_window());
-            assert_eq!(w.next(now, s.sleep_interval_s), Next::Advertise);
+            let w = Window::new(now, s.budget_s());
+            assert_eq!(w.next(now, &s), Next::Advertise);
             now += 10_000;
-            assert_eq!(
-                w.next(now, s.sleep_interval_s),
-                Next::Sleep { interval_s: 120 }
-            );
+            assert_eq!(w.next(now, &s), Next::Sleep { interval_s: 120 });
             now += 120_000;
         }
     }
@@ -1164,9 +1648,9 @@ mod tests {
     fn an_absent_power_key_leaves_the_live_value_alone() {
         let mut stored = Stored {
             sleep_interval_s: 60,
-            flags: 0,
             adv_window_s: 10,
             ble_off_s: 45,
+            ..Stored::new()
         };
         let before = stored;
 

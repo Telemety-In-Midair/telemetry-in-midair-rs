@@ -352,8 +352,13 @@ pub struct PowerConfig {
     pub ble_off_s: Option<u32>,
     /// Seconds each advertising window lasts; 0 means the firmware default.
     pub adv_window_s: Option<u32>,
-    /// Seconds between deep-sleep wake checks; 0 never deep-sleeps.
+    /// Seconds between deep-sleep wake checks, i.e. the cadence
+    /// `Mode::Stored` runs on; 0 never deep-sleeps, which also means the
+    /// board never stores itself and stays reachable.
     pub sleep_interval_s: Option<u32>,
+    /// Seconds `Mode::Idle` lasts before the board stores itself; 0 means
+    /// the firmware default.
+    pub idle_timeout_s: Option<u32>,
 }
 
 /// Parsed and validated radio configuration.
@@ -1031,6 +1036,19 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                 }
                 cfg.power.sleep_interval_s = Some(v as u32);
             }
+            "idle_timeout_s" => {
+                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
+                // 0 is legal and means "the firmware default", as with the
+                // advertising window: there is no "never" here, because a
+                // `sleep_interval_s` of 0 already is one.
+                if v != 0
+                    && !(ble::IDLE_TIMEOUT_MIN_S as u64..=ble::IDLE_TIMEOUT_MAX_S as u64)
+                        .contains(&v)
+                {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+                cfg.power.idle_timeout_s = Some(v as u32);
+            }
             _ => {} // unknown key: ignore
         }
     }
@@ -1647,11 +1665,14 @@ mod tests {
 
     #[test]
     fn power_values_parse_and_range_check() {
-        let cfg = parse("[power]\nble_off_s = 30\nadv_window_s = 10\nsleep_interval_s = 120")
-            .unwrap();
+        let cfg = parse(
+            "[power]\nble_off_s = 30\nadv_window_s = 10\nsleep_interval_s = 120\nidle_timeout_s = 900",
+        )
+        .unwrap();
         assert_eq!(cfg.power.ble_off_s, Some(30));
         assert_eq!(cfg.power.adv_window_s, Some(10));
         assert_eq!(cfg.power.sleep_interval_s, Some(120));
+        assert_eq!(cfg.power.idle_timeout_s, Some(900));
 
         // Below the floor but not zero, and above the ceiling, on each key.
         for bad in [
@@ -1660,6 +1681,8 @@ mod tests {
             "adv_window_s = 61",
             "sleep_interval_s = 1",
             "sleep_interval_s = 301",
+            "idle_timeout_s = 9",
+            "idle_timeout_s = 3601",
         ] {
             assert_eq!(
                 parse(bad),

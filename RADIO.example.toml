@@ -150,14 +150,14 @@ dynamic_model_description = "GPS motion model: portable, stationary, pedestrian,
 dynamic_model_type = "enum:portable,stationary,pedestrian,automotive,sea,airborne1g,airborne2g,airborne4g"
 
 # -- Power --------------------------------------------------------------
-# The duty cycle: how much of the time the board is reachable. These three
+# The duty cycle: how much of the time the board is reachable. These four
 # are the only keys in this file the board also keeps its own copy of, in
 # RTC RAM so they survive a deep sleep and in flash so they survive a flat
 # cell, and they are the only ones an app can change live over BLE.
 #
 # So they follow a different rule to every other key here: an absent one
 # leaves the board's current value alone rather than resetting it to the
-# default. That is why all three are commented out - a push of this file
+# default. That is why all four are commented out - a push of this file
 # should not silently undo a duty cycle somebody set from the app. Uncomment
 # one and it wins at the next boot, because the file is what survives a
 # reflash and the RTC copy is not.
@@ -166,14 +166,34 @@ dynamic_model_type = "enum:portable,stationary,pedestrian,automotive,sea,airborn
 # a duty cycle off. Live changes made over BLE or `wio-set` last until the
 # next cold boot, where an uncommented key here takes over again.
 #
+# What is NOT here is the mode. The board has three - stored, idle and
+# tracking - and which one it is in is a command (`CFG_MODE` from the app,
+# `wio-set mode` from a bench), never a file: a card that said "tracking"
+# would put every board it was ever copied into onto the air.
+#
+# Each key below belongs to one mode, and only that mode reads it:
+#
+#   stored    sleep_interval_s   how often a stored board wakes to ask
+#                                whether anyone wants it
+#             adv_window_s       how long each of those checks advertises
+#   idle      idle_timeout_s     how long a reachable board waits before
+#                                storing itself
+#   tracking  ble_off_s          how long the modem is down between
+#                                windows on a board that is on the air
+#
 # ble_off_s is the large one: the BLE controller is about 71 mA of the
 # board's 126, and ending its lifetime is the only thing that reduces it.
+# Before the modes existed it was also dead config on any board that had a
+# wake-check cadence, because deep sleep was tested first and always won.
 [power]
 # ble_off_s = 0
 # ble_off_s_description = "Seconds the BLE controller is powered down between advertising windows, 0 or 5-300. This is the biggest single saving the firmware has: the controller is about 71 mA of the board's 126 and nothing but ending its lifetime reduces it, so the board drops to ~60 mA for this long and is unreachable over BLE while it does. LoRa, GPS and logging keep running throughout, so it is still a working tracker. 0 keeps BLE up continuously."
 
 # adv_window_s = 0
-# adv_window_s_description = "Seconds each advertising window lasts, 0 or 1-60. 0 means the firmware default of 15 s. Only meaningful alongside ble_off_s or sleep_interval_s - with both at 0 the board advertises forever and the window never ends."
+# adv_window_s_description = "Seconds each advertising window lasts, 0 or 1-60. 0 means the firmware default of 15 s. This is the window a stored board's wake check advertises for - the whole of the time a stored board is reachable, so it and sleep_interval_s together are what a phone has to catch. While tracking it is the on-half of the ble_off_s duty cycle instead. With ble_off_s and sleep_interval_s both at 0 the board advertises forever and the window never ends."
 
 # sleep_interval_s = 0
-# sleep_interval_s_description = "Seconds between deep-sleep wake checks, 0 or 5-300. 0 never deep-sleeps. Deep sleep takes the whole chip down rather than just the BLE controller, so it is the larger saving and the larger cost: the board stops beaconing, stops logging, and every wake is a full reset."
+# sleep_interval_s_description = "Seconds between wake checks while the board is stored, 0 or 5-300. 0 never deep-sleeps, which also means the board never stores itself: with no cadence to sleep on, the idle timeout has nowhere to send it and it stays awake and reachable. That is the bench setting. Deep sleep takes the whole chip down rather than just the BLE controller, so it is the larger saving and the larger cost: the board stops beaconing, stops logging, and every wake is a full reset. Ignored while tracking - a tracker that deep-sleeps is not tracking."
+
+# idle_timeout_s = 0
+# idle_timeout_s_description = "Seconds the board stays reachable-but-not-tracking before it stores itself, 0 or 10-3600. 0 means the firmware default of 600. Idle is the expensive state - BLE dominates it at around 90 mA - and this is what makes it affordable: minutes of it, not days. Every cold boot lands in idle, so this is also the rescue window a board that came back from a flat cell gives you before it goes back down."

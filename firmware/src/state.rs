@@ -289,6 +289,19 @@ pub fn drain_log() {
 pub enum Request {
     GpsSleep(bool),
     RadioStandby(bool),
+    /// Raise or lower everything at once, because a mode is a posture
+    /// rather than one subsystem.
+    ///
+    /// [`Mode::Tracking`] wakes the GPS, re-arms its settings push and
+    /// brings the radio back; anything else parks the GPS in backup and
+    /// puts the radio in cold sleep. A board promoted out of a wake check
+    /// also mounts its card here, which is the mount the wake check
+    /// deferred.
+    ///
+    /// [`Mode::Stored`] arrives as a [`Request::PrepareSleep`] instead -
+    /// deep sleep is entered from the side that owns the `Rtc` - so this
+    /// treats it as the lowering half and leaves the sleeping to that.
+    Mode(midair_proto::ble::Mode),
     /// A new radio config was pushed over BLE or USB and verified. The
     /// hardware loop owns the radio, the GPS and the card, so it is what
     /// re-inits them and writes the file back.
@@ -297,6 +310,12 @@ pub enum Request {
     Reboot,
     /// The board is about to deep sleep. Park what a sleeping board cannot
     /// use and raise [`SLEEP_READY`].
+    ///
+    /// All of it, not just the radio: the card is flushed and unmounted
+    /// (deep sleep is a full reset, and the pending buffer is RAM), the GPS
+    /// goes into backup (a sleeping S3 cannot use a receiver that is
+    /// acquiring, and it is most of the sleeping board's current), and the
+    /// panel is blanked.
     PrepareSleep,
 }
 
@@ -312,6 +331,16 @@ pub enum Request {
 /// owns the `Rtc` and the advertising. Two places wait on it and they are
 /// never concurrent - a board is either advertising or in a session.
 pub static SLEEP_NOW_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+
+/// Raised when the board's mode changes, so the serve loop stops waiting
+/// on a budget that belongs to the mode it was in.
+///
+/// Without it a `CFG_MODE` written over USB with nobody connected would sit
+/// unnoticed until the current budget ran out, which in idle is ten
+/// minutes. Like [`SLEEP_NOW_SIGNAL`] this goes to the serve loop rather
+/// than the hardware loop: the hardware half of a mode change is a
+/// [`Request::Mode`], and the two halves are answered by different tasks.
+pub static MODE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
 /// The node the compass should point at: `(src, position, age_s, rssi)`.
 ///

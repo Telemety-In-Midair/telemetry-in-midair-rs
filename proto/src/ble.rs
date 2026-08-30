@@ -104,15 +104,106 @@ pub const SETTINGS_UUID_U128: u128 = 0xc3a10009_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 pub const RADIO_CONFIG_UUID: &str = "c3a1000a-9f6e-4b2c-8f5a-2e32c3b1e5d0";
 pub const RADIO_CONFIG_UUID_U128: u128 = 0xc3a1000a_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 
+/// What the board is for right now.
+///
+/// This is the one setting an app actually means when it asks for a
+/// tracker, or for a device that is going in a bag. It replaces the pair of
+/// independent sleep flags ([`CFG_WIO_SLEEP`], [`CFG_GPS_SLEEP`]) as the
+/// thing an app sets: those stay, and are still the way to park one
+/// subsystem and leave the other up, but neither of them decides what a
+/// board does when it comes back from a flat cell, and this does.
+///
+/// Not to be confused with [`crate::session::Stored`], the settings record.
+/// `Mode::Stored` is the device in storage; `session::Stored` is what
+/// survives a sleep.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// Everything the firmware can lower, lowered: deep sleep on the
+    /// wake-check cadence, GPS in backup, radio in cold sleep, card
+    /// unmounted, panel dark. The default, and where an unattended board
+    /// spends most of its life.
+    ///
+    /// While a stored board is *awake* - the advertising window of one wake
+    /// check - the mode still reads `Stored`, because that is what the
+    /// window is for: asking whether anyone wants the board back.
+    #[default]
+    Stored,
+    /// Awake and connectable, but not tracking: the GPS stays in backup and
+    /// the radio stays down, so monitoring a stored object's configuration
+    /// does not cost an acquisition.
+    ///
+    /// Deliberately transient. It always ends - by [`CFG_IDLE_TIMEOUT_S`]
+    /// or by a command - and it is never what reaches flash (see
+    /// [`Mode::persisted`]), because a board that came back from a reset
+    /// still believing it was idle would sit at awake current with nobody
+    /// coming.
+    Idle,
+    /// Tracking: GPS acquiring, positions out over LoRa, pings without a
+    /// fix, card logging. Entered by command and left by command - there is
+    /// no battery sense on this board, and a timeout that silently stopped
+    /// tracking a flying object would be worse than a flat cell.
+    Tracking,
+}
+
+impl Mode {
+    /// Decode the wire byte. `None` for a value this firmware does not
+    /// know, which a config write rejects rather than guessing at.
+    pub fn from_wire(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(Self::Stored),
+            1 => Some(Self::Idle),
+            2 => Some(Self::Tracking),
+            _ => None,
+        }
+    }
+
+    pub fn as_wire(self) -> u8 {
+        match self {
+            Self::Stored => 0,
+            Self::Idle => 1,
+            Self::Tracking => 2,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stored => "stored",
+            Self::Idle => "idle",
+            Self::Tracking => "tracking",
+        }
+    }
+
+    /// What this mode becomes on its way to flash.
+    ///
+    /// Only two modes are worth surviving a power cycle: a board that was
+    /// tracking must come back tracking, and everything else must come back
+    /// reachable and then store itself. Idle is neither - it is "awake
+    /// because someone might want me", and a reboot is exactly the moment
+    /// nobody does - so it persists as [`Mode::Stored`] and the cold-boot
+    /// rescue window brings it back to Idle anyway.
+    pub fn persisted(self) -> Self {
+        match self {
+            Self::Idle => Self::Stored,
+            other => other,
+        }
+    }
+
+    /// Whether the GPS, the radio and the card come up with the board.
+    pub fn tracks(self) -> bool {
+        matches!(self, Self::Tracking)
+    }
+}
+
 /// Wire length of [`Settings`].
-pub const SETTINGS_LEN: usize = 20;
+pub const SETTINGS_LEN: usize = 24;
 /// Layout version in byte 0, so an app meeting a newer firmware can
 /// reject the blob rather than misread it.
 ///
 /// Version 2 dropped the separate stow interval: one wake-check interval
 /// now covers every sleep the board does. Version 3 appended the
-/// advertising window, version 4 the BLE off period.
-pub const SETTINGS_VERSION: u8 = 4;
+/// advertising window, version 4 the BLE off period, and version 5 the
+/// [`Mode`] and its idle timeout.
+pub const SETTINGS_VERSION: u8 = 5;
 
 pub const SFLAG_PWR_EN: u8 = 1 << 0;
 pub const SFLAG_WIO_SLEEP: u8 = 1 << 1;
@@ -135,8 +226,18 @@ pub struct Settings {
     /// the effective value, never 0.
     pub adv_window_s: u32,
     /// Seconds the BLE controller stays powered down between advertising
-    /// windows ([`CFG_BLE_OFF_S`]), 0 = never take it down.
+    /// windows ([`CFG_BLE_OFF_S`]), 0 = never take it down. Honored in
+    /// [`Mode::Tracking`] only.
     pub ble_off_s: u32,
+    /// What the board is doing right now ([`CFG_MODE`]).
+    ///
+    /// The live mode, not the persisted one: a board reporting
+    /// [`Mode::Idle`] has [`Mode::Stored`] in its flash record, because idle
+    /// is not a state a reboot may come back into.
+    pub mode: Mode,
+    /// Seconds [`Mode::Idle`] lasts before the board stores itself
+    /// ([`CFG_IDLE_TIMEOUT_S`]). Always the effective value, never 0.
+    pub idle_timeout_s: u32,
 }
 
 impl Settings {
@@ -154,11 +255,15 @@ impl Settings {
             flags |= SFLAG_GPS_SLEEP;
         }
         b[1] = flags;
-        // b[2..4] reserved, kept zero to word-align the u32s.
+        // The mode takes one of the two bytes that were reserved to
+        // word-align the u32s below, so it costs nothing and everything
+        // after it keeps the offset an older reader knew.
+        b[2] = self.mode.as_wire();
         b[4..8].copy_from_slice(&self.sleep_interval_s.to_le_bytes());
         b[8..12].copy_from_slice(&self.notify_interval_ms.to_le_bytes());
         b[12..16].copy_from_slice(&self.adv_window_s.to_le_bytes());
         b[16..20].copy_from_slice(&self.ble_off_s.to_le_bytes());
+        b[20..24].copy_from_slice(&self.idle_timeout_s.to_le_bytes());
         b
     }
 
@@ -177,6 +282,11 @@ impl Settings {
             notify_interval_ms: word(8),
             adv_window_s: word(12),
             ble_off_s: word(16),
+            // An unknown mode byte is a board running firmware this reader
+            // predates; report the safe one rather than refusing the whole
+            // blob, which would take every other field with it.
+            mode: Mode::from_wire(b[2]).unwrap_or_default(),
+            idle_timeout_s: word(20),
         })
     }
 }
@@ -191,14 +301,25 @@ pub const CFG_PWR_EN: u8 = 0x10;
 pub const CFG_WIO_SLEEP: u8 = 0x11;
 /// `u8` 0/1: GPS backup mode on/off.
 pub const CFG_GPS_SLEEP: u8 = 0x12;
-/// `u32` seconds: ESP deep-sleep wake-check interval. While set (non-zero)
-/// the ESP deep-sleeps whenever no central is connected, waking every
-/// interval to advertise for a short window. 0 disables sleep mode.
+/// `u32` seconds: ESP deep-sleep wake-check interval, i.e. the cadence
+/// [`Mode::Stored`] runs on. 0 disables deep sleep.
+///
+/// This is a [`Mode::Stored`] knob and nothing else's. A stored board sleeps
+/// this long, wakes into a check, advertises for
+/// [`CFG_ESP_ADV_WINDOW_S`], and goes back down if nobody came; a board in
+/// [`Mode::Idle`] uses it as the sleep it takes when its idle timeout runs
+/// out; a board in [`Mode::Tracking`] ignores it entirely, because deep
+/// sleep stops the beacon, the logging and the listening, and a tracker
+/// doing that is not tracking.
+///
+/// 0 therefore means "never store this board" rather than merely "do not
+/// sleep": with no cadence to sleep on, the idle timeout has nowhere to
+/// send it and it stays awake and reachable. That is the bench setting, and
+/// it is what an unconfigured board does.
 ///
 /// The board keeps this across a connect: reaching it does not clear the
 /// interval, so an unattended tracker holds its cadence indefinitely and
-/// the setting means the same thing whether or not anyone is looking. The
-/// GPS/LoRa rail stays off through every sleep.
+/// the setting means the same thing whether or not anyone is looking.
 ///
 /// Note the wake is timed by the C6's uncalibrated RC slow clock, so the
 /// interval drifts. It paces a wake-check, not a schedule.
@@ -243,8 +364,15 @@ pub const ESP_ADV_DEFAULT_S: u32 = 15;
 /// advertising windows. 0 disables it, which is the default and the old
 /// behavior - a board that is not deep-sleeping advertises continuously.
 ///
-/// This is the awake-state counterpart to [`CFG_ESP_SLEEP_S`], and on the
-/// Wio-S3 it is the largest lever the firmware has. BLE measures **71 mA of
+/// This is a [`Mode::Tracking`] knob and nothing else's: it exists so a
+/// tracker nobody is talking to does not pay 71 mA for reachability, and
+/// the other two modes have no use for it - [`Mode::Idle`] exists to be
+/// reachable, and [`Mode::Stored`] has no controller at all. Before the
+/// mode existed the two duty cycles competed inside one state and deep
+/// sleep silently won, which made this dead config on any board that had a
+/// wake-check cadence set.
+///
+/// On the Wio-S3 it is the largest lever the firmware has. BLE measures **71 mA of
 /// the board's 126**, and it cannot be reduced while the controller exists:
 /// esp-radio does not implement the controller's modem sleep, so the PHY
 /// stays up for as long as `BleConnector` is alive. Dropping the connector
@@ -292,6 +420,50 @@ pub const BLE_OFF_MAX_S: u32 = 5 * 60;
 /// The board acks before it sleeps and the link then drops. That
 /// disconnect is the command working, not a failure.
 pub const CFG_SLEEP_NOW: u8 = 0x15;
+
+/// `u8`: the board's [`Mode`] - 0 stored, 1 idle, 2 tracking.
+///
+/// The write an app makes when it means "this is a tracker now" or "this is
+/// going in a bag". Each value is a whole posture rather than one
+/// subsystem:
+///
+/// - **2, tracking.** The GPS comes up, the radio comes up, the card logs.
+///   Persisted, so it survives a brownout on the object - which is the one
+///   time it must.
+/// - **1, idle.** GPS into backup, radio down, BLE up. Transient: the board
+///   stores itself once [`CFG_IDLE_TIMEOUT_S`] runs out.
+/// - **0, stored.** The board acks and then deep-sleeps on its wake-check
+///   cadence, exactly as [`CFG_SLEEP_NOW`] does. The link drops; that
+///   disconnect is the command working.
+///
+/// A value outside 0..=2 is rejected rather than rounded, because every one
+/// of them is a different amount of the board switched off.
+pub const CFG_MODE: u8 = 0x17;
+
+/// `u32` seconds: how long [`Mode::Idle`] lasts before the board stores
+/// itself. 0 means never configured and resolves to
+/// [`IDLE_TIMEOUT_DEFAULT_S`].
+///
+/// Idle is the expensive state - BLE dominates it at around 90 mA, because
+/// esp-radio does not implement the controller's modem sleep - and this
+/// timeout is the whole reason it is affordable: minutes of it, not days.
+///
+/// There is no "never" value here, and it would be redundant if there were:
+/// a board leaves Idle by deep-sleeping, so [`CFG_ESP_SLEEP_S`] at 0
+/// already means "stay awake and reachable indefinitely". That is the bench
+/// setting, and it is what an unconfigured board does.
+pub const CFG_IDLE_TIMEOUT_S: u8 = 0x18;
+
+/// Clamp range and default for [`CFG_IDLE_TIMEOUT_S`].
+///
+/// The floor is short enough to watch a whole promote/timeout/store cycle
+/// go by on a bench and long enough that a phone which has just woken the
+/// board can still finish connecting. The ceiling is an hour: past that the
+/// timeout has stopped being a timeout and the board should have been told
+/// to track.
+pub const IDLE_TIMEOUT_MIN_S: u32 = 10;
+pub const IDLE_TIMEOUT_MAX_S: u32 = 60 * 60;
+pub const IDLE_TIMEOUT_DEFAULT_S: u32 = 10 * 60;
 
 /// What [`CFG_SLEEP_NOW`] with a value of 0 resolves to when sleep mode is
 /// off. Long enough to be an unmistakable sleep on a bench and short enough
@@ -407,6 +579,8 @@ mod tests {
             notify_interval_ms: 1000,
             adv_window_s: 15,
             ble_off_s: 60,
+            mode: super::Mode::Tracking,
+            idle_timeout_s: 600,
         };
         let bytes = s.encode();
         assert_eq!(bytes.len(), super::SETTINGS_LEN);
@@ -426,6 +600,45 @@ mod tests {
         let mut bad = good;
         bad[0] = super::SETTINGS_VERSION + 1;
         assert!(super::Settings::decode(&bad).is_none());
+    }
+
+    /// Every mode survives the blob, and the byte it travels in is the one
+    /// that used to be padding - so nothing else moved.
+    #[test]
+    fn settings_carry_the_mode() {
+        for mode in [super::Mode::Stored, super::Mode::Idle, super::Mode::Tracking] {
+            let s = super::Settings {
+                mode,
+                ..Default::default()
+            };
+            let bytes = s.encode();
+            assert_eq!(bytes[2], mode.as_wire());
+            assert_eq!(super::Settings::decode(&bytes), Some(s));
+        }
+    }
+
+    /// The wire values are fixed: an app and a board disagreeing about
+    /// which number means "tracking" is a board that stores itself when it
+    /// was told to track.
+    #[test]
+    fn mode_wire_values_are_fixed() {
+        assert_eq!(super::Mode::Stored.as_wire(), 0);
+        assert_eq!(super::Mode::Idle.as_wire(), 1);
+        assert_eq!(super::Mode::Tracking.as_wire(), 2);
+        for m in [super::Mode::Stored, super::Mode::Idle, super::Mode::Tracking] {
+            assert_eq!(super::Mode::from_wire(m.as_wire()), Some(m));
+        }
+        assert_eq!(super::Mode::from_wire(3), None);
+        assert_eq!(super::Mode::default(), super::Mode::Stored);
+    }
+
+    /// Idle never reaches flash: a board that came back from a reset still
+    /// believing it was idle would sit at awake current with nobody coming.
+    #[test]
+    fn idle_persists_as_stored() {
+        assert_eq!(super::Mode::Idle.persisted(), super::Mode::Stored);
+        assert_eq!(super::Mode::Stored.persisted(), super::Mode::Stored);
+        assert_eq!(super::Mode::Tracking.persisted(), super::Mode::Tracking);
     }
 
     /// A longer buffer must still decode: a future layout can only grow,
