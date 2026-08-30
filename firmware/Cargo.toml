@@ -138,6 +138,28 @@ esp-radio = { path = "vendor/esp-radio" }
 # For debug builds always builds with some optimization
 opt-level = "s"
 
+# btuuid miscompiles on the Xtensa backend at any optimization level above
+# zero, and takes the whole build with it:
+#
+#   rustc-LLVM ERROR: Error while trying to spill A2 from class AR:
+#   Cannot scavenge register without an emergency spill slot!
+#
+# It is the `-C force-frame-pointers` in .cargo/config.toml that provokes it -
+# the register scavenger runs out of room with the frame pointer reserved -
+# so the alternative is dropping that flag for every crate, which is what
+# esp-backtrace needs to produce a backtrace at all. Only the dev profile is
+# affected; release compiles this crate clean.
+#
+# `opt-level` was the only knob that helped: debug-assertions, debug,
+# codegen-units and overflow-checks were each tried per-package and each
+# still crashed, and rustflags cannot be set per package at all. The cost is
+# nil - btuuid is UUID constants and comparisons, and its generics are
+# instantiated in the crates that call it, at their own optimization level.
+#
+# Remove this when the esp toolchain's LLVM stops crashing on it.
+[profile.dev.package.btuuid]
+opt-level = 0
+
 [profile.release]
 codegen-units    = 1     # LLVM can perform better optimizations using a single thread
 debug            = 2
