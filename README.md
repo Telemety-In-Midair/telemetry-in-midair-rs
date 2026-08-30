@@ -465,7 +465,10 @@ always won.
 Sleep is off by default (`0x13` = 0), which is what an unconfigured board
 does: land in idle at boot and stay there, advertising continuously. With no
 cadence to sleep on, the idle timeout has nowhere to send the board - so
-`0x13 = 0` is also "never store this board", and it is the bench setting.
+`0x13 = 0` is also "never store this board *on its own*", and it is the
+bench setting. Being told `0x17 = 0` still stores it: somebody asked for
+that one, so it borrows the 5 min ceiling rather than reading the missing
+cadence as a refusal.
 Two board facts shape everything below - there is no rail to cut, and what
 the two-MCU board called the WIO's boot time is now nothing at all.
 

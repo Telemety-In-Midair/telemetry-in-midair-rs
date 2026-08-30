@@ -166,12 +166,20 @@ impl Stored {
     /// on any board that had a wake-check cadence.
     pub fn at_expiry(&self) -> Next {
         match self.mode {
-            // Both end in storage: a wake check nobody answered goes back
-            // down, and an idle board nobody came for stores itself.
-            Mode::Stored | Mode::Idle => match self.sleep_interval_s {
-                // No cadence to sleep on, so there is nowhere to go. The
-                // board keeps advertising, which is what a bench board and
-                // an unconfigured board both want.
+            // A wake check always goes back down. The board is in this mode
+            // because something put it here, so a cadence it does not have
+            // is borrowed rather than treated as a refusal - otherwise a
+            // board stored without one would wake once and then sit at
+            // awake current forever, which is the opposite of what was
+            // asked for.
+            Mode::Stored => Next::Sleep {
+                interval_s: self.sleep_cadence(),
+            },
+            // Idle is the passive path, and nobody asked for this one: with
+            // no cadence to sleep on the board simply keeps advertising,
+            // which is what a bench board and an unconfigured board both
+            // want.
+            Mode::Idle => match self.sleep_interval_s {
                 0 => Next::Advertise,
                 interval_s => Next::Sleep { interval_s },
             },
@@ -791,11 +799,20 @@ mod tests {
     }
 
     /// A stored board on `interval_s`, i.e. what a wake check runs on.
-    /// `0` is a board with deep sleep off.
     fn cadence(interval_s: u32) -> Stored {
         Stored {
             sleep_interval_s: interval_s,
             mode: Mode::Stored,
+            ..Stored::new()
+        }
+    }
+
+    /// An idle board with `interval_s` to store itself on. `0` is a board
+    /// with deep sleep off, which is where "never store this board" lives.
+    fn idle(interval_s: u32) -> Stored {
+        Stored {
+            sleep_interval_s: interval_s,
+            mode: Mode::Idle,
             ..Stored::new()
         }
     }
@@ -1338,12 +1355,40 @@ mod tests {
         assert_eq!(s.at_expiry(), Next::Advertise);
         let w = Window::new(0, s.budget_s());
         assert_eq!(w.next(60_000, &s), Next::Advertise);
+    }
 
-        // An explicit command to store the board is different: somebody
-        // asked for it, so it borrows the ceiling rather than being
-        // ignored.
+    /// Being *told* to store the board is different: somebody asked for it,
+    /// so a missing cadence is borrowed rather than read as a refusal.
+    /// Without this a board stored without a cadence would wake once and
+    /// then sit at awake current forever.
+    #[test]
+    fn a_stored_board_without_a_cadence_still_sleeps() {
+        let s = Stored {
+            mode: Mode::Stored,
+            sleep_interval_s: 0,
+            ..Stored::new()
+        };
         assert_eq!(s.sleep_cadence(), ble::ESP_SLEEP_MAX_S);
+        assert_eq!(
+            s.at_expiry(),
+            Next::Sleep {
+                interval_s: ble::ESP_SLEEP_MAX_S
+            }
+        );
         assert_eq!(cadence(120).sleep_cadence(), 120);
+        assert_eq!(
+            cadence(120).at_expiry(),
+            Next::Sleep { interval_s: 120 }
+        );
+
+        // And the way back out is the promotion, not the cadence: a wake
+        // check that somebody connects to becomes idle, where a board with
+        // no cadence stays.
+        let promoted = Stored {
+            mode: Mode::Idle,
+            ..s
+        };
+        assert_eq!(promoted.at_expiry(), Next::Advertise);
     }
 
     /// A disconnect in idle re-arms the whole timeout rather than the five
@@ -1439,10 +1484,11 @@ mod tests {
     // -- the wake / advertise / sleep cycle --------------------------------
 
     /// With sleep off the board advertises indefinitely, whatever the
-    /// window says - the window only paces a wake check.
+    /// budget says. That is an idle board with nowhere to be sent - the
+    /// bench case, and the unconfigured one.
     #[test]
     fn sleep_off_means_the_board_never_sleeps() {
-        let s = cadence(0);
+        let s = idle(0);
         let w = Window::new(0, 15);
         assert_eq!(w.next(0, &s), Next::Advertise);
         assert_eq!(w.next(15_000, &s), Next::Advertise);
@@ -1508,15 +1554,12 @@ mod tests {
     }
 
     /// Sleep switched on mid-window takes effect at the next decision, not
-    /// at the next boot - the interval is asked for every time.
+    /// at the next boot - the settings are asked for every time.
     #[test]
     fn enabling_sleep_takes_effect_within_the_window() {
         let w = Window::new(0, 15);
-        assert_eq!(w.next(20_000, &cadence(0)), Next::Advertise);
-        assert_eq!(
-            w.next(20_000, &cadence(300)),
-            Next::Sleep { interval_s: 300 }
-        );
+        assert_eq!(w.next(20_000, &idle(0)), Next::Advertise);
+        assert_eq!(w.next(20_000, &idle(300)), Next::Sleep { interval_s: 300 });
     }
 
     /// The window a wake runs on is the one that was stored when it woke.

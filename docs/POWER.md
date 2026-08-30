@@ -56,10 +56,12 @@ Two consequences worth having in mind before reading the tables below:
   tracking. Before the modes existed both duty cycles were tested in one
   place and deep sleep always won, which made `ble_off_s` dead config on any
   board that had a wake-check cadence.
-- **`sleep_interval_s = 0` means the board never stores itself.** With no
-  cadence to sleep on, the idle timeout has nowhere to send it, so it stays
-  awake and reachable. That is the bench setting, and it is what an
-  unconfigured board does.
+- **`sleep_interval_s = 0` means the board never stores itself on its
+  own.** With no cadence to sleep on, the idle timeout has nowhere to send
+  it, so it stays awake and reachable. That is the bench setting, and it is
+  what an unconfigured board does. A board *told* `mode stored` still
+  sleeps, on the 5 min ceiling - the command is not ambiguous, so it is not
+  read as a refusal.
 
 Tracking is also the only mode that survives a power cycle. A board put down
 tracking comes back tracking - which is the point, since a brownout on the

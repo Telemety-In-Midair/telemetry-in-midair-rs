@@ -312,10 +312,13 @@ pub const CFG_GPS_SLEEP: u8 = 0x12;
 /// sleep stops the beacon, the logging and the listening, and a tracker
 /// doing that is not tracking.
 ///
-/// 0 therefore means "never store this board" rather than merely "do not
-/// sleep": with no cadence to sleep on, the idle timeout has nowhere to
-/// send it and it stays awake and reachable. That is the bench setting, and
-/// it is what an unconfigured board does.
+/// 0 therefore means "never store this board *on its own*" rather than
+/// merely "do not sleep": with no cadence to sleep on, the idle timeout has
+/// nowhere to send it and it stays awake and reachable. That is the bench
+/// setting, and it is what an unconfigured board does. A board explicitly
+/// told `CFG_MODE stored` still sleeps - somebody asked for that one, so it
+/// borrows [`ESP_SLEEP_MAX_S`] rather than treating the missing cadence as
+/// a refusal.
 ///
 /// The board keeps this across a connect: reaching it does not clear the
 /// interval, so an unattended tracker holds its cadence indefinitely and

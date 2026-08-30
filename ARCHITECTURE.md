@@ -436,10 +436,12 @@ long Idle lasts, and `ble_off_s` is Tracking's modem cycle. Before the modes
 existed both were tested in one place, deep sleep always won, and `ble_off_s`
 was dead config on any board that had a wake-check cadence.
 
-`sleep_interval_s = 0` is therefore also "never store this board": with no
-cadence to sleep on the idle timeout has nowhere to send it, so it stays
-awake and reachable. That is the bench setting, and it is what an
-unconfigured board does.
+`sleep_interval_s = 0` is therefore also "never store this board *on its
+own*": with no cadence to sleep on the idle timeout has nowhere to send it,
+so it stays awake and reachable. That is the bench setting, and it is what an
+unconfigured board does. An explicit `CFG_MODE stored` still sleeps - it
+borrows the ceiling, because a command is not ambiguous the way a timeout
+running out on a board nobody configured is.
 
 **A connect during a wake check is a doorbell, not a leash.** It used to be
 that only a held session kept a stored board up, so reaching one meant
