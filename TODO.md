@@ -27,20 +27,52 @@ twice against targeting the running slot, but `partitions.csv` and the
 rollback behavior of espflash's bundled bootloader are both unverified.
 Keep a USB cable on the first one.
 
+## The two measurements the mode work is waiting on
+
+`docs/STATES-PLAN.md` is implemented except for its step 2, and step 2 is
+what decides whether the Stored mode is worth anything. Both readings need a
+board on a meter:
+
+1. **The GPS in backup, on its own.** `--features iso-gps-backup` puts the
+   receiver into a timed PMREQ 20 s after boot; read the meter across the
+   gap. That is the number the whole mode hangs on, because `V_BCKP` is
+   unfed here and backup-on-`VCC`-alone has never been priced.
+2. **The Stored floor.** Set a cadence and let it sleep: `wio-set sleep 60`,
+   then `wio-set mode stored`. The park path now takes the receiver into
+   backup, the radio into cold sleep and the card off the bus, and holds
+   both NSS and UART TX across the sleep - so this reading is the floor
+   itself rather than the old ~30 mA of ungated GPS. Low single-digit
+   milliamps means storage life in weeks; tens of milliamps means the plan
+   shrinks to Idle plus promotion, and it is a board finding for
+   `docs/BOARD-V1-ISSUES.md`.
+
+Two more that are now worth taking while a meter is attached: what **Idle**
+costs (predicted ~90 mA, BLE-dominated, never measured) and how long a
+**wake-check boot** takes, since every check pays a full init and the
+cadence cannot be tuned against a number nobody has.
+
+Also unproven on hardware: whether the receiver comes back at all after a
+park, and what TTFF costs when it does.
+
 ## Bench work
 
 Work the power list in `docs/POWER-AUDIT.md`, which is ordered by what it
 is worth. The board is measured - ~126 mA awake, a 60 mA floor with BLE
-dark - so the open items are levers, not unknowns. The first three are
-clearing `BT_STATE` in `ble_init`, restoring the Wi-Fi clock and power-down
-bits after the BLE connector drops, and running `--features iso-gps-backup`
-to get the one reading the investigation never took.
+dark - so the open items are levers, not unknowns. The first two are
+clearing `BT_STATE` in `ble_init` and restoring the Wi-Fi clock and
+power-down bits after the BLE connector drops.
 
 Soak the BLE duty cycle. `esp_radio::init` and `BleConnector::new` now run
 once per window rather than once at boot, thousands of times a day at a
 45 s cycle, and both are `expect`s on a heap that the controller allocates
-from every cycle. Leave a board running overnight with `ble-off 30` and
-check the wake counter and the free heap.
+from every cycle. Leave a board running overnight with `mode tracking` and
+`ble-off 30`, and check the wake counter and the free heap.
+
+Soak the modes: a week of Stored on a cell with the wake counter and heap
+checked, then a tracked walk that ends in `mode stored` from the phone. The
+promotion is the part to watch - a wake check that is connected to has to
+come up idle and stay there for its timeout, and a misfire is the failure
+that costs battery rather than reachability.
 
 Check whether an OTA over BLE survives its own flash writes. Each sector
 takes tens of milliseconds with interrupts off, which should cost a
@@ -115,7 +147,13 @@ Add current monitor? (INA219/226?)
 
 Add an LP-GPIO wake button so a deep sleep can be interrupted. Deep sleep
 is timer-only, so the 5 min clamp on 0x13 is the only thing keeping the
-board reachable.
+board reachable - and with the modes in, that clamp is also the worst case
+for reaching a *stored* board, which is now the state it spends its life in.
+
+Move SD CS off GPIO44. It is outside the S3's RTC range (0-21), so unlike
+NSS and UART TX it cannot be pad-held through a deep sleep and floats for
+the whole interval. Whether that costs anything is one of the meter
+questions above.
 
 Route the module's Wi-Fi/BT RF port to an antenna. It reaches test point
 BLE1 and stops there on the board as drawn, so the 2.4 GHz side has no
@@ -127,3 +165,12 @@ voltage without a board change.
 Route GPS EXTINT to the MCU, and TIMEPULSE for PPS discipline. Neither is
 connected today; backup mode still wakes on UART traffic, but PPS is simply
 unavailable.
+
+
+Add `Keep connected button` constantly attempts to reconnect if device disconnects during active connection. 
+
+Test feature display state to OLED display. The panel now keeps refreshing
+in idle but says nothing about which mode the board is in, which is the one
+thing a board sitting on a desk doing nothing needs to be able to tell you.
+
+Check bluetooth docs for lower power state management. Wake without advertising?

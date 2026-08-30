@@ -380,54 +380,80 @@ boot when it names no slot at all, which is the state a USB flash leaves it
 in, because the arithmetic that picks the *other* slot has nothing to work
 from otherwise.
 
-## The wake / advertise / sleep cycle
+## The modes, and the wake / advertise / sleep cycle
+
+The board has three modes and spends most of its life in the first. Two of
+them persist (`mode` in RTC RAM, mirrored to nvs); idle deliberately does
+not, because a board that came back from a reset still believing it was idle
+would sit at awake current with nobody coming.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> Boot
-    Boot --> Advertise : window = adv_window_s
+    [*] --> ColdBoot
+    ColdBoot --> Tracking : nvs says tracking
+    ColdBoot --> Idle : otherwise - the rescue window
 
-    Advertise --> Connected : a central accepts
-    Connected --> Advertise : disconnect (linger 5 s)
+    Stored --> WakeCheck : RTC timer
+    WakeCheck --> Park : window spent, nobody came
+    WakeCheck --> Idle : a central connects<br/>(or tries to)
 
-    Advertise --> Advertise : sleep_interval_s = 0<br/>(the default: never sleep)
-    Advertise --> Park : window spent and sleep_interval_s > 0
+    Idle --> Connected : central accepts
+    Connected --> Idle : disconnect<br/>(the whole timeout again)
+    Idle --> Park : idle timeout, nobody connected
 
-    Advertise --> Park : CFG_SLEEP_NOW / USB SLEEP
-    Connected --> Park : CFG_SLEEP_NOW<br/>(after the ack has left)
+    Connected --> Tracking : CFG_MODE tracking
+    Tracking --> Connected : central accepts<br/>(tracking continues under it)
+    Connected --> Park : CFG_MODE stored / CFG_SLEEP_NOW<br/>(after the ack has left)
 
-    Park --> DeepSleep : radio in cold sleep,<br/>NSS pad-held
-    DeepSleep --> Boot : timer wake, wake count += 1
+    Tracking --> BleDown : window spent, ble_off_s set
+    BleDown --> Tracking : ble_off_s elapses
 
-    note right of Park
-        There is no rail to cut on this
-        board, so the radio is the one load
-        the firmware can drop - and holding
-        NSS is what keeps it dropped, since
-        the S3 releases unheld pads and the
-        SX1262 wakes on a falling NSS edge.
-        The MAX-M10 keeps acquiring: V_BCKP
-        is unconnected, so backup mode costs
-        a cold start on every wake.
+    Park --> Stored : card flushed, GPS in backup,<br/>radio cold, NSS and TX pads held
+    Stored --> Tracking : timer wake with nvs tracking
+
+    note right of WakeCheck
+        Raises nothing. No gps.configure -
+        UART RX is one of the M10's backup
+        wake sources, so the boot path used
+        to wake the receiver every wake just
+        to have Park put it back - no radio
+        init, and the card stays off the bus.
     end note
 
-    note right of Connected
-        A commanded sleep ends the session
-        rather than sleeping under it: the
-        board stops being contactable, and
-        a connection left open would show
-        the phone a timeout instead of a
-        disconnect.
-    end note
-
-    note left of Advertise
-        The budget is a deadline, not a
-        per-attempt timeout. A central that
-        keeps failing to connect cannot
-        restart it, which is what kept a
-        board awake at full current forever.
+    note right of Idle
+        Fully connectable, but the GPS stays
+        in backup and the radio stays down:
+        reading a stored object's config
+        should not cost an acquisition.
+        Transient - it always ends, by the
+        timeout or by a command.
     end note
 ```
+
+Each duty-cycle knob belongs to exactly one mode, which is what stops them
+competing: `sleep_interval_s` is Stored's cadence, `idle_timeout_s` is how
+long Idle lasts, and `ble_off_s` is Tracking's modem cycle. Before the modes
+existed both were tested in one place, deep sleep always won, and `ble_off_s`
+was dead config on any board that had a wake-check cadence.
+
+`sleep_interval_s = 0` is therefore also "never store this board": with no
+cadence to sleep on the idle timeout has nowhere to send it, so it stays
+awake and reachable. That is the bench setting, and it is what an
+unconfigured board does.
+
+**A connect during a wake check is a doorbell, not a leash.** It used to be
+that only a held session kept a stored board up, so reaching one meant
+catching the window, connecting, and then not letting go. Now the connect
+*attempt* promotes the board to Idle with the timeout armed, and the app can
+take its time - including reconnecting after a handshake that fizzled, which
+phones do routinely. A misfire costs one idle timeout of awake current.
+
+Waking without advertising is not available on this hardware: a BLE
+peripheral cannot cheaply observe that someone is scanning for it, so
+advertise-and-connect is the only remote wake there is. That is why
+`sleep_interval_s` keeps its five-minute cap - it is also the worst case for
+reaching a stored board - and why a wake button on an RTC GPIO is on the
+board-changes list.
 
 The two commanded transitions exist because the timed ones only fire when a
 window expires with nobody connected - so without them the only way to sleep
@@ -438,19 +464,23 @@ the loop that owns the `Rtc` is the one that can wait for the link to finish.
 
 Settings live in RTC fast RAM so a wake check costs no flash read, and are
 mirrored into the `nvs` partition so they also survive a flat cell. Only the
-settings that decide whether a board is reachable at all are mirrored; the
-GPS and radio sleep flags are not, because a board that cold-boots with its
-GPS running is the safer of the two failures.
+settings that decide whether a board is reachable at all are mirrored, and
+the mode is now one of them - which resolves an inversion. The GPS and radio
+sleep flags are deliberately *not* saved, because "a board that cold-boots
+with its GPS running is the safer failure" - true for a tracker, and it
+drains the cell of a device in a bag. The mode answers both: a cold boot
+lands in Idle, which is reachable *and* has the GPS down, and only an
+explicit stored `tracking` raises everything.
 
 ## The states over time
 
 The diagram above says what follows what. This says what the board can
 still *do* while it is in each state, and for how long.
 
-Two charts, because the two duty cycles never run together. `serve` checks
-deep sleep first, so a board with `sleep_interval_s` set never reaches the
-`ble_off_s` branch at all - the awake duty cycle only exists on a board that
-has deep sleep off.
+Two charts, because the two duty cycles belong to different modes: the
+first is Tracking's and the second is Stored's. They cannot both be running,
+and now they cannot be confused either - `at_expiry` asks the mode which one
+applies rather than testing both settings in one place.
 
 Read the axis with one caveat. The window, off-period and sleep-interval
 lengths are the config keys and are exact; the beacon spacing is the
@@ -459,10 +489,11 @@ illustrative** - no boot or wake time has ever been measured on this board,
 and the connect, transfer and disconnect instants in the third chart are one
 plausible session rather than a recorded one.
 
-### The awake duty cycle
+### Tracking: the awake duty cycle
 
-`adv_window_s = 15`, `ble_off_s = 30`, `sleep_interval_s = 0`. The modem
-goes down; the tracker does not.
+`mode = tracking`, `adv_window_s = 15`, `ble_off_s = 30`. The modem goes
+down; the tracker does not. `sleep_interval_s` is ignored here whatever it
+is set to - a tracker that deep-sleeps is not tracking.
 
 ```mermaid
 gantt
@@ -521,10 +552,17 @@ phone that stays connected keeps the board up indefinitely. And the
 **linger** after a disconnect is spent advertising rather than merely awake,
 so the phone can come straight back.
 
-### The deep-sleep duty cycle
+### Stored: the deep-sleep duty cycle
 
-`adv_window_s = 15`, `sleep_interval_s = 45`. The chip goes away; the GPS
-does not.
+`mode = stored`, `adv_window_s = 15`, `sleep_interval_s = 45`. The chip goes
+away and so does everything else - the receiver into backup, the radio into
+cold sleep, the card flushed and unmounted, the panel dark.
+
+What the floor actually is has never been measured. The chip is microamps
+and the radio is 9.3 uA; the M10 in backup on `VCC` alone is unknown, since
+`V_BCKP` is unfed on this board and the timed-PMREQ experiment proves the
+domain survives rather than what it costs. That measurement is the one this
+whole mode hangs on - see `docs/STATES-PLAN.md`.
 
 ```mermaid
 gantt
@@ -560,13 +598,16 @@ gantt
     cold sleep - 9.3 uA     :done,  q7, 105, 46s
 
     section GPS
-    acquiring - ~30 mA even asleep :active, p1, 1, 150s
+    acquiring     :active, p1, 1, 18s
+    PMREQ backup - re-issued by every Park :done, p2, 19, 46s
+    still in backup - the wake check never speaks to it :done, p3, 65, 40s
+    backup        :done, p4, 105, 46s
 
     section SD card
     logging every fix       :active, e1, 1, 18s
-    powered but idle        :done,   e2, 19, 46s
-    logging every fix       :active, e3, 66, 39s
-    powered but idle        :done,   e4, 105, 46s
+    flushed and unmounted by Park :done, e2, 19, 46s
+    not mounted - a wake check reads no card :done, e3, 65, 40s
+    unmounted               :done,   e4, 105, 46s
 
     section USB console
     alive                   :active, v1, 0, 19s
@@ -581,20 +622,32 @@ gantt
     blanked by Park         :done,   n4, 105, 46s
 ```
 
-The GPS lane running unbroken through both sleeps is the board fact that
-makes deep sleep worth ~30 mA and not less - the MAX-M10 has no rail to cut.
+The GPS lane is the change worth reading. It used to run unbroken through
+both sleeps - the MAX-M10 has no rail to cut, so a sleeping board carried a
+receiver that was still acquiring at around 30 mA - and worse, the boot path
+ran `gps.configure` on every wake, whose UART traffic is one of the M10's
+backup wake sources. A wake check therefore woke the receiver just to have
+the next Park put it back, forever. Park now parks the receiver and the wake
+check speaks to neither it nor the radio.
+
+Two pads are held across the sleep for the same reason: NSS (GPIO21),
+because the SX1262 leaves cold sleep on a falling edge, and UART TX (GPIO2),
+because a floating edge there is UART activity to a receiver that wakes on
+it. SD CS (GPIO44) has the same problem and no fix in firmware - the S3's
+RTC pins stop at 21.
 
 `Park` is drawn a second wide to stay legible and is normally one 10 ms pass
 of the hardware loop. It only becomes long when a beacon is already in
 flight, which it then waits out: 289 ms at the defaults, and up to 9.7 s at
 the slowest settings the config accepts.
 
-The SD lane is drawn stopping at `Park`, and that is worse than it looks.
+The SD lane stops at `Park` because `Park` closes it properly.
 `log_position` buffers into RAM and only `sdlog.poll` writes it out, on a
-5 s cadence - but `PrepareSleep` does not flush, and the `standby` gate it
-sets skips the poll for the rest of the pass. So every deep sleep discards
-whatever had not reached the card: 0-5 s of fixes, once per cycle. On a
-15 s window at 1 Hz that is up to a third of each wake's log.
+5 s cadence, so at 1 Hz there are 0-5 fixes in the buffer at any instant -
+and deep sleep is a full reset, so before `PrepareSleep` flushed they were
+simply lost. The gap always landed at the end of the wake, which is the part
+a reader would use to work out where the board was when it went down. On a
+15 s window that was up to a third of each wake's log.
 
 ### Inside one connected window
 
@@ -654,21 +707,28 @@ one board, one supply, one USB FIFO:
 
 | State | Entered by | Connectable | LoRa | GPS | SD log | USB console | Leaves when | Draw |
 |-|-|-|-|-|-|-|-|-|
-| **Boot** | power-on, reset, OTA reboot | no | init | configured | mounted | yes | init done (never measured) | ~126 mA |
-| **Boot (wake check)** | deep-sleep timer | no | init | configured | mounted | yes | init done (never measured) | ~126 mA |
-| **Advertise** | boot, or a spent BLE-down period | yes | beacon + RX | tracking | yes | yes | a central connects, the window expires, or `SLEEP_NOW` | ~126-130 mA |
-| **Connected** | a central accepts | in session | beacon + RX | tracking | yes | yes | disconnect, or `CFG_SLEEP_NOW` | ~130 mA |
-| **Linger** | disconnect | yes | beacon + RX | tracking | yes | yes | 5 s, or the phone returns | ~126-130 mA |
-| **BLE down** | window spent with `ble_off_s` set | **no** | beacon + RX | tracking | yes | yes | `ble_off_s` elapses, or USB `SLEEP` | **60 mA** |
-| **Park** | any path into deep sleep | no | going to cold sleep | tracking | **not flushed** | yes | radio parked, or the TX budget expires | ~126 mA |
-| **Deep sleep** | window spent with `sleep_interval_s` set, or a commanded sleep | no | cold sleep | **still acquiring** | no | **no** | the timer fires - a full reset | **~30 mA** |
+| **Boot (tracking)** | power-on or timer wake with nvs `tracking` | no | init | configured | mounted | yes | init done (never measured) | ~126 mA |
+| **Boot (idle)** | any other cold boot | no | cold sleep | parked | mounted | yes | init done | ~90 mA |
+| **Boot (wake check)** | timer wake, any other mode | no | untouched | untouched | **not mounted** | yes | init done | ~90 mA |
+| **Advertise** | boot, or a spent BLE-down period | yes | beacon + RX in tracking, else down | per mode | per mode | yes | a central connects, the budget expires, or `SLEEP_NOW` | ~90-130 mA |
+| **Connected** | a central accepts | in session | as above | per mode | per mode | yes | disconnect, `CFG_MODE stored` or `CFG_SLEEP_NOW` | ~90-130 mA |
+| **Linger** | disconnect while tracking | yes | beacon + RX | tracking | yes | yes | 5 s, or the phone returns | ~126-130 mA |
+| **Idle** | a cold boot, or a wake-check promotion | yes | cold sleep | backup | mounted, idle | yes | `idle_timeout_s`, or `CFG_MODE tracking` | ~90 mA (unmeasured) |
+| **BLE down** | window spent while tracking with `ble_off_s` set | **no** | beacon + RX | tracking | yes | yes | `ble_off_s` elapses, or USB `SLEEP` | **60 mA** |
+| **Park** | any path into deep sleep | no | going to cold sleep | going to backup | **flushed and unmounted** | yes | everything parked, or the TX budget expires | ~126 mA |
+| **Deep sleep** | a spent budget in stored/idle, or a commanded sleep | no | cold sleep, NSS held | backup, TX pad held | unmounted | **no** | the timer fires - a full reset | **unmeasured** |
+
+The two unmeasured numbers are the two that decide whether any of this is
+worth it: what Idle costs (BLE dominates it, and esp-radio does not
+implement the controller's modem sleep) and what a stored board's floor is
+with the receiver in backup on `VCC` alone.
 
 Three of these are modal rather than positional - they overlay whichever
 state the board is in:
 
 | Overlay | Set by | What it changes |
 |-|-|-|
-| **Radio standby** (`PFLAG_WIO_SLEEP`) | `CFG_WIO_SLEEP`, survives deep sleep | The hardware loop skips GPS, beacon and telemetry entirely and polls at 20 Hz. Only BLE and the console stay alive. |
+| **Radio standby** (`PFLAG_WIO_SLEEP`) | `CFG_WIO_SLEEP`, survives deep sleep | The hardware loop skips the GPS, the beacon and the receiver and polls at 20 Hz. The card, the panel, telemetry and the status line keep running, because a board that is idle rather than asleep is one somebody may be looking at. |
 | **GPS backup** (`PFLAG_GPS_SLEEP`) | `CFG_GPS_SLEEP`, survives deep sleep | The receiver is parked with `UBX-RXM-PMREQ`. It loses its settings, so the loop re-pushes them when sentences resume. |
 | **Transfer active** | a bulk op over BLE or USB | Beacon held off, console quiet, and the transfer is bounded so a host that walks away cannot hold the board. |
 

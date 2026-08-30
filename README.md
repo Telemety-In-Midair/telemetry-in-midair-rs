@@ -351,6 +351,9 @@ Config command ids (config characteristic, `[id, len, value]`):
 | `0x13` | u32 s | deep-sleep wake-check interval, 5 s..5 min, 0 = off (the default) |
 | `0x14` | u32 s | advertising window per wake check, 1 s..60 s (default 15 s) |
 | `0x15` | u32 s | deep sleep **now** for this long, 5 s..5 min; 0 = use `0x13`. A command, not a setting |
+| `0x16` | u32 s | BLE controller down between windows while tracking, 5 s..5 min, 0 = off |
+| `0x17` | u8 | mode: 0 stored, 1 idle, 2 tracking. The one an app actually means |
+| `0x18` | u32 s | how long idle lasts before the board stores itself, 10 s..1 h (default 10 min) |
 
 ### Status display
 
@@ -426,18 +429,54 @@ pump off, not just pixels cleared) before every deep sleep - it sits on the
 always-on +3V3 and would otherwise hold its last frame, and its current,
 for the whole sleep.
 
+### Modes
+
+The board is in one of three, and `0x17` is how it moves between them.
+
+| Mode | What is up | Its knob | Persisted |
+|-|-|-|-|
+| **stored** | nothing, bar a wake check on a cadence: chip asleep, GPS in backup, radio in cold sleep, card unmounted, panel dark | `0x13` cadence, `0x14` window | yes |
+| **idle** | BLE only - connectable, but the GPS stays in backup and the radio stays down | `0x18` timeout | no, deliberately |
+| **tracking** | everything: GPS acquiring, beacons out, receiver listening, card logging | `0x16` modem duty cycle | yes |
+
+A cold boot lands in **idle** unless nvs says tracking. That is the rescue
+window: a board recovered from a flat cell, or one just flashed, is
+reachable for `0x18` before it stores itself, and only an explicit stored
+`tracking` puts a board back on the air by itself. Tracking is the mode that
+survives a brownout on the object, which is the one time it must.
+
+Idle never reaches flash - a board that came back from a reset still
+believing it was idle would sit at awake current with nobody coming - so
+what an app reads back as "idle" is the live RTC copy, and the record behind
+it says stored.
+
+**A connect during a wake check is a doorbell, not a leash.** The connect
+*attempt* promotes the board to idle with the timeout armed, so the app can
+take its time instead of having to catch the window, connect, and hold on.
+A misfire costs one idle timeout of awake current.
+
+Each duty-cycle knob belongs to exactly one mode, which is what stops them
+competing: before the modes existed, `0x16` was dead config on any board
+that had a wake-check cadence, because deep sleep was tested first and
+always won.
+
 ### Low power
 
 Sleep is off by default (`0x13` = 0), which is what an unconfigured board
-does: advertise continuously. Two board facts shape everything below -
-there is no rail to cut, and what the two-MCU board called the WIO's boot
-time is now nothing at all.
+does: land in idle at boot and stay there, advertising continuously. With no
+cadence to sleep on, the idle timeout has nowhere to send the board - so
+`0x13 = 0` is also "never store this board", and it is the bench setting.
+Two board facts shape everything below - there is no rail to cut, and what
+the two-MCU board called the WIO's boot time is now nothing at all.
 
-`0x13` turns sleep on. While set, the board deep-sleeps whenever no central
-is connected and wakes every interval to advertise for `0x14` seconds (one
-long D2 blink). Both persist until changed - a connect does not clear
-them, so an unattended board holds its cadence indefinitely and the
-settings mean the same thing whether or not anyone is looking.
+`0x13` is the stored cadence. While the board is stored it deep-sleeps for
+that long, wakes into a check, advertises for `0x14` seconds (one long D2
+blink), and goes back down if nobody came. Both persist until changed - a
+connect does not clear them, so an unattended board holds its cadence
+indefinitely and the settings mean the same thing whether or not anyone is
+looking. A board that is *tracking* ignores `0x13` entirely: deep sleep
+stops the beacon, the logging and the listening, and a tracker doing that is
+not tracking.
 
 Together the two set the duty cycle, and so the average current:
 advertising costs roughly two orders of magnitude more than deep sleep, so
@@ -462,8 +501,10 @@ no way to sleep a board you are looking at: you would have to disconnect and
 wait the window out, on a board that has been given a cadence in the first
 place.
 
-`0x15` is the direct one. The board acks, finishes paying out what it owes
-the connection, and goes. It stores nothing, does not touch `0x13`, and
+`0x15` is the direct one, and `0x17 = 0` (stored) is the same path with the
+mode written first, so the board comes back into a wake check rather than
+into whatever it was doing. The board acks, finishes paying out what it owes
+the connection, and goes. `0x15` stores nothing, does not touch `0x13`, and
 comes back to exactly what it was configured for - so a board with sleep
 mode off takes one nap and resumes advertising continuously. A value of 0
 means "for the `0x13` interval", falling back to 60 s when sleep is off, and
@@ -524,23 +565,37 @@ R15 tells them apart: ~0 V is open.
 **For a passive build the fix is hardware:** depopulate R15, the 10 ohm in
 the bias tee's DC path. One 0402, and the feed is gone.
 
-Tying `V_BCKP` to +3V3 is the fix for the sleep half, and it is a board
-change (see `BOARD-REVIEW.md` in the board repo). It is worth more than the TTFF it is
-usually filed under - it is what would let a sleeping board park its GPS and
-approach the module's 9.3 uA instead of sitting at 30 mA.
+Tying `V_BCKP` to +3V3 is a board change worth more than the TTFF it is
+usually filed under (see `BOARD-REVIEW.md` in the board repo): it is the
+difference between a receiver whose backup domain is guaranteed and one
+whose is merely observed to survive on `VCC`. Backup mode is used either
+way - the timed-PMREQ experiment proves the domain lives - but what it costs
+there has never been measured, and that number is what a stored board's
+floor comes down to.
 
-Before it sleeps the board puts the radio into cold sleep - the one load it
-can actually drop, 5.5 mA of continuous RX against the module's 9.3 uA
-asleep. The GPS keeps acquiring unless `0x12` says otherwise, because that
-is the app's call to make and a cold TTFF is what it costs.
+Before it sleeps the board parks everything it can reach. The radio goes to
+cold sleep (5.5 mA of continuous RX against 9.3 uA), the card is flushed and
+unmounted, the panel is blanked, and the receiver is sent into PMREQ backup
+- re-issued on every park, because after a reset the firmware's belief about
+the module is worth nothing, and because a bare request to a module already
+in backup gets eaten as the wake-up itself and leaves it awake.
 
-The interval, the window and the `0x10` rail setting are held in RTC fast
-RAM and mirrored to the `nvs` flash partition, so they survive deep sleep
-*and* a flat battery - a board put away for transport comes back on the same
-cadence rather than advertising until the cell dies again. Flash is read
+Two pads are held across the sleep. NSS (GPIO21), because the SX1262 leaves
+cold sleep on a falling edge and the S3 releases every pad it is not holding.
+UART TX (GPIO2), because a floating edge there is UART traffic to a receiver
+that wakes on it, which would undo the backup the park just asked for. SD CS
+(GPIO44) has the same problem and no fix in firmware - the S3's RTC pins stop
+at 21.
+
+The mode, the intervals, the window and the `0x10` rail setting are held in
+RTC fast RAM and mirrored to the `nvs` flash partition, so they survive deep
+sleep *and* a flat battery - a board put away for transport comes back on the
+same cadence rather than advertising until the cell dies again. Flash is read
 only on a cold boot; wake checks run from the RTC RAM copy. The two sleep
-flags are deliberately not mirrored: a board that cold-boots with its GPS
-running is the safer of the two failures.
+flags are still not mirrored, and the mode is what resolved the awkwardness
+there: "a board that cold-boots with its GPS running is the safer failure" is
+true of a tracker and drains the cell of a device in a bag, so a cold boot
+lands in idle instead - reachable, and with the GPS down.
 
 The wake is timed by the uncalibrated RC slow clock, so the interval
 drifts - it paces a wake-check, not a schedule.
@@ -549,10 +604,9 @@ drifts - it paces a wake-check, not a schedule.
 interrupt it: the radio is off, and there is no GPIO or button wake
 configured. The 5 min ceiling on `0x13` is what bounds that - it is the
 longest the board can ever be unreachable, short of a physical reset. A
-reset does get you back sooner, but a cold boot restores the settings from
-flash and the first advertising window is the same `0x14` seconds as any
-other, so it buys you a window you chose the timing of rather than an
-awake board.
+reset does get you back sooner, and now it buys more than a window of your
+own choosing: a cold boot lands in idle, so the board comes up reachable for
+a whole `0x18` timeout rather than for one advertising window.
 
 ## SD card
 

@@ -33,6 +33,41 @@ settings that matter and the rest is trimming. And the regulator is an LDO,
 so this is the current drawn from the cell, not a higher-voltage figure that
 divides down.
 
+## The mode decides which knobs apply
+
+The board has three modes, and each duty-cycle knob belongs to exactly one
+of them. Set the mode first; the rest of this document is what each mode
+then reads.
+
+| Mode | What is up | Its knob | Left by |
+|-|-|-|-|
+| **stored** | nothing but a wake check on a cadence | `sleep_interval_s` (cadence), `adv_window_s` (each check) | a connect during a check - which promotes it to idle |
+| **idle** | BLE only: GPS in backup, radio in cold sleep, card mounted | `idle_timeout_s` | the timeout (into stored) or `CFG_MODE tracking` |
+| **tracking** | everything: GPS, beacon, receiver, logging | `ble_off_s` (modem duty cycle) | `CFG_MODE` only |
+
+The mode is a command, never a file key: a card that said "tracking" would
+put every board it was ever copied into onto the air. Set it from the app,
+or from a bench with `pixi run wio-set mode tracking`.
+
+Two consequences worth having in mind before reading the tables below:
+
+- **`sleep_interval_s` is ignored while tracking.** Deep sleep stops the
+  beacon, the logging and the listening, and a tracker doing that is not
+  tracking. Before the modes existed both duty cycles were tested in one
+  place and deep sleep always won, which made `ble_off_s` dead config on any
+  board that had a wake-check cadence.
+- **`sleep_interval_s = 0` means the board never stores itself.** With no
+  cadence to sleep on, the idle timeout has nowhere to send it, so it stays
+  awake and reachable. That is the bench setting, and it is what an
+  unconfigured board does.
+
+Tracking is also the only mode that survives a power cycle. A board put down
+tracking comes back tracking - which is the point, since a brownout on the
+object is exactly when it must - and everything else comes back **idle**,
+reachable for one timeout before it stores itself. That is the rescue window
+for a board recovered from a flat cell, and it is why a cold boot no longer
+comes up with its GPS running.
+
 ## The settings
 
 ### The two that matter
@@ -71,18 +106,26 @@ saves.
 
 ### The duty cycle
 
-| Key | Range | Default | Effect |
-|-|-|-|-|
-| `ble_off_s` | 0, or 5-300 | 0 | above |
-| `adv_window_s` | 0, or 1-60 | 0 (= 15 s) | Seconds each advertising window lasts. Only meaningful alongside `ble_off_s` or `sleep_interval_s`; with both at 0 the window never ends. |
-| `sleep_interval_s` | 0, or 5-300 | 0 | Seconds between deep-sleep wake checks. 0 never deep-sleeps. |
+| Key | Mode | Range | Default | Effect |
+|-|-|-|-|-|
+| `ble_off_s` | tracking | 0, or 5-300 | 0 | above |
+| `adv_window_s` | stored, tracking | 0, or 1-60 | 0 (= 15 s) | Seconds each advertising window lasts: the whole of the time a stored board is reachable, and the on-half of the modem cycle while tracking. |
+| `sleep_interval_s` | stored, idle | 0, or 5-300 | 0 | Seconds between wake checks while stored, and the sleep an idle board takes when its timeout runs out. 0 never deep-sleeps, and so never stores the board. |
+| `idle_timeout_s` | idle | 0, or 10-3600 | 0 (= 600 s) | Seconds a reachable board waits before storing itself. |
 
 Deep sleep is the larger saving and the larger cost. It takes the whole chip
-down to ~30 mA (the ungated GPS, which deep sleep cannot reach), but the
-board stops beaconing, stops logging, and every wake is a full reset. Use it
-for a board that is being stored, not one that is tracking.
+down - and now the receiver into backup, the radio into cold sleep and the
+card off the bus with it - but the board stops beaconing, stops logging, and
+every wake is a full reset. It is what a board being stored does; a board
+that is tracking never does it.
 
-These three are the only keys in the file the board also keeps its own copy
+What a stored board's floor actually is has not been measured. The old ~30 mA
+figure was the ungated GPS still acquiring through the sleep, which the mode
+work parks; what a MAX-M10 in backup costs on `VCC` alone is unknown, because
+`V_BCKP` is unfed on this board. `docs/STATES-PLAN.md` is where that
+measurement is owed.
+
+These four are the only keys in the file the board also keeps its own copy
 of - see "Where a setting lives" below.
 
 ### The radio
@@ -134,7 +177,7 @@ is useless for a tracker.
 ## Where a setting lives
 
 Most keys are read from the card at boot and that is the whole story. The
-three under `[power]` are different: the board also keeps them in RTC RAM,
+four under `[power]` are different: the board also keeps them in RTC RAM,
 so they survive a deep sleep, and in flash, so they survive a flat cell -
 and an app can change them live over BLE, which no other key can.
 
@@ -142,12 +185,14 @@ That makes them the one place precedence matters:
 
 ```mermaid
 flowchart TD
+    MODE["CFG_MODE / wio-set mode<br/>(no file key)"]
     FILE["RADIO.CFG [power] key"]
     LIVE["BLE write / wio-set"]
     RTC["RTC RAM<br/>survives deep sleep"]
     NVS["nvs flash record<br/>survives a flat cell"]
     RUN(["what the board runs"])
 
+    MODE -->|"immediately, and saved"| RTC
     FILE -->|"cold boot, or a deliberate push"| RTC
     LIVE -->|"immediately"| RTC
     RTC --> RUN
@@ -162,7 +207,7 @@ The rules that come out of it:
 - **An absent `[power]` key changes nothing.** Everywhere else in the file
   an absent key means "the default"; here it means "leave the board's live
   value alone". Otherwise pushing an unrelated radio change would silently
-  undo a duty cycle somebody set from the app. This is why all three ship
+  undo a duty cycle somebody set from the app. This is why all four ship
   commented out in `RADIO.example.toml`.
 - **An explicit `0` is a request, not an absence.** Writing `ble_off_s = 0`
   is how a file turns a duty cycle off.
@@ -192,18 +237,23 @@ pixi run wio-config --dry-run --save ../RADIO.CFG   # write a card instead
 This sends a *whole file*, not a patch: anything absent from it reverts to
 its default. `--file` starts from settings of your own rather than the
 reference. The `[power]` keys are the exception - absent still means "leave
-alone" for those three.
+alone" for those four.
 
-Change one of the three live, without touching the file:
+Change one of the four live, without touching the file, or set the mode
+(which no file can):
 
 ```
 cd tools
+pixi run wio-set mode tracking
+pixi run wio-set mode stored        # acks, then the port disappears
 pixi run wio-set ble-off 30
 pixi run wio-set adv-window 10
+pixi run wio-set idle-timeout 600
 ```
 
-That is the same path a BLE config write takes, and it lasts until the next
-cold boot.
+That is the same path a BLE config write takes. The settings last until the
+next cold boot, where an uncommented file key takes over again; the mode has
+no file key, so it lasts until something changes it.
 
 ## What is not configurable, and why
 

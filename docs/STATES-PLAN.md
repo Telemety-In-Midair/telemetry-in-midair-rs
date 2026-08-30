@@ -1,5 +1,17 @@
 # The states this device should have
 
+> **Status (2026-08-29): implemented, except the measurements.** Steps 1
+> and 3-6 of the work order are in the firmware - the SD flush, the mode
+> enum and its nvs record, the three boot flavors, the wake-check
+> promotion, and the knob scoping. Step 2 (the two current measurements)
+> and step 7 (the soak) need a board on a meter and are still owed; the
+> Stored floor this plan hangs on remains unmeasured. Two hazards from the
+> list below are also closed: GPIO2 is held across the sleep alongside NSS,
+> and the card is flushed and unmounted by the park path. The app toggle
+> lives in `gps-gui-rs` and is not done here - and that app must be rebuilt
+> against this crate either way, because the settings blob is version 5 now.
+> What follows is the plan as written, unchanged.
+
 The device tracks an object. Its life is three unequal parts: mostly it
 sits in a bag drawing as close to nothing as the board allows, sometimes
 it is awake so a phone can talk to it, and while it matters it is a
