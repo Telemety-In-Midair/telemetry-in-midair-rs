@@ -550,6 +550,20 @@ fn low_power_mode_init(config: &Config) {
     );
 }
 
+/// Whether the controller that is currently up is sleeping between events.
+///
+/// LOCAL PATCH, and the only way to answer that question from outside. It
+/// asks both ends of the setup rather than repeating what the config said:
+/// [`low_power_mode_init`] drops modem sleep if it cannot select a low
+/// power clock, and the controller reports the mode it took from its own
+/// config struct. Both have to agree, because either one alone is a way
+/// for this to be half wired and look connected.
+#[cfg(any(esp32c3, esp32s3))]
+pub(crate) fn modem_sleep_active() -> bool {
+    LP_ENABLED.load(Ordering::Relaxed)
+        && unsafe { btdm_controller_get_sleep_mode() } == BTDM_SLEEP_MODE_1
+}
+
 /// Gives back everything [`low_power_mode_init`] took.
 ///
 /// A duty-cycled board builds and drops the connector once per advertising

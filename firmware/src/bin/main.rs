@@ -577,6 +577,7 @@ async fn main(spawner: Spawner) -> ! {
     // Unlike deep sleep this stops nothing else. The hardware task keeps
     // beaconing, the GPS keeps tracking and the card keeps logging - the
     // board stays a working tracker and only stops being connectable.
+    let mut announced_modem_sleep = false;
     loop {
         {
             // TX power is 0 dBm rather than the +9 dBm default. Nine buys
@@ -628,6 +629,22 @@ async fn main(spawner: Spawner) -> ! {
                         continue;
                     }
                 };
+            // Said once, and from the crate rather than from the build
+            // flags: this is what the controller was actually set up with.
+            // A board that is quietly advertising with its PHY up all the
+            // time looks exactly like one that is not, until a meter says
+            // otherwise, and this is the cheaper way to ask.
+            if !core::mem::replace(&mut announced_modem_sleep, true) {
+                status_println!(
+                    "ble modem sleep {}",
+                    if esp_radio::ble::modem_sleep_active() {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+            }
+
             let controller = ExternalController::<_, 20>::new(transport);
 
             let mut resources: HostResources<

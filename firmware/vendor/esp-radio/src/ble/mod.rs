@@ -166,6 +166,18 @@ impl defmt::Format for ReceivedPacket {
     }
 }
 
+/// Whether the BLE controller is sleeping between events.
+///
+/// LOCAL PATCH. Reports what the controller was actually set up with, which
+/// is not always what [`Config::with_modem_sleep`] asked for: modem sleep
+/// needs a low power clock, and it is dropped rather than fudged if one
+/// cannot be selected. Meaningful only while a `BleConnector` is alive.
+#[cfg(any(esp32c3, esp32s3))]
+#[instability::unstable]
+pub fn modem_sleep_active() -> bool {
+    ble::modem_sleep_active()
+}
+
 /// Checks if there is any HCI data available to read.
 #[instability::unstable]
 pub fn have_hci_read_data() -> bool {

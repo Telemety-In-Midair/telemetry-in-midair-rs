@@ -65,6 +65,9 @@ answer to the largest open question in `docs/POWER-S3.md`, it is the number
 Idle's ~90 mA estimate rests on, and it is the one lever that works while a
 phone is attached. Watch that a connection survives it, too: the wake path
 that hands the controller an HCI packet is the part with the least margin.
+The console prints `ble modem sleep on` at the first window if the
+controller really took it, so a run that says `off` is a finding rather
+than a measurement.
 
 Then work the rest of `docs/POWER-AUDIT.md`, which is ordered by what it is
 worth. The board is measured - ~126 mA awake, a 60 mA floor with BLE dark -

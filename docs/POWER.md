@@ -273,7 +273,10 @@ no file key, so it lasts until something changes it.
   `--features iso-ble-no-modem-sleep` build, which exists so the A/B can be
   measured, and there is no reason to ship that. What it saves is
   unmeasured; ESP-IDF's own numbers put BLE advertising near 31 mA rather
-  than the 71 this board reads with the PHY up continuously.
+  than the 71 this board reads with the PHY up continuously. The console
+  says `ble modem sleep on` (or `off`) once, at the first advertising
+  window, and it asks the controller rather than the build flags - so a
+  board that came up without it says so.
 - **Light sleep.** The ~12 mA of S3 core that never halts for long. Needs
   tickless integration between `embassy-time` and the RTC, which `esp-rtos`
   does not provide. Design work, not a setting.
