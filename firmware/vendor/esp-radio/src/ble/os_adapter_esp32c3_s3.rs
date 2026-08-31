@@ -64,10 +64,16 @@ pub(super) struct osi_funcs_s {
     read_efuse_mac: Option<unsafe extern "C" fn(*const ()) -> i32>,
     srand: Option<unsafe extern "C" fn(u32)>,
     rand: Option<unsafe extern "C" fn() -> i32>,
-    btdm_lpcycles_2_hus: Option<unsafe extern "C" fn(u32, u32) -> u32>,
+    // The first two take and return the controller's own units: a low
+    // power clock cycle and a half-microsecond. `error_corr` is an in/out
+    // accumulator for the bits the conversion truncates, and is null when
+    // the caller does not want it carried - so it is a pointer, not the u32
+    // it was declared as while these were all `todo!()`.
+    btdm_lpcycles_2_hus: Option<unsafe extern "C" fn(u32, *mut u32) -> u32>,
     btdm_hus_2_lpcycles: Option<unsafe extern "C" fn(u32) -> u32>,
-    btdm_sleep_check_duration: Option<unsafe extern "C" fn(i32) -> i32>,
-    btdm_sleep_enter_phase1: Option<unsafe extern "C" fn(i32)>,
+    // Also an in/out pointer: the callback shortens the sleep it is given.
+    btdm_sleep_check_duration: Option<unsafe extern "C" fn(*mut i32) -> bool>,
+    btdm_sleep_enter_phase1: Option<unsafe extern "C" fn(u32)>,
     btdm_sleep_enter_phase2: Option<unsafe extern "C" fn()>,
     btdm_sleep_exit_phase1: Option<unsafe extern "C" fn()>,
     btdm_sleep_exit_phase2: Option<unsafe extern "C" fn()>,
@@ -134,8 +140,12 @@ pub(super) static G_OSI_FUNCS: osi_funcs_s = osi_funcs_s {
     btdm_sleep_check_duration: Some(btdm_sleep_check_duration),
     btdm_sleep_enter_phase1: Some(btdm_sleep_enter_phase1),
     btdm_sleep_enter_phase2: Some(btdm_sleep_enter_phase2),
-    btdm_sleep_exit_phase1: Some(btdm_sleep_exit_phase1),
-    btdm_sleep_exit_phase2: Some(btdm_sleep_exit_phase2),
+    // Null, as in ESP-IDF. Both run from the controller's own ISR and both
+    // are only there for the classic ESP32's power-down path; the wake work
+    // this chip needs is all in phase 3, which runs in the controller task
+    // and so may touch the PHY.
+    btdm_sleep_exit_phase1: None,
+    btdm_sleep_exit_phase2: None,
     btdm_sleep_exit_phase3: Some(btdm_sleep_exit_phase3),
     coex_wifi_sleep_set: Some(ble_os_adapter_chip_specific::coex_wifi_sleep_set),
     coex_core_ble_conn_dyn_prio_get: Some(
@@ -370,6 +380,30 @@ impl TxPower {
     }
 }
 
+/// The clock the controller counts on while its PHY is powered down.
+///
+/// Only reached when [`Config::modem_sleep`] is set. Sleep is measured in
+/// cycles of this clock, so its accuracy is the connection's accuracy: the
+/// 136 kHz RC oscillator ESP-IDF also allows is far outside the 500 ppm
+/// Bluetooth asks for and is not offered here.
+#[derive(Default, Clone, Copy, Eq, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum SleepClock {
+    /// The SoC's main crystal, divided to 1 MHz.
+    ///
+    /// The best of the three, and the only one that needs no part the SoC
+    /// does not already have. It does keep the crystal powered, so the
+    /// system cannot enter light sleep while the controller is up.
+    #[default]
+    MainXtal        = 1,
+    /// An external 32.768 kHz crystal on the RTC slow clock.
+    ///
+    /// Falls back to [`SleepClock::MainXtal`] if the RTC slow clock is not
+    /// actually running off that crystal.
+    External32kXtal = 2,
+}
+
 /// BLE CCA mode.
 #[derive(Default, Clone, Copy, Eq, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Deserialize, Serialize))]
@@ -441,6 +475,22 @@ pub struct Config {
     /// Default TX power.
     default_tx_power: TxPower,
 
+    /// Enable the controller's modem sleep.
+    ///
+    /// The controller powers the PHY down between BLE events - between
+    /// advertisements, and between the connection events of an idle
+    /// connection - and keeps time on [`Config::sleep_clock`] meanwhile. It
+    /// is transparent to the host: the wake path is in this crate's OS
+    /// adapter, and the controller re-enables the PHY before it needs it.
+    ///
+    /// Off by default, as it is in ESP-IDF.
+    modem_sleep: bool,
+
+    /// The clock the controller counts on while it is asleep.
+    ///
+    /// Ignored unless [`Config::modem_sleep`] is set.
+    sleep_clock: SleepClock,
+
     /// Coexistence: limit on MAX Tx/Rx time for coded-PHY connection.
     limit_time_for_coded_phy_connection: bool,
 
@@ -506,6 +556,8 @@ impl Default for Config {
             default_tx_antenna: Antenna::default(),
             default_rx_antenna: Antenna::default(),
             default_tx_power: TxPower::default(),
+            modem_sleep: false,
+            sleep_clock: SleepClock::default(),
             limit_time_for_coded_phy_connection: false,
             hw_recorrect_en: AGC_RECORRECT_EN != 0,
             cca_threshold: 75, // CONFIG_BT_CTRL_HW_CCA_VAL is 0 which is not valid
@@ -549,25 +601,21 @@ pub(crate) fn create_ble_config(config: &Config) -> esp_bt_controller_config_t {
         bluetooth_mode: esp_bt_mode_t_ESP_BT_MODE_BLE as _,
 
         ble_max_act: config.max_connections,
-        // Back to upstream's zeros, and they have to stay that way.
-        //
-        // Setting these to ESP_BT_SLEEP_MODE_1 / ESP_BT_SLEEP_CLOCK_MAIN_XTAL
-        // was tried and measured: no change in current at all. The config
-        // field is not what enables modem sleep. ESP-IDF also calls
-        // btdm_lpclk_select_src, btdm_controller_set_sleep_mode and, after
-        // btdm_controller_enable, btdm_controller_enable_sleep(true). None
-        // of those exist here.
-        //
-        // More to the point, the controller could not sleep even if it were
-        // told to: every callback it would use for that is a `todo!()` in
-        // btdm.rs - btdm_sleep_check_duration, btdm_sleep_enter_phase1 and
-        // _phase2, btdm_sleep_exit_phase1 through _phase3, and
-        // btdm_lpcycles_2_hus. Only btdm_hus_2_lpcycles is written. Modem
-        // sleep is unimplemented in this crate, not merely unconfigured, and
-        // a controller that did try to enter it would panic rather than save
-        // anything.
-        sleep_mode: 0,
-        sleep_clock: 0,
+        // Modem sleep. The controller reads these at init and will not
+        // sleep without them, but they are not sufficient on their own:
+        // `ble_init` also has to set the low power clock up, hand the
+        // controller a wake path, and call `btdm_controller_enable_sleep`.
+        // See the modem sleep section of `btdm.rs`.
+        sleep_mode: if config.modem_sleep {
+            esp_bt_sleep_mode_t_ESP_BT_SLEEP_MODE_1 as u8
+        } else {
+            esp_bt_sleep_mode_t_ESP_BT_SLEEP_MODE_NONE as u8
+        },
+        sleep_clock: if config.modem_sleep {
+            config.sleep_clock as u8
+        } else {
+            esp_bt_sleep_clock_t_ESP_BT_SLEEP_CLOCK_NONE as u8
+        },
         ble_st_acl_tx_buf_nb: 0,
         ble_hw_cca_check: 0,
         ble_adv_dup_filt_max: 30,

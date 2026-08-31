@@ -238,6 +238,12 @@ the work order.
 
 ## 1. esp-radio hardcodes BLE modem sleep off - biggest single item
 
+> **Settled, 2026-08-30.** This section is the investigation, and it is
+> kept because two of its drafts were wrong in instructive ways. The
+> outcome is at the end of the document: modem sleep is implemented in the
+> vendored crate now, as a port rather than a config change. What it is
+> worth on this board is still unmeasured.
+
 `esp-radio-0.17.0/src/ble/os_adapter_esp32c3_s3.rs`, in `create_ble_config`:
 
 ```rust
@@ -859,3 +865,53 @@ re-exported, so BLE TX runs at 0 dBm instead of the +9 dBm default.
 
 140 mA -> 126 mA across the two earlier commits was therefore the 80 MHz
 clock drop and the TX power, with nothing from modem sleep.
+
+### Modem sleep is implemented now, as a port (2026-08-30)
+
+The conclusion above - "not an afternoon's fork ... porting the relevant
+part of ESP-IDF's `bt.c` plus six ROM callbacks, and getting the RTC cycle
+arithmetic right" - was correct about the size of the job and it has now
+been done. The port is in `firmware/vendor/esp-radio/src/ble/btdm.rs`,
+under its own heading, and the working notes carry the detail.
+
+Source: ESP-IDF v5.5.3's `components/bt/controller/esp32c3/bt.c`. That is
+the S3's controller file as well as the C3's -
+`components/bt/CMakeLists.txt` maps `CONFIG_IDF_TARGET_ESP32S3` to
+`target_name esp32c3` - so this is the code Espressif ships against this
+same `libbtdm_app.a`, not an approximation of it.
+
+What the job actually contained, against what this section guessed:
+
+- **The clock arithmetic, and it was worse than "get it right".** Both
+  conversions in the crate were wrong, not merely absent: the one that
+  existed treated half-microseconds as microseconds, so it was out by a
+  factor of two, and it was harmless only because nothing called it.
+- **Three signatures were wrong.** `btdm_sleep_check_duration`,
+  `btdm_lpcycles_2_hus` and `btdm_sleep_enter_phase1` take in/out pointers
+  that were declared as plain integers. A check that shortens the sleep it
+  is handed could not have written the shortened value back.
+- **A wake path, which this section did not anticipate at all.** A sleeping
+  controller cannot take an HCI packet and cannot be disabled, so both
+  `send_hci` and `ble_deinit` have to wake it first, through the
+  controller task and a semaphore.
+- **Two callbacks did not need writing.** `btdm_sleep_exit_phase1` and
+  `_phase2` are null in ESP-IDF too. So it was five, not six.
+
+Every symbol the port needs is in the shipped blob - checked with `nm` on
+`esp-wifi-sys-0.8.1/libs/esp32s3/libbtdm_app.a` before a line was written:
+`btdm_controller_enable_sleep`, `btdm_controller_get_sleep_mode`,
+`btdm_power_state_active`, `btdm_wakeup_request`,
+`btdm_in_wakeup_requesting_set`, `btdm_sleep_clock_sync`,
+`btdm_lpclk_select_src`, `btdm_lpclk_set_div`,
+`btdm_vnd_offload_task_register` and `r_btdm_vnd_offload_post`. Note that
+`btdm_controller_set_sleep_mode` is **not** there: on this controller the
+mode comes from the config struct, and that function is the classic
+ESP32's. The draft above that called for it was describing the wrong chip.
+
+**The measurement is the open item, and it is now the first one.** Build
+both halves - the firmware ships modem sleep on, and
+`--features iso-ble-no-modem-sleep` is the control - and read the meter
+advertising, then again with a phone connected and idle. ESP-IDF's own
+figure for BLE advertising is near 31 mA against the 71 this board reads
+with the PHY up continuously, so the difference between the two builds is
+the answer to the largest open question in this document.

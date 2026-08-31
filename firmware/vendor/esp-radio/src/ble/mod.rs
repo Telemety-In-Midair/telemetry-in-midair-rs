@@ -17,6 +17,10 @@ pub use ble::ble_os_adapter_chip_specific::Config;
 // outside. Not defined for the classic ESP32's controller.
 #[cfg(not(esp32))]
 pub use ble::ble_os_adapter_chip_specific::TxPower;
+// LOCAL PATCH: same for the modem sleep clock, which `Config::sleep_clock`
+// takes. Only the btdm controller's adapters define one.
+#[cfg(any(esp32c3, esp32s3))]
+pub use ble::ble_os_adapter_chip_specific::SleepClock;
 pub(crate) use ble::{ble_deinit, ble_init, send_hci};
 use esp_sync::NonReentrantMutex;
 

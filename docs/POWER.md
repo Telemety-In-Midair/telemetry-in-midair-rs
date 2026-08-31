@@ -79,12 +79,15 @@ comes up with its GPS running.
 | `ble_off_s` | 0, or 5-300 | 0 | Seconds the BLE controller is powered **down** between advertising windows. **Saves ~70 mA while down.** 0 keeps it up continuously. |
 | `power_mode` | `full`, `psmoo`, `psmct` | `full` | GPS receiver power mode. `psmct` is cyclic tracking, `psmoo` acquires a fix then powers down until the next update. Saves up to ~25 mA; costs fix latency. |
 
-`ble_off_s` is the largest lever the firmware has, and it is blunt: the
-controller draws its 71 mA for as long as it exists, because `esp-radio`
-does not implement the controller's modem sleep, so nothing reduces it
-short of destroying the connector and rebuilding it. The board drops to
-**60 mA** while BLE is down and cannot be connected to until the next
-window. LoRa, GPS and SD logging all keep running - it is still a working
+`ble_off_s` is the blunt lever: it destroys the controller and rebuilds it,
+so the modem goes to nothing and the board cannot be connected to until the
+next window. The board drops to **60 mA** while BLE is down.
+
+The sharp one is not a setting. The controller's own modem sleep powers the
+PHY down between advertisements, and between the connection events of an
+idle connection, without the board becoming unreachable - see the note
+below. Every number in this document was measured before it existed, so
+treat the ones with BLE up as an upper bound until they are taken again. LoRa, GPS and SD logging all keep running - it is still a working
 tracker throughout, just not a reachable one.
 
 The average is whatever `adv_window_s` and `ble_off_s` make it:
@@ -263,11 +266,14 @@ no file key, so it lasts until something changes it.
   `firmware/src/bin/main.rs`. It cannot come from the file: the clock is
   configured before the SPI bus that reads the card exists. Worth ~10-15 mA
   against 160 MHz, which is already taken.
-- **BLE modem sleep.** Would save ~60 mA whether or not a phone is
-  connected, and is the single largest thing missing. `esp-radio` leaves the
-  controller's sleep callbacks as `todo!()` in every published version
-  through 1.0.0-beta.0, so there is nothing to switch on. `ble_off_s` exists
-  because this does not.
+- **BLE modem sleep.** On, always, and not a setting. `esp-radio` ships it
+  unimplemented - the controller's sleep callbacks are `todo!()` in every
+  published version through 1.0.0-beta.0 - so it is a local patch to the
+  vendored copy, ported from ESP-IDF. It is off in a
+  `--features iso-ble-no-modem-sleep` build, which exists so the A/B can be
+  measured, and there is no reason to ship that. What it saves is
+  unmeasured; ESP-IDF's own numbers put BLE advertising near 31 mA rather
+  than the 71 this board reads with the PHY up continuously.
 - **Light sleep.** The ~12 mA of S3 core that never halts for long. Needs
   tickless integration between `embassy-time` and the RTC, which `esp-rtos`
   does not provide. Design work, not a setting.

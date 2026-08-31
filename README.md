@@ -771,9 +771,16 @@ read of it.
 
 The short version. Awake, BLE advertising, GPS tracking, LoRa listening and
 nothing transmitting, the board measures **~126 mA at the 4.2 V input**. The
-BLE controller is 71 mA of that and the MAX-M10 is most of what is left, so
+BLE controller was 71 mA of that and the MAX-M10 is most of what is left, so
 `ble_off_s` and the GPS `power_mode` are the two settings that matter. The
 regulator is an LDO, so that current passes straight through from the cell.
+
+That 71 mA was measured with the BLE PHY powered continuously, which is
+what esp-radio does: it ships the controller's modem sleep unimplemented.
+The vendored copy implements it now, so the controller powers its own PHY
+down between advertisements and between the connection events of an idle
+connection. The board has not been back on a meter since, so treat every
+BLE figure here as an upper bound.
 
 The two-MCU board this one replaced measured 66 mA in the same scenario.
 Roughly 50 mA of the gap is the part swap - an S3's BLE radio costs about

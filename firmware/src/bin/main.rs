@@ -554,12 +554,21 @@ async fn main(spawner: Spawner) -> ! {
 
     // The BLE duty cycle.
     //
-    // BLE measures 71 mA of this board's 126, and it cannot be reduced
-    // while the controller exists: esp-radio does not implement the
-    // controller's modem sleep, so the PHY stays up for as long as
-    // `BleConnector` is alive. What *does* work is its `Drop`, which calls
-    // `ble_deinit` and takes the `PhyInitGuard` with it - so the whole
-    // stack is built inside this loop and dropped at the bottom of it.
+    // BLE measures 71 mA of this board's 126. Two things cut into that, and
+    // they cut into different parts of it.
+    //
+    // Modem sleep, set below, is the controller powering its own PHY down
+    // in the gaps it knows about - between advertisements, and between the
+    // connection events of a connection with nothing to say. It costs
+    // nothing in reachability, because the controller is still counting and
+    // still wakes for every event it promised. It cannot help while a
+    // transfer is actually moving.
+    //
+    // The loop is the other one, and the only way to zero: `BleConnector`'s
+    // `Drop` calls `ble_deinit` and takes the `PhyInitGuard` with it, so
+    // the whole stack is built inside this loop and dropped at the bottom
+    // of it. That does cost reachability - a board in a dark period cannot
+    // be connected to at all.
     //
     // `serve` returns rather than advertising forever once the window is
     // spent and `ble_off_s` is set; with it at 0 it never returns and this
@@ -576,8 +585,14 @@ async fn main(spawner: Spawner) -> ! {
             // and a +9 dBm burst is the worst current spike to put beside a
             // LoRa PA that can be keying 22 dBm at the same moment - the
             // conflict `state::radio_busy` exists to keep apart.
+            //
+            // Modem sleep is a local patch to the vendored esp-radio, which
+            // ships it unimplemented; the sleep clock is left at its
+            // default of the main crystal, which is the only low power
+            // clock this board has (there is no 32.768 kHz part).
             let ble_config = esp_radio::ble::Config::default()
-                .with_default_tx_power(esp_radio::ble::TxPower::N0);
+                .with_default_tx_power(esp_radio::ble::TxPower::N0)
+                .with_modem_sleep(!cfg!(feature = "iso-ble-no-modem-sleep"));
 
             // SAFETY: the previous iteration's `BleConnector` was dropped at
             // the closing brace below, and nothing outside this block ever

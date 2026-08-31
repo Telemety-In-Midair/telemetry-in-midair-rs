@@ -31,6 +31,12 @@ iso-no-app = []
 # receiver's own draw can be measured. V_BCKP is unconnected on this board,
 # so waking it again is not established - expect to power-cycle.
 iso-gps-backup = []
+# Build the BLE controller without modem sleep, the way the crate ships. The
+# firmware turns modem sleep on, so this is the other half of the A/B: flash
+# both and the difference is what the controller saves by powering its PHY
+# down between events. Advertising costs the same either way, so measure
+# while advertising, and again while a phone is connected and idle.
+iso-ble-no-modem-sleep = []
 
 [dependencies]
 # Same versions the retired ESP32-C6 firmware ran, retargeted at the S3: the
@@ -117,19 +123,25 @@ midair-proto = { path = "../proto" }
 # Shared BLE position protocol and NMEA parsing.
 gps-proto = { path = "../../gps-proto" }
 
-# esp-radio is vendored for one working reason: it re-exports the `TxPower`
-# enum, which upstream keeps crate-private while exposing the builder that
-# takes it, so BLE TX can be dropped from the +9 dBm default to 0 dBm.
+# esp-radio is vendored for two things, and both are BLE power.
 #
-# It was vendored originally to turn the BLE controller's modem sleep on.
-# That did not work and cannot: modem sleep is unimplemented in this crate,
-# not merely unconfigured - the callbacks the controller would need are
-# `todo!()`. The finding is written up at the `sleep_mode` field in
-# `src/ble/os_adapter_esp32c3_s3.rs`; the values there are back to
-# upstream's.
+# The small one: it re-exports the `TxPower` enum, which upstream keeps
+# crate-private while exposing the builder that takes it, so BLE TX can be
+# dropped from the +9 dBm default to 0 dBm.
 #
-# To go back to the published crate, delete this block and pass
-# `Default::default()` at the `BleConnector` construction in `main`.
+# The large one: the controller's modem sleep, which upstream leaves
+# unimplemented rather than merely unconfigured - the callbacks the
+# controller uses to sleep were `todo!()` and `ble_init` ran none of the
+# enabling sequence, so setting the two config literals did nothing (it was
+# tried, and measured). Both are written now, ported from ESP-IDF's
+# `components/bt/controller/esp32c3/bt.c`, which is the file that serves
+# the S3. The code and what it deliberately leaves out are in the modem
+# sleep section of `src/ble/btdm.rs`.
+#
+# Going back to the published crate is no longer a one-line change: it
+# costs the modem sleep as well as the TX power, and the
+# `with_modem_sleep`/`with_default_tx_power` calls in `main` would have to
+# go with it.
 [patch.crates-io]
 esp-radio = { path = "vendor/esp-radio" }
 

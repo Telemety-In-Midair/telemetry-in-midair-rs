@@ -56,11 +56,20 @@ park, and what TTFF costs when it does.
 
 ## Bench work
 
-Work the power list in `docs/POWER-AUDIT.md`, which is ordered by what it
-is worth. The board is measured - ~126 mA awake, a 60 mA floor with BLE
-dark - so the open items are levers, not unknowns. The first two are
-clearing `BT_STATE` in `ble_init` and restoring the Wi-Fi clock and
-power-down bits after the BLE connector drops.
+**Measure the BLE modem sleep.** It is implemented now - a port of
+ESP-IDF's sequence into the vendored esp-radio, since upstream ships the
+callbacks as `todo!()` - and not a milliamp of it has been read. Flash the
+default build and `--features iso-ble-no-modem-sleep`, and take both
+advertising and with a phone connected and idle. The difference is the
+answer to the largest open question in `docs/POWER-S3.md`, it is the number
+Idle's ~90 mA estimate rests on, and it is the one lever that works while a
+phone is attached. Watch that a connection survives it, too: the wake path
+that hands the controller an HCI packet is the part with the least margin.
+
+Then work the rest of `docs/POWER-AUDIT.md`, which is ordered by what it is
+worth. The board is measured - ~126 mA awake, a 60 mA floor with BLE dark -
+so the open items are levers, not unknowns. The next one is restoring the
+Wi-Fi clock and power-down bits after the BLE connector drops.
 
 Soak the BLE duty cycle. `esp_radio::init` and `BleConnector::new` now run
 once per window rather than once at boot, thousands of times a day at a
@@ -174,3 +183,5 @@ in idle but says nothing about which mode the board is in, which is the one
 thing a board sitting on a desk doing nothing needs to be able to tell you.
 
 Check bluetooth docs for lower power state management. Wake without advertising?
+
+Confirm in app for stored mode.

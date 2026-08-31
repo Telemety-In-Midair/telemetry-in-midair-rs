@@ -29,6 +29,21 @@ SF12/BW500.
 
 Reduce packet size: payloads go out at their true length.
 
+## BLE modem sleep in the vendored esp-radio
+
+The controller powers its own PHY down between advertisements and between
+the connection events of an idle connection. Upstream ships this
+unimplemented rather than unconfigured - the sleep callbacks are `todo!()`
+and `ble_init` runs no enabling sequence - so it is a port of ESP-IDF's
+`components/bt/controller/esp32c3/bt.c`: the low power clock setup, the
+cycle arithmetic (both conversions were wrong, one by a factor of two),
+the callbacks with the in/out pointer signatures they actually have, and a
+wake path so that an HCI send and the teardown can talk to a sleeping
+controller.
+
+On by default, `--features iso-ble-no-modem-sleep` for the A/B. What it
+saves is not measured yet, which is why the bench list starts with it.
+
 ## The three modes (docs/STATES-PLAN.md)
 
 Stored / idle / tracking as one `CFG_MODE` setting, persisted in RTC RAM and

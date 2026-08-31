@@ -375,12 +375,14 @@ pub const ESP_ADV_DEFAULT_S: u32 = 15;
 /// sleep silently won, which made this dead config on any board that had a
 /// wake-check cadence set.
 ///
-/// On the Wio-S3 it is the largest lever the firmware has. BLE measures **71 mA of
-/// the board's 126**, and it cannot be reduced while the controller exists:
-/// esp-radio does not implement the controller's modem sleep, so the PHY
-/// stays up for as long as `BleConnector` is alive. Dropping the connector
-/// calls `ble_deinit` and takes the PHY with it, which is what this
-/// schedules.
+/// On the Wio-S3 it is the lever that takes BLE to zero. BLE measured **71
+/// mA of the board's 126** with the PHY up continuously, which is what the
+/// board did before the vendored esp-radio learned the controller's modem
+/// sleep. Modem sleep now takes back whatever the gaps between
+/// advertisements are worth - unmeasured, and the first thing to put on a
+/// meter - but only destroying the controller takes the modem to nothing,
+/// and that is what this schedules: dropping the connector calls
+/// `ble_deinit` and takes the PHY with it.
 ///
 /// Unlike deep sleep it costs no reset and stops nothing else: the LoRa
 /// beacon keeps transmitting, the GPS keeps tracking and the card keeps
@@ -447,9 +449,10 @@ pub const CFG_MODE: u8 = 0x17;
 /// itself. 0 means never configured and resolves to
 /// [`IDLE_TIMEOUT_DEFAULT_S`].
 ///
-/// Idle is the expensive state - BLE dominates it at around 90 mA, because
-/// esp-radio does not implement the controller's modem sleep - and this
-/// timeout is the whole reason it is affordable: minutes of it, not days.
+/// Idle is the expensive state - BLE dominates it at around 90 mA, a figure
+/// from before the vendored esp-radio learned the controller's modem sleep
+/// and not re-taken since - and this timeout is the whole reason it is
+/// affordable: minutes of it, not days.
 ///
 /// There is no "never" value here, and it would be redundant if there were:
 /// a board leaves Idle by deep-sleeping, so [`CFG_ESP_SLEEP_S`] at 0

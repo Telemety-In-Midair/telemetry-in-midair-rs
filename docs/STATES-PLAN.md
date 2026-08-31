@@ -152,10 +152,12 @@ reachability before it stores itself.
 
 Draw is BLE-dominated: roughly the measured 126 mA minus the GPS
 (~25-30), the LoRa RX (~6) and the app loop (~6) - call it on the order
-of 90 mA, unmeasured. That sounds like a lot for "idle", and it is; it
-is the price of esp-radio's unimplemented modem sleep, the same 71 mA
-that dominates every other state. The idle timeout is what makes it
-affordable: minutes of it, not days. Default something like 10 minutes,
+of 90 mA, unmeasured. That estimate carries the same 71 mA of BLE that
+dominates every other state, and it was drawn before the controller had
+modem sleep; how much of the 71 the sleep takes back in a state that
+advertises and nothing else is exactly the reading this mode is waiting
+on. The idle timeout is what makes it affordable meanwhile: minutes of
+it, not days. Default something like 10 minutes,
 `0` meaning never (a bench board).
 
 Everything in the app works here. The one thing an app cannot see is

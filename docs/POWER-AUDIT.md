@@ -15,12 +15,14 @@ duty-cycle path.
 
 Confirmed by inspection, so do not re-litigate these:
 
-- Modem sleep really is unimplemented. `btdm_sleep_check_duration`,
-  `_enter_phase1/2`, `_exit_phase1/2/3` and `btdm_lpcycles_2_hus` are all
-  `todo!()` at `firmware/vendor/esp-radio/src/ble/btdm.rs:237-259`, and `ble_init`
-  (same file, 305) runs no `btdm_lpclk_select_src` /
-  `btdm_controller_set_sleep_mode` / `btdm_controller_enable_sleep`
-  sequence. Setting the two config literals could only ever have panicked.
+- Modem sleep really was unimplemented. `btdm_sleep_check_duration`,
+  `_enter_phase1/2`, `_exit_phase1/2/3` and `btdm_lpcycles_2_hus` were all
+  `todo!()` in `firmware/vendor/esp-radio/src/ble/btdm.rs`, and `ble_init`
+  ran no `btdm_lpclk_select_src` / `btdm_controller_enable_sleep` sequence.
+  Setting the two config literals could only ever have panicked. **Since
+  2026-08-30 they are written**, ported from ESP-IDF - see section E, which
+  called for exactly this. The saving is still unmeasured, so nothing else
+  in this document has moved.
 - 71 mA for BLE is arithmetically consistent with the PHY being powered
   100% of the time: it is roughly an S3's RF-working current minus its
   modem-sleep current.
@@ -198,19 +200,37 @@ runtime matters, there are two honest options and they are both large:
    and it is the only thing that helps while connected.
 2. Move BLE off the S3.
 
+**Option 1 has been taken** (2026-08-30). Five callbacks rather than six -
+two are null in ESP-IDF as well - plus the enabling sequence, the low power
+clock setup and a wake path for HCI sends and for teardown. It is on by
+default, `--features iso-ble-no-modem-sleep` is the control build, and the
+connected-case reading is now a bench item rather than a design question.
+
+One thing this changes about A3: the PHY is enabled and disabled per
+connection event now, not per window, which would be indefensible if a full
+calibration ran each time. It does not. `esp-phy` calibrates once per boot
+(`PhyState::calibrated` is a global that outlives the connector) and every
+later enable is `phy_wakeup_init` plus a digital register restore - which
+is exactly what ESP-IDF does around its own modem sleep. A3's cost is real
+but it is the first window after boot, not every window.
+
 ## Order to work in
 
-1. **Clear `BT_STATE` in `ble_init`.** Correctness. Two lines. Do it first
-   so the bench readings are not contaminated by phantom host errors.
-2. **Re-set `wifi_force_pd` and restore `wifi_clk_en` after the connector
+1. **Measure modem sleep, both halves.** Now the largest unknown, because
+   the port has landed and nothing has read it. Advertising, then connected
+   and idle, against `--features iso-ble-no-modem-sleep`.
+2. **Clear `BT_STATE` in `ble_init`.** Correctness. Two lines. Done. It was
+   worth doing first so the bench readings are not contaminated by phantom
+   host errors.
+3. **Re-set `wifi_force_pd` and restore `wifi_clk_en` after the connector
    drops**, then re-measure the dark period. Predicted 60 -> ~55 mA. Two
    register writes, and it settles A2 either way.
-3. **Run `--features iso-gps-backup`.** The one measurement the whole
+4. **Run `--features iso-gps-backup`.** The one measurement the whole
    investigation is missing.
-4. **`power_mode = "psmct"`, and drop BeiDou/QZSS/SBAS.** No code.
-5. **Cache the PHY calibration data across windows.** Latency, not current.
-6. **Light sleep during the BLE-dark period, woken by DIO1 (GPIO9) or the
+5. **`power_mode = "psmct"`, and drop BeiDou/QZSS/SBAS.** No code.
+6. **Cache the PHY calibration data across windows.** Latency, not current.
+7. **Light sleep during the BLE-dark period, woken by DIO1 (GPIO9) or the
    beacon timer.** The only path below ~40 mA that does not need a board
    respin.
-7. Then the board changes already in `POWER-S3.md`: V_BCKP to +3V3, a load
+8. Then the board changes already in `POWER-S3.md`: V_BCKP to +3V3, a load
    switch under the GPS and SX1262, a buck in place of U2.

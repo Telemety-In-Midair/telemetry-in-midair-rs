@@ -720,10 +720,16 @@ one board, one supply, one USB FIFO:
 | **Park** | any path into deep sleep | no | going to cold sleep | going to backup | **flushed and unmounted** | yes | everything parked, or the TX budget expires | ~126 mA |
 | **Deep sleep** | a spent budget in stored/idle, or a commanded sleep | no | cold sleep, NSS held | backup, TX pad held | unmounted | **no** | the timer fires - a full reset | **unmeasured** |
 
+Every draw in that table was measured, or estimated, with the BLE PHY
+powered continuously - the vendored esp-radio has since been taught the
+controller's modem sleep, which powers it down between advertisements and
+between the connection events of an idle connection. So the BLE-bearing
+rows are now upper bounds.
+
 The two unmeasured numbers are the two that decide whether any of this is
-worth it: what Idle costs (BLE dominates it, and esp-radio does not
-implement the controller's modem sleep) and what a stored board's floor is
-with the receiver in backup on `VCC` alone.
+worth it: what Idle costs, which is the same question as what modem sleep
+is worth, and what a stored board's floor is with the receiver in backup on
+`VCC` alone.
 
 Three of these are modal rather than positional - they overlay whichever
 state the board is in:
