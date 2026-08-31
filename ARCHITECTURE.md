@@ -517,7 +517,7 @@ gantt
     advertising - anyone may connect :active, b1, 4, 5s
     in session - CONNECTIONS_MAX is 1 :crit, b2, 9, 25s
     advertising - the phone may return :active, b3, 34, 5s
-    stack dropped - 71 mA goes :milestone, b4, 39, 0s
+    stack dropped - the modem goes :milestone, b4, 39, 0s
     advertising - anyone may connect :active, b5, 69, 15s
     stack dropped           :milestone, b6, 84, 0s
 
@@ -547,6 +547,15 @@ Nothing below the BLE lane changes shape. That is the whole point of this
 cycle: a board in a BLE-down period is still beaconing, still logging and
 still answering the USB console - it is only unreachable from a phone,
 for at most `ble_off_s`.
+
+The BLE lane is coarser than the controller is. Inside every advertising
+band the controller powers its own PHY down between advertisements, and
+between the connection events of an idle connection - modem sleep, which
+the vendored esp-radio implements and upstream does not. It is too fine to
+draw here, at tens of milliseconds against a chart in seconds, and it does
+not change what the board can do at any instant. It does mean this lane's
+current is no longer flat: dropping the stack is what takes the modem to
+nothing, but it is no longer the only thing between advertisements.
 
 Two timings worth reading off the chart. A **session is not bounded by the
 window** - the deadline is only consulted at the top of the serve loop, so a
