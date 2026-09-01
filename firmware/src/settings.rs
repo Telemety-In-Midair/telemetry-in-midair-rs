@@ -17,7 +17,7 @@
 
 use midair_proto::ble::Mode;
 use midair_proto::session::Stored;
-use portable_atomic::{AtomicU32, Ordering};
+use portable_atomic::{AtomicU32, AtomicU8, Ordering};
 
 /// Marks the RTC RAM copy as ours ("mida").
 const MAGIC: u32 = 0x6D69_6461;
@@ -40,6 +40,15 @@ static BLE_OFF: AtomicU32 = AtomicU32::new(0);
 static MODE: AtomicU32 = AtomicU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static IDLE_TIMEOUT: AtomicU32 = AtomicU32::new(0);
+/// The board's name, zero-padded, a byte per cell.
+///
+/// Kept here for the reason the advertising window is: a wake check
+/// advertises before anything has mounted the card or read the flash, and
+/// the name is what a scan list shows. Bytes rather than packed words
+/// because that is the shape both the record and the advertisement want.
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static NAME: [AtomicU8; midair_proto::ble::NAME_FIELD_LEN] =
+    [const { AtomicU8::new(0) }; midair_proto::ble::NAME_FIELD_LEN];
 
 /// How many deep sleeps this board has woken from since its last cold
 /// boot, and the seconds it was last told to sleep for.
@@ -71,6 +80,7 @@ pub fn get() -> Stored {
             // safe reading of it is the mode a board can be woken out of.
             mode: Mode::from_wire(MODE.load(Ordering::Relaxed) as u8).unwrap_or_default(),
             idle_timeout_s: IDLE_TIMEOUT.load(Ordering::Relaxed),
+            name: core::array::from_fn(|i| NAME[i].load(Ordering::Relaxed)),
         }
     } else {
         Stored::new()
@@ -97,6 +107,9 @@ pub fn set(s: Stored) {
     BLE_OFF.store(s.ble_off_s, Ordering::Relaxed);
     MODE.store(u32::from(s.mode.as_wire()), Ordering::Relaxed);
     IDLE_TIMEOUT.store(s.idle_timeout_s, Ordering::Relaxed);
+    for (cell, b) in NAME.iter().zip(s.name) {
+        cell.store(b, Ordering::Relaxed);
+    }
     MAGIC_WORD.store(MAGIC, Ordering::Relaxed);
 }
 
@@ -192,4 +205,23 @@ pub async fn save() {
     if !ok {
         crate::qprintln!("nvs: save failed, settings are volatile this session");
     }
+}
+
+/// The name this board advertises under: the stored label behind the
+/// firmware's prefix, or the board's address if it has never been named.
+///
+/// Built here rather than at each use so the scan response, the GAP name,
+/// the name characteristic and the console line cannot disagree about what
+/// the board is called.
+pub fn name() -> heapless::String<{ midair_proto::ble::NAME_MAX }> {
+    let stored = get();
+    let mut buf = [0u8; midair_proto::ble::NAME_MAX];
+    let name = midair_proto::ble::advertised_name(
+        stored.label(),
+        &crate::state::ble_address(),
+        &mut buf,
+    );
+    // The name is built to fit by construction; an empty string would be an
+    // unnamed advertisement, which is worse than a wrong one.
+    heapless::String::try_from(name).unwrap_or_default()
 }

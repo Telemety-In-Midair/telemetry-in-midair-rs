@@ -71,6 +71,18 @@ pub struct Stored {
     /// never configured. Read it through [`Stored::idle_timeout`], which
     /// substitutes the default.
     pub idle_timeout_s: u32,
+    /// What the board is called ([`ble::CFG_NAME`]), zero-padded ASCII.
+    ///
+    /// All-zero is a board that has never been named, which advertises
+    /// under its address instead - so this is the one field whose "never
+    /// configured" value is visible to anyone holding a phone. Read it
+    /// through [`Stored::label`], which is where the padding stops.
+    ///
+    /// It sits here rather than with the radio config because of when it is
+    /// needed: a wake check advertises before anything has mounted the
+    /// card, so a name kept on the card would be a name a sleeping board
+    /// could not tell anyone.
+    pub name: [u8; ble::NAME_FIELD_LEN],
 }
 
 impl Stored {
@@ -86,7 +98,38 @@ impl Stored {
             // reachable before it stores itself. See [`boot_mode`].
             mode: Mode::Stored,
             idle_timeout_s: 0,
+            name: [0; ble::NAME_FIELD_LEN],
         }
+    }
+
+    /// The stored label, or `""` for a board that has never been named.
+    ///
+    /// Padding stops at the first zero byte. Anything that is not a valid
+    /// label reads as unnamed rather than as itself: the field is written
+    /// by [`Stored::set_label`], which validates, so a value that fails
+    /// here came from corrupted RTC RAM or a truncated record, and an
+    /// address-derived name is the honest answer to that.
+    pub fn label(&self) -> &str {
+        let end = self
+            .name
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(ble::NAME_LABEL_MAX);
+        match core::str::from_utf8(&self.name[..end]) {
+            Ok(s) if ble::valid_label(s.as_bytes()) => s,
+            _ => "",
+        }
+    }
+
+    /// Store a label, or clear it with an empty one. Returns whether the
+    /// value was accepted; a rejected write leaves the old name in place.
+    pub fn set_label(&mut self, label: &[u8]) -> bool {
+        if !label.is_empty() && !ble::valid_label(label) {
+            return false;
+        }
+        self.name = [0; ble::NAME_FIELD_LEN];
+        self.name[..label.len()].copy_from_slice(label);
+        true
     }
 
     pub fn pwr_en(&self) -> bool {
@@ -277,6 +320,7 @@ impl Stored {
         // was idle would sit at awake current with nobody coming.
         rec[24..28].copy_from_slice(&(self.mode.persisted().as_wire() as u32).to_le_bytes());
         rec[28..32].copy_from_slice(&self.idle_timeout_s.to_le_bytes());
+        rec[32..32 + ble::NAME_FIELD_LEN].copy_from_slice(&self.name);
         let crc = link::crc32(&rec[0..RECORD_LEN - 4]);
         rec[RECORD_LEN - 4..RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
         rec
@@ -299,10 +343,18 @@ impl Stored {
         // defaults. Their trailing bytes are erased flash, so the crc has to
         // be checked where each version put it rather than where this one
         // does.
-        let (crc_at, adv_window_s, ble_off_s, mode, idle_timeout_s) = match word(4) {
-            2 => (V2_CRC_AT, 0, 0, Mode::Stored, 0),
-            3 => (V3_CRC_AT, word(16), 0, Mode::Stored, 0),
-            4 => (V4_CRC_AT, word(16), word(20), Mode::Stored, 0),
+        let (crc_at, adv_window_s, ble_off_s, mode, idle_timeout_s, named) = match word(4) {
+            2 => (V2_CRC_AT, 0, 0, Mode::Stored, 0, false),
+            3 => (V3_CRC_AT, word(16), 0, Mode::Stored, 0, false),
+            4 => (V4_CRC_AT, word(16), word(20), Mode::Stored, 0, false),
+            5 => (
+                V5_CRC_AT,
+                word(16),
+                word(20),
+                Mode::from_wire(word(24) as u8).unwrap_or_default(),
+                word(28),
+                false,
+            ),
             RECORD_VERSION => (
                 RECORD_LEN - 4,
                 word(16),
@@ -312,11 +364,16 @@ impl Stored {
                 // guessed at tracking would run its cell down.
                 Mode::from_wire(word(24) as u8).unwrap_or_default(),
                 word(28),
+                true,
             ),
             _ => return None,
         };
         if word(crc_at) != link::crc32(&rec[0..crc_at]) {
             return None;
+        }
+        let mut name = [0u8; ble::NAME_FIELD_LEN];
+        if named {
+            name.copy_from_slice(&rec[32..32 + ble::NAME_FIELD_LEN]);
         }
         Some(Self {
             sleep_interval_s: word(8),
@@ -325,6 +382,7 @@ impl Stored {
             ble_off_s,
             mode,
             idle_timeout_s,
+            name,
         })
     }
 }
@@ -344,21 +402,27 @@ pub const RECORD_MAGIC: u32 = 0x6D69_6441;
 /// A record from before version 5 carries no mode, which reads as
 /// [`Mode::Stored`]: an updated board comes back reachable (a cold boot
 /// lands in [`Mode::Idle`] whatever the record says) and then stores itself
-/// on the cadence it already had.
-pub const RECORD_VERSION: u32 = 5;
+/// on the cadence it already had. Version 6 appended the name, and a record
+/// from before it reads as never named - a board updated in the field
+/// advertises under its address until somebody names it.
+pub const RECORD_VERSION: u32 = 6;
 
 /// magic, version, sleep interval, flags, advertising window, BLE off
-/// period, mode, idle timeout, crc32 - all `u32`, so the length is already
-/// a multiple of the flash write word.
-pub const RECORD_LEN: usize = 36;
+/// period, mode, idle timeout, name, crc32. Every field is a `u32` or a
+/// multiple of one, so the length is already a multiple of the flash write
+/// word.
+pub const RECORD_LEN: usize = 36 + ble::NAME_FIELD_LEN;
 
-/// Where the crc sits in a version 2 record, which is this layout minus its
-/// last five words.
+/// Where the crc sits in each older record: the length that version's
+/// layout had before it.
+///
+/// Every version since 2 has been a pure append, so an old record is read
+/// by checking its crc where that version left it rather than where this
+/// one does - the bytes past it are erased flash, not fields.
 const V2_CRC_AT: usize = 16;
-/// Where the crc sits in a version 3 record - this layout minus three.
 const V3_CRC_AT: usize = 20;
-/// Where the crc sits in a version 4 record - this layout minus two.
 const V4_CRC_AT: usize = 24;
+const V5_CRC_AT: usize = 32;
 
 // ---------------------------------------------------------------------------
 // Config characteristic writes
@@ -411,6 +475,15 @@ pub enum Action {
     /// clamped; it takes effect at the next re-arm rather than shortening
     /// the timeout already running.
     IdleTimeout(u32),
+    /// The board has been renamed - or, with an empty label, un-named and
+    /// back to advertising under its address. Already stored.
+    ///
+    /// The firmware republishes the name characteristic on the strength of
+    /// this, because the ack cannot carry the name: an ack has four value
+    /// bytes and this one spends them on the stored length. The scan
+    /// response catches up at the next advertising window, since the one
+    /// running was handed to the controller before the write arrived.
+    Name,
     /// Nothing to do - the write was rejected, and the ack says why.
     None,
 }
@@ -595,6 +668,22 @@ pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
                     id,
                     packet::ACK_OK,
                     &secs.to_le_bytes(),
+                );
+            }
+            ble::CFG_NAME => {
+                // An empty value clears the name; anything else has to be a
+                // label the board can advertise. A rejected write leaves
+                // the old name alone rather than half-applying one, so a
+                // board never ends up between two names.
+                if !stored.set_label(value) {
+                    return Outcome::reject(id, packet::ACK_BAD_VALUE);
+                }
+                return Outcome::new(
+                    Action::Name,
+                    true,
+                    id,
+                    packet::ACK_OK,
+                    &[value.len() as u8],
                 );
             }
             ble::CFG_SLEEP_NOW => {
@@ -1142,6 +1231,7 @@ mod tests {
             ble_off_s: 90,
             mode: Mode::Tracking,
             idle_timeout_s: 900,
+            name: *b"sky-1\0\0\0\0\0\0\0\0\0\0\0",
         };
         let rec = s.encode_record();
         assert_eq!(rec.len(), RECORD_LEN);
@@ -1219,6 +1309,112 @@ mod tests {
         assert_eq!(s.idle_timeout_s, 0);
         assert_eq!(s.idle_timeout(), ble::IDLE_TIMEOUT_DEFAULT_S);
         assert_eq!(boot_mode(s.mode, false), Mode::Idle);
+    }
+
+    /// A board updated in the field is unnamed rather than unreadable: the
+    /// name was appended, so a version 5 record still carries every setting
+    /// that decides reachability.
+    #[test]
+    fn a_version_5_record_still_reads() {
+        let mut rec = [0xFFu8; RECORD_LEN]; // erased flash past the record
+        rec[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+        rec[4..8].copy_from_slice(&5u32.to_le_bytes());
+        rec[8..12].copy_from_slice(&120u32.to_le_bytes());
+        rec[12..16].copy_from_slice(&PFLAG_WIO_SLEEP.to_le_bytes());
+        rec[16..20].copy_from_slice(&45u32.to_le_bytes());
+        rec[20..24].copy_from_slice(&30u32.to_le_bytes());
+        rec[24..28].copy_from_slice(&(Mode::Tracking.as_wire() as u32).to_le_bytes());
+        rec[28..32].copy_from_slice(&900u32.to_le_bytes());
+        let crc = link::crc32(&rec[0..V5_CRC_AT]);
+        rec[V5_CRC_AT..V5_CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
+
+        let s = Stored::decode_record(&rec).expect("a version 5 record still reads");
+        assert_eq!(s.sleep_interval_s, 120);
+        assert_eq!(s.mode, Mode::Tracking);
+        assert_eq!(s.idle_timeout_s, 900);
+        // The erased bytes where the name now sits are not read as one.
+        assert_eq!(s.label(), "");
+        assert_eq!(s.name, [0; ble::NAME_FIELD_LEN]);
+    }
+
+    // -- the name ----------------------------------------------------------
+
+    #[test]
+    fn a_name_write_stores_a_label() {
+        let mut s = Stored::new();
+        assert_eq!(s.label(), "");
+
+        let o = apply(&mut s, &write(ble::CFG_NAME, b"sky-1"));
+        assert_eq!(o.action, Action::Name);
+        assert_eq!(s.label(), "sky-1");
+        // The ack spends its value on the length: no name fits in one.
+        assert_eq!(o.ack(), &[ble::CFG_NAME, packet::ACK_OK, 5]);
+        // A name has to survive a flat cell, so it is worth a flash write.
+        assert!(o.save);
+        assert_eq!(Stored::decode_record(&s.encode_record()), Some(s));
+    }
+
+    /// An empty value is the way back to an address-derived name, not a
+    /// rejected write.
+    #[test]
+    fn an_empty_name_write_clears_the_label() {
+        let mut s = Stored::new();
+        apply(&mut s, &write(ble::CFG_NAME, b"ground-1"));
+        let o = apply(&mut s, &write(ble::CFG_NAME, b""));
+        assert_eq!(o.action, Action::Name);
+        assert_eq!(ack_status(&o), packet::ACK_OK);
+        assert_eq!(o.ack(), &[ble::CFG_NAME, packet::ACK_OK, 0]);
+        assert_eq!(s.label(), "");
+    }
+
+    /// A label the board cannot advertise is refused, and refusing it
+    /// leaves the board under the name it already answered to.
+    #[test]
+    fn a_bad_label_leaves_the_old_name() {
+        let mut s = Stored::new();
+        apply(&mut s, &write(ble::CFG_NAME, b"sky-1"));
+        for bad in [b"has space".as_slice(), b"quote\"", "caf\u{e9}".as_bytes()] {
+            let o = apply(&mut s, &write(ble::CFG_NAME, bad));
+            assert_eq!(o.action, Action::None);
+            assert_eq!(ack_status(&o), packet::ACK_BAD_VALUE);
+            assert!(!o.save);
+            assert_eq!(s.label(), "sky-1");
+        }
+    }
+
+    /// The longest label the record holds is one the board still reads
+    /// back: there is no terminator to lose when the padding runs out.
+    #[test]
+    fn a_full_length_label_survives_the_record() {
+        let label = "x".repeat(ble::NAME_LABEL_MAX);
+        let mut s = Stored::new();
+        let o = apply(&mut s, &write(ble::CFG_NAME, label.as_bytes()));
+        assert_eq!(o.action, Action::Name);
+        assert_eq!(s.label(), label);
+        let back = Stored::decode_record(&s.encode_record()).expect("record");
+        assert_eq!(back.label(), label);
+
+        // One byte more is refused by the policy rather than truncated.
+        let o = apply(&mut s, &write(ble::CFG_NAME, "y".repeat(ble::NAME_LABEL_MAX + 1).as_bytes()));
+        assert_eq!(ack_status(&o), packet::ACK_BAD_VALUE);
+        assert_eq!(s.label(), label);
+    }
+
+    /// A name is a settings change, not a command: nothing else about the
+    /// board moves with it.
+    #[test]
+    fn a_name_write_changes_nothing_else() {
+        let mut s = Stored::new();
+        apply(&mut s, &u32_write(ble::CFG_ESP_SLEEP_S, 120));
+        let before = s;
+        apply(&mut s, &write(ble::CFG_NAME, b"ground-1"));
+        assert_eq!(
+            Stored {
+                name: before.name,
+                ..s
+            },
+            before
+        );
     }
 
     /// Idle never reaches flash. The RTC copy carries it - that is what the

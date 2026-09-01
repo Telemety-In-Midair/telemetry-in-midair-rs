@@ -6,11 +6,6 @@ reads a MAX-M10 GPS, transmits positions over 915 MHz LoRa, logs to SD, and
 serves everything over BLE to the gps-gui-rs app. See `PLAN.md` for the
 intent and `ARCHITECTURE.md` for the UML views.
 
-This replaced a two-MCU board (ESP32-C6 for BLE and power, WIO-E5 for
-GPS/LoRa/SD, a framed UART link between them). That firmware is gone from
-the tree as of the single-module cleanup; `git log` still has it, and
-`docs/PORT-WIO-S3.md` records what the merge deleted and why.
-
 ## Layout
 
 | Directory | What | Target |
@@ -272,13 +267,19 @@ sentence.
 ## BLE
 
 Same service UUID as the ESP32-C3 beacon, so gps-gui-rs discovers it
-unchanged (device name `GPS-S3`; the app filters scans by service UUID, so
-the rename from `GPS-C6` is display text only). On top of the gps-proto
-position / config / ack characteristics the firmware adds telemetry (LoRa
-RSSI/SNR, counters, SD + fix flags), remote node positions and pings, a
-status/log characteristic (notify + read), the current radio config (read +
-notify), and a bulk write characteristic carrying either a TOML config or a
-firmware image.
+unchanged (the app filters scans by service UUID, so a board's name is
+display text and renaming one cannot lose it - see [Board names](#board-names)).
+On top of the gps-proto position / config / ack characteristics the firmware
+adds telemetry (LoRa RSSI/SNR, counters, SD + fix flags), remote node
+positions and pings, a status/log characteristic (notify + read), the board's
+name (read + notify), the current radio config (read + notify), and a bulk
+write characteristic carrying either a TOML config or a firmware image.
+
+Everything declared `read` is written into the attribute table as well as
+notified, so a central that never subscribes reads the current value rather
+than the zeros the table was built with. That matters most for telemetry,
+where the all-zero blob is not an obviously empty one: `secs_since_rx` of 0
+means "heard from just now", and the value for never is 0xFFFF.
 
 ### Remote nodes
 
@@ -354,6 +355,46 @@ Config command ids (config characteristic, `[id, len, value]`):
 | `0x16` | u32 s | BLE controller down between windows while tracking, 5 s..5 min, 0 = off |
 | `0x17` | u8 | mode: 0 stored, 1 idle, 2 tracking. The one an app actually means |
 | `0x18` | u32 s | how long idle lasts before the board stores itself, 10 s..1 h (default 10 min) |
+| `0x19` | ASCII | board name label, up to 15 bytes; empty clears it |
+
+### Board names
+
+A board advertises as `ws3gps-<label>`, and one that has never been named
+falls back to `ws3gps-<xxxx>` from the last two octets of its BLE address -
+so two boards out of the same box are already told apart in a scan list,
+and a fleet reads as `ws3gps-ground-1`, `ws3gps-sky-1` without anything
+having to be configured first.
+
+```
+pixi run wio-set name sky-1     # over USB, at the bench
+pixi run wio-set name ""        # back to the address-derived name
+pixi run wio-info               # what this board is called, and its address
+```
+
+The prefix is a firmware constant rather than part of the label, so a board
+cannot be named something unrecognizable: whatever it is called, a generic
+scanner can be searched by `ws3gps`. Labels take ASCII letters, digits, `-`
+and `_`; anything else is rejected rather than sanitized, because a board
+answering to a name nobody asked for is worse than a write that failed
+loudly.
+
+The label is stored with the settings that decide reachability - RTC RAM,
+mirrored to the `nvs` partition - rather than on the card, because a wake
+check advertises before anything has mounted one. It survives a deep sleep
+and a flat cell, and a board updated from firmware that predates names
+reads back as unnamed rather than as unreadable.
+
+Three surfaces carry it, and they catch up at different speeds:
+
+| Surface | When it updates |
+|-|-|
+| scan response (`CompleteLocalName`) | the next advertising window - the one on the air was handed to the controller before the write |
+| name characteristic (`c3a1000c-...`, read + notify) | immediately, on the connection that renamed the board |
+| GAP device name (`0x2A00`) | the next boot; the attribute table is built once per power cycle |
+
+The ack for `0x19` carries the stored *length*, not the label: an ack has
+four value bytes and no name fits in one. What a board is actually called
+comes back on `c3a1000c-...`.
 
 ### Status display
 

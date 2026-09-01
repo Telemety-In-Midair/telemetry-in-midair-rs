@@ -300,6 +300,20 @@ def query_ble_address(ser: serial.Serial, timeout: float = 2.0) -> str | None:
     The reply is [USB_INFO, addr[0]..addr[5]] with the address most-
     significant octet first, so it prints directly.
     """
+    info = query_info(ser, timeout)
+    return None if info is None else info[0]
+
+
+def query_info(
+    ser: serial.Serial, timeout: float = 2.0
+) -> tuple[str, str] | None:
+    """Ask the board for its BLE address and its name in one round trip.
+
+    The reply is [USB_INFO, addr[0]..addr[5], name...], the address most-
+    significant octet first and the name in the form it advertises under.
+    Firmware that predates the name sends the address alone, which reads
+    back as an empty name rather than as a failure.
+    """
     ser.reset_input_buffer()
     ser.write(build_frame(USB_INFO, b""))
     ser.flush()
@@ -309,7 +323,9 @@ def query_ble_address(ser: serial.Serial, timeout: float = 2.0) -> str | None:
     payload = frame[1]
     if len(payload) < 7 or payload[0] != USB_INFO:
         return None
-    return ":".join(f"{b:02X}" for b in payload[1:7])
+    address = ":".join(f"{b:02X}" for b in payload[1:7])
+    name = payload[7:].decode("ascii", "replace")
+    return address, name
 
 
 def sleep_now(ser: serial.Serial, secs: int, timeout: float = 2.0) -> int | None:

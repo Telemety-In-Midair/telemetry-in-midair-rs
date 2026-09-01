@@ -6,10 +6,97 @@
 //! (continuing the same UUID sequence) and new config command ids on the
 //! existing config characteristic.
 
-/// Name the board advertises under. The service UUID (which the app
-/// filters scans by) stays `gps_proto::packet::SERVICE_UUID`, so this is
-/// display text and renaming it does not break a scan.
-pub const DEVICE_NAME: &str = "GPS-S3";
+/// Prefix every board's advertised name carries.
+///
+/// A named board advertises `<prefix>-<label>` ("ws3gps-sky-1"); one that
+/// has never been named advertises `<prefix>-<xxxx>` from the tail of its
+/// BLE address, so two boards out of the same box are already told apart in
+/// a scan list. See [`advertised_name`].
+///
+/// The prefix is a firmware constant rather than part of the label, so that
+/// a board cannot be named something unrecognizable: whatever it is called,
+/// a generic scanner can be searched by this. It is not what an app filters
+/// on - the service UUID is, and that travels in the advertisement rather
+/// than the scan response - so a name is display text and renaming a board
+/// cannot lose it.
+pub const NAME_PREFIX: &str = "ws3gps";
+
+/// Separator between the prefix and the label.
+pub const NAME_SEP: u8 = b'-';
+
+/// Bytes of label a board stores (see [`CFG_NAME`]).
+///
+/// The ceiling is not the air - a scan response holds 29 bytes of name -
+/// but the GAP device-name characteristic, which trouble-host builds into a
+/// fixed 22-byte string and refuses to build at all past it. Fifteen is
+/// what is left of that after the prefix and its separator, and it is
+/// longer than the place-and-number labels these boards get ("ground-1",
+/// "sky-1").
+pub const NAME_LABEL_MAX: usize = 15;
+
+/// Bytes a stored label occupies.
+///
+/// One more than the longest label, which does two things: it keeps the
+/// settings record a multiple of the flash write word, and it means a
+/// full-length label is still followed by a zero - so the padding a reader
+/// stops at is always there.
+pub const NAME_FIELD_LEN: usize = NAME_LABEL_MAX + 1;
+
+/// Longest name a board advertises: prefix, separator, label.
+pub const NAME_MAX: usize = NAME_PREFIX.len() + 1 + NAME_LABEL_MAX;
+
+/// Whether a label is one a board will store.
+///
+/// ASCII letters, digits, `-` and `_`, at most [`NAME_LABEL_MAX`] of them.
+/// The charset is what a name can be without needing an escape somewhere:
+/// it travels through a scan list, a console line and a log file, and a
+/// space or a quote in it is a different amount of trouble in each. An
+/// empty label is not valid here - clearing a name is a separate case that
+/// [`CFG_NAME`] checks for first.
+pub fn valid_label(label: &[u8]) -> bool {
+    !label.is_empty()
+        && label.len() <= NAME_LABEL_MAX
+        && label
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
+}
+
+/// The name a board with this label and address advertises under, written
+/// into `buf`.
+///
+/// An empty (or invalid) label is an unnamed board, which falls back to the
+/// tail of its BLE address. `addr` is LSB-first, as the controller takes
+/// it, and the two bytes used are the two a scanner prints last - so the
+/// name and the address a phone shows agree about which board this is.
+///
+/// Shared with the app rather than formatted at each end: the app strips
+/// the prefix to show a label, and a board that built its name by another
+/// rule would have the app displaying the wrong half of it.
+pub fn advertised_name<'a>(label: &str, addr: &[u8; 6], buf: &'a mut [u8; NAME_MAX]) -> &'a str {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut n = 0;
+    for &b in NAME_PREFIX.as_bytes() {
+        buf[n] = b;
+        n += 1;
+    }
+    buf[n] = NAME_SEP;
+    n += 1;
+    if valid_label(label.as_bytes()) {
+        for &b in label.as_bytes() {
+            buf[n] = b;
+            n += 1;
+        }
+    } else {
+        for &b in &[addr[1], addr[0]] {
+            buf[n] = HEX[usize::from(b >> 4)];
+            buf[n + 1] = HEX[usize::from(b & 0x0F)];
+            n += 2;
+        }
+    }
+    // Every byte written above came from ASCII, so this cannot fail; the
+    // fallback keeps the function total rather than panicking on the air.
+    core::str::from_utf8(&buf[..n]).unwrap_or(NAME_PREFIX)
+}
 
 /// [`crate::link::Telemetry`] wire format, notify + read.
 pub const TELEMETRY_UUID: &str = "c3a10005-9f6e-4b2c-8f5a-2e32c3b1e5d0";
@@ -26,6 +113,20 @@ pub const TELEMETRY_UUID_U128: u128 = 0xc3a10005_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 pub const BULK_UUID_U128: u128 = 0xc3a10006_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 pub const REMOTE_UUID_U128: u128 = 0xc3a10007_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 pub const LOG_UUID_U128: u128 = 0xc3a10008_9f6e_4b2c_8f5a_2e32c3b1e5d0;
+
+/// The board's name as it advertises it (ASCII, up to [`NAME_MAX`] bytes),
+/// read + notify.
+///
+/// The same string the scan response carries, so an app that connected to
+/// a board need not have kept the scan around to know which one it is
+/// talking to, and one that has just renamed a board sees the new name
+/// without waiting for the next advertising window.
+///
+/// Read-only: a name is set through [`CFG_NAME`] on the config
+/// characteristic, so every settings write a board takes goes through one
+/// path and produces one ack.
+pub const NAME_UUID: &str = "c3a1000c-9f6e-4b2c-8f5a-2e32c3b1e5d0";
+pub const NAME_UUID_U128: u128 = 0xc3a1000c_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 
 /// Smallest remote position value: src + rssi + packet.
 ///
@@ -471,6 +572,27 @@ pub const IDLE_TIMEOUT_MIN_S: u32 = 10;
 pub const IDLE_TIMEOUT_MAX_S: u32 = 60 * 60;
 pub const IDLE_TIMEOUT_DEFAULT_S: u32 = 10 * 60;
 
+/// ASCII label up to [`NAME_LABEL_MAX`] bytes: what this board is called.
+///
+/// The board advertises `<NAME_PREFIX>-<label>` from the next advertising
+/// window on and reports the whole name on [`NAME_UUID`]. An empty value
+/// clears the label, which returns the board to its address-derived name.
+///
+/// Persisted alongside the settings that decide reachability, and for the
+/// same reason: a name has to survive a deep sleep and a flat cell, and it
+/// has to be readable during a wake check, which mounts no card.
+///
+/// A label outside [`valid_label`] is rejected rather than sanitized. A
+/// board answering to a name nobody asked for is worse than a write that
+/// failed loudly, and the app cannot show the difference between the two
+/// unless the board refuses.
+///
+/// The ack carries the stored length rather than the label, because an ack
+/// is `gps_proto::packet::ACK_MAX_LEN` bytes and no name fits in one; a
+/// length of 0 means the name was cleared. What the board is actually
+/// called comes back on [`NAME_UUID`].
+pub const CFG_NAME: u8 = 0x19;
+
 /// What [`CFG_SLEEP_NOW`] with a value of 0 resolves to when sleep mode is
 /// off. Long enough to be an unmistakable sleep on a bench and short enough
 /// that nobody is waiting on a board they put down by accident.
@@ -548,6 +670,16 @@ pub const BULK_DATA_MAX: usize = crate::link::DATA_CHUNK;
 /// transfer that looked fine.
 pub const WRITE_MAX: usize = 3 + BULK_DATA_MAX;
 
+/// Longest write the config characteristic takes: `[id, len, value]` with
+/// the longest value any id defines, which is a [`CFG_NAME`] label.
+///
+/// It sizes the characteristic, so the attribute layer refuses anything
+/// longer with an ATT error rather than handing the policy a name with its
+/// tail missing. Raising it is backward compatible in the direction that
+/// matters - every other config write is three to six bytes, and a central
+/// that only ever sends those cannot tell the difference.
+pub const CONFIG_WRITE_MAX: usize = 2 + NAME_LABEL_MAX;
+
 #[cfg(test)]
 mod tests {
     use gps_proto::str_eq;
@@ -568,6 +700,7 @@ mod tests {
         assert_eq!(to_u128(super::SETTINGS_UUID), super::SETTINGS_UUID_U128);
         assert_eq!(to_u128(super::RADIO_CONFIG_UUID), super::RADIO_CONFIG_UUID_U128);
         assert_eq!(to_u128(super::NODE_PING_UUID), super::NODE_PING_UUID_U128);
+        assert_eq!(to_u128(super::NAME_UUID), super::NAME_UUID_U128);
         // Same service as the C3 beacon, different characteristic ids.
         assert!(str_eq(
             gps_proto::packet::SERVICE_UUID,
@@ -657,6 +790,67 @@ mod tests {
         assert_eq!(super::Mode::Idle.persisted(), super::Mode::Stored);
         assert_eq!(super::Mode::Stored.persisted(), super::Mode::Stored);
         assert_eq!(super::Mode::Tracking.persisted(), super::Mode::Tracking);
+    }
+
+    /// A named board is its label, an unnamed one is its address - and
+    /// both start with the prefix a scanner is searched by.
+    #[test]
+    fn advertised_name_covers_named_and_unnamed() {
+        // LSB-first, i.e. FF:C6:A1:53:50:47 as a scanner prints it.
+        let addr = [0x47, 0x50, 0x53, 0xA1, 0xC6, 0xFF];
+        let mut buf = [0u8; super::NAME_MAX];
+        assert_eq!(super::advertised_name("sky-1", &addr, &mut buf), "ws3gps-sky-1");
+        // The two bytes are the two the address ends with, in that order.
+        assert_eq!(super::advertised_name("", &addr, &mut buf), "ws3gps-5047");
+    }
+
+    /// A rejected label does not leave the board nameless: the fallback is
+    /// the same one an unnamed board gets, not an empty string.
+    #[test]
+    fn advertised_name_falls_back_on_a_bad_label() {
+        let addr = [0x01, 0x02, 0, 0, 0, 0];
+        let mut buf = [0u8; super::NAME_MAX];
+        assert_eq!(super::advertised_name("has space", &addr, &mut buf), "ws3gps-0201");
+    }
+
+    /// The longest label a board stores still fits everything the name has
+    /// to travel through.
+    #[test]
+    fn longest_name_fits_every_carrier() {
+        let label = "x".repeat(super::NAME_LABEL_MAX);
+        let mut buf = [0u8; super::NAME_MAX];
+        let name = super::advertised_name(&label, &[0; 6], &mut buf);
+        assert_eq!(name.len(), super::NAME_MAX);
+        // A 31-byte scan response less the length and type bytes of the
+        // complete-local-name AD structure.
+        assert!(super::NAME_MAX <= 29);
+        // trouble-host's GAP device name, which is a fixed-size string: a
+        // name past it does not truncate, it fails the server build.
+        assert!(super::NAME_MAX <= 22);
+        // A full-length label still leaves the field zero-terminated.
+        assert!(super::NAME_LABEL_MAX < super::NAME_FIELD_LEN);
+    }
+
+    #[test]
+    fn labels_are_ascii_word_characters() {
+        for good in ["a", "sky-1", "ground_2", "A1"] {
+            assert!(super::valid_label(good.as_bytes()), "{good}");
+        }
+        for bad in ["", "has space", "quote\"", "caf\u{e9}", "a/b"] {
+            assert!(!super::valid_label(bad.as_bytes()), "{bad}");
+        }
+        let too_long = "x".repeat(super::NAME_LABEL_MAX + 1);
+        assert!(!super::valid_label(too_long.as_bytes()));
+        assert!(super::valid_label(&too_long.as_bytes()[..super::NAME_LABEL_MAX]));
+    }
+
+    /// The config characteristic has to be able to carry the longest
+    /// label, or a name write is truncated by the attribute layer before
+    /// the policy ever sees it.
+    #[test]
+    fn config_write_max_holds_a_full_label() {
+        assert_eq!(super::CONFIG_WRITE_MAX, 2 + super::NAME_LABEL_MAX);
+        assert!(super::CONFIG_WRITE_MAX <= super::WRITE_MAX);
     }
 
     /// A longer buffer must still decode: a future layout can only grow,

@@ -72,3 +72,15 @@ edge cannot wake the receiver out of it. Wake checks no longer run
 
 `wio-set mode` and `wio-set idle-timeout` on the USB console; `idle_timeout_s`
 in the card's `[power]` section.
+
+## Board names
+
+Boards advertise as `ws3gps-<label>`, set by config id `0x19` over BLE or
+`wio-set name` over USB, with an unnamed board falling back to the tail of
+its BLE address so two out of the same box are still told apart. The label
+is stored with the settings that decide reachability - RTC RAM mirrored to
+`nvs`, record version 6 - rather than on the card, because a wake check
+advertises before anything has mounted one. It comes back on the name
+characteristic (`c3a1000c-...`) and in the USB `INFO` reply, and the prefix
+is a firmware constant so a board can never be named something a scanner
+cannot find.

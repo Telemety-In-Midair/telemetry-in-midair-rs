@@ -3,14 +3,15 @@
 
     pixi run wio-info
 
-Prints the firmware's protocol version and the board's BLE address. The
-address is the one thing about a board that is otherwise only visible in a
-single line at boot, and a board that has been running for a week has
-scrolled that away - so this asks for it on demand instead.
+Prints the firmware's protocol version, the board's BLE address and the
+name it advertises under. The address is the one thing about a board that is
+otherwise only visible in a single line at boot, and a board that has been
+running for a week has scrolled that away - so this asks for it on demand
+instead.
 
-Nothing here is a scan: an address is a property of the board, and reading
-it from the board is what makes it possible to tell two of them apart
-without connecting to either.
+Nothing here is a scan: both are properties of the board, and reading them
+from the board is what makes it possible to tell two of them apart without
+connecting to either. `wio-set name` is what changes the name.
 """
 
 import argparse
@@ -32,10 +33,16 @@ def main() -> int:
         sys.exit("no PING reply - is the board running wio-s3-gps firmware?")
     print("firmware responding")
 
-    address = link.query_ble_address(ser)
-    if address is None:
-        sys.exit("the board did not answer the address query")
+    info = link.query_info(ser)
+    if info is None:
+        sys.exit("the board did not answer the info query")
+    address, name = info
     print(f"BLE address {address}")
+    if name:
+        print(f"advertises as {name}")
+    else:
+        # Firmware from before names existed answers with the address alone.
+        print("no name reported (firmware predates board names)")
     return 0
 
 

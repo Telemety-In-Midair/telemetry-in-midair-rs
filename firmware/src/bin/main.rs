@@ -187,8 +187,14 @@ struct GpsService {
     #[characteristic(uuid = packet::POSITION_UUID_U128, read, notify)]
     position: [u8; packet::POSITION_PACKET_LEN],
     /// Config commands: [id, len, value bytes].
+    ///
+    /// Sized from the protocol rather than from the longest numeric write,
+    /// because one id carries a string: a name is `ble::NAME_LABEL_MAX`
+    /// bytes behind its two-byte header, and a characteristic shorter than
+    /// that would hand the policy a truncated label instead of refusing the
+    /// write.
     #[characteristic(uuid = packet::CONFIG_UUID_U128, write)]
-    config: heapless::Vec<u8, 8>,
+    config: heapless::Vec<u8, { ble::CONFIG_WRITE_MAX }>,
     /// Config/bulk acks: [id, status, applied value].
     #[characteristic(uuid = packet::ACK_UUID_U128, notify)]
     ack: [u8; packet::ACK_MAX_LEN],
@@ -223,6 +229,14 @@ struct GpsService {
     /// editor from the board rather than a local file.
     #[characteristic(uuid = ble::RADIO_CONFIG_UUID_U128, read, notify)]
     radio_config: [u8; radiocfg::RADIO_CONFIG_LEN],
+    /// What this board is called, as it advertises it.
+    ///
+    /// A connected app should not have to have kept the scan around to know
+    /// which board it is talking to, and one that has just renamed a board
+    /// sees the result here rather than waiting a window for the scan
+    /// response to catch up.
+    #[characteristic(uuid = ble::NAME_UUID_U128, read, notify)]
+    name: heapless::Vec<u8, { ble::NAME_MAX }>,
 }
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -554,8 +568,15 @@ async fn main(spawner: Spawner) -> ! {
     // `Server::new_with_config` panics ("already full, it can't be
     // initialized twice") rather than returning an error. It borrows nothing
     // from the per-window stack, so hoisting it costs nothing either.
+    // The GAP device name is the one surface that cannot follow a rename:
+    // the attribute table is built once (see above) and this string is
+    // copied into it. A board renamed while running therefore advertises
+    // and reports its new name immediately - the scan response and the name
+    // characteristic are both rebuilt - and only the GAP characteristic,
+    // which nothing here reads, catches up at the next boot.
+    let boot_name = settings::name();
     let server = Server::new_with_config(GapConfig::Peripheral(PeripheralConfig {
-        name: ble::DEVICE_NAME,
+        name: &boot_name,
         appearance: &appearance::sensor::GENERIC_SENSOR,
     }))
     .expect("gatt server");
@@ -673,6 +694,10 @@ async fn main(spawner: Spawner) -> ! {
             // `gatt_session`. Re-seeded per window because the settings may
             // have moved while the modem was down.
             let _ = server.gps.settings.set(&server, &current_settings().encode());
+            let _ = server
+                .gps
+                .name
+                .set(&server, &name_value());
 
             let _ = select(
                 async {
@@ -934,11 +959,6 @@ async fn serve<C: Controller>(
     )
     .expect("adv data fits");
     let mut scan_data = [0u8; 31];
-    let scan_len = AdStructure::encode_slice(
-        &[AdStructure::CompleteLocalName(ble::DEVICE_NAME.as_bytes())],
-        &mut scan_data,
-    )
-    .expect("scan data fits");
 
     let mut mode = settings::get().mode;
     let mut window = session::Window::new(Instant::now().as_millis(), settings::get().budget_s());
@@ -968,7 +988,16 @@ async fn serve<C: Controller>(
             session::Next::BleDown { .. } => return,
             session::Next::Advertise => {}
         }
-        qprintln!("advertising as {}", ble::DEVICE_NAME);
+        // Built here rather than once above, so a board renamed during the
+        // last connection advertises under the new name from this window on
+        // rather than at the next boot.
+        let name = settings::name();
+        let scan_len = AdStructure::encode_slice(
+            &[AdStructure::CompleteLocalName(name.as_bytes())],
+            &mut scan_data,
+        )
+        .expect("scan data fits");
+        qprintln!("advertising as {}", name);
         let advertiser = match peripheral
             .advertise(
                 &AdvertisementParameters::default(),
@@ -1144,6 +1173,25 @@ async fn publish_settings<P: PacketPool>(server: &Server<'_>, conn: &GattConnect
     let _ = server.gps.settings.notify(conn, &value).await;
 }
 
+/// The name characteristic's value: what the board advertises under, as
+/// the characteristic holds it.
+fn name_value() -> heapless::Vec<u8, { ble::NAME_MAX }> {
+    let name = settings::name();
+    // Built to fit by construction - both buffers are `ble::NAME_MAX`.
+    heapless::Vec::from_slice(name.as_bytes()).unwrap_or_default()
+}
+
+/// Refresh the name characteristic and notify the central. Called on
+/// connect and after a config write, which is the only thing that renames a
+/// board.
+async fn publish_name<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>) {
+    let value = name_value();
+    if server.gps.name.set(server, &value).is_err() {
+        return;
+    }
+    let _ = server.gps.name.notify(conn, &value).await;
+}
+
 /// Refresh the radio-config characteristic. A no-op until the radio has
 /// been configured, so the characteristic never carries the all-zero
 /// placeholder as if it were a real config.
@@ -1177,6 +1225,7 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
     // Publish before anything else, so an app can populate its controls
     // without waiting for a notify interval.
     publish_settings(server, conn).await;
+    publish_name(server, conn).await;
     publish_radio_config(server, conn).await;
 
     // Hand the new central every node heard from recently. Their ages go
@@ -1239,6 +1288,10 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
                             // settings characteristic reports, including
                             // through clamping.
                             publish_settings(server, conn).await;
+                            // A rename is the one settings change the blob
+                            // above does not carry: a name is a string, and
+                            // the ack could only afford its length.
+                            publish_name(server, conn).await;
                         }
                         Wrote::Bulk => {
                             let (ack, _) =

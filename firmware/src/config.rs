@@ -82,6 +82,14 @@ pub async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
         Action::IdleTimeout(secs) => {
             qprintln!("config: idle timeout {} s", secs);
         }
+        // Nothing to drive: the serve loop rebuilds the scan response from
+        // the stored name before every advertisement, so the new name goes
+        // out with the next window - the one on the air now was handed to
+        // the controller before this write arrived. The characteristic is
+        // republished by the caller, which still holds the connection.
+        Action::Name => {
+            status_println!("name: {}", settings::name());
+        }
         Action::None => {
             qprintln!("config: rejected write (status {})", outcome.ack[1]);
         }

@@ -97,6 +97,7 @@ classDiagram
     class Settings {
         <<RTC RAM + nvs mirror>>
         survives deep sleep and a flat cell
+        name() advertised label
     }
 
     class MidairProto {
@@ -155,7 +156,7 @@ classDiagram
     Firmware *-- HardwareTask
     Firmware *-- FlashStore
     ServeTask --> GattSession
-    ServeTask --> Settings : sleep interval, window
+    ServeTask --> Settings : sleep interval, window, name
     GattSession <--> State
     HardwareTask <--> State
     HardwareTask --> StatusOled : render(telemetry)
@@ -252,10 +253,11 @@ sequenceDiagram
     participant St as State
     participant Hw as HardwareTask
 
+    Serve-->>Serve: settings::name() for this window's scan response
     Serve->>Serve: advertise (service uuid + name)
     App->>Serve: connect
     Serve->>Gatt: hand over the connection
-    Gatt->>App: notify settings, radio config
+    Gatt->>App: notify settings, name, radio config
     Gatt->>St: replay_remotes()
     St->>App: every node still inside the TTL, aged
 
@@ -277,7 +279,7 @@ sequenceDiagram
     App->>Gatt: write config id
     Gatt->>Gatt: session::apply (host-tested policy)
     Gatt->>St: request(GpsSleep | RadioStandby)
-    Gatt->>App: notify ack, then fresh settings
+    Gatt->>App: notify ack, then fresh settings and name
     St->>Hw: take_request() on the next loop
     Note over Gatt,Hw: the ack always holds - there is no<br/>second chip that can fail to answer
 
@@ -468,7 +470,10 @@ the loop that owns the `Rtc` is the one that can wait for the link to finish.
 Settings live in RTC fast RAM so a wake check costs no flash read, and are
 mirrored into the `nvs` partition so they also survive a flat cell. Only the
 settings that decide whether a board is reachable at all are mirrored, and
-the mode is now one of them - which resolves an inversion. The GPS and radio
+the mode is now one of them - which resolves an inversion. The board's name
+is kept there for a related reason: a wake check advertises before anything
+has mounted the card, so a name on the card would be a name a sleeping board
+could not tell anyone. The GPS and radio
 sleep flags are deliberately *not* saved, because "a board that cold-boots
 with its GPS running is the safer failure" - true for a tracker, and it
 drains the cell of a device in a bag. The mode answers both: a cold boot

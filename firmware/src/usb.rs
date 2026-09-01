@@ -94,11 +94,21 @@ pub async fn usb_task(
                     let a = state::ble_address();
                     // Most-significant octet first, so it prints directly
                     // and matches the boot line.
-                    let mut reply = [link::usb::INFO, 0, 0, 0, 0, 0, 0];
+                    let mut reply = [0u8; 7 + midair_proto::ble::NAME_MAX];
+                    reply[0] = link::usb::INFO;
                     for i in 0..6 {
                         reply[1 + i] = a[5 - i];
                     }
-                    out.build(link::resp::ACK, &reply);
+                    // The name is appended rather than sent on a command of
+                    // its own, so one round trip answers "which board is
+                    // this" in both the forms that question is asked - the
+                    // address a scanner shows and the name a scan list does.
+                    // A tool that predates it reads the address at the same
+                    // offsets and ignores the tail.
+                    let name = crate::settings::name();
+                    let end = 7 + name.len();
+                    reply[7..end].copy_from_slice(name.as_bytes());
+                    out.build(link::resp::ACK, &reply[..end]);
                     send_frame(&mut tx, out.as_bytes()).await;
                 }
                 link::usb::SLEEP => {

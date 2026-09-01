@@ -209,3 +209,8 @@ thing a board sitting on a desk doing nothing needs to be able to tell you.
 Check bluetooth docs for lower power state management. Wake without advertising?
 
 Confirm in app for stored mode.
+
+- Boot into idle.
+- Should be able to turn off idle auto to stored. 
+- Quick double flash on rx.
+- Log gps data to flash. Can load from usb or over BLE.
