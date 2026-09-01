@@ -13,12 +13,21 @@ runner = """espflash flash --monitor --chip esp32s3 --flash-size 16mb --partitio
 [env]
 
 [build]
-rustflags = [
-  # Required to obtain backtraces (e.g. when using the "esp-backtrace" crate.)
-  # NOTE: May negatively impact performance of produced code
-  "-C", "force-frame-pointers",
-]
-
+# No `-C force-frame-pointers` here, deliberately. Forcing it is what a
+# RISC-V part needs to give esp-backtrace something to walk; this one is
+# Xtensa, where the backtrace comes from the windowed-ABI register spill
+# area instead and the flag buys nothing. esp-backtrace agrees - its build
+# script only inspects the flag when the chip is not Xtensa.
+#
+# It is not merely useless here, it is fatal: with the frame pointer
+# reserved the register scavenger runs out of room and LLVM aborts codegen
+# of the final binary,
+#
+#   rustc-LLVM ERROR: Error while trying to spill A6 from class AR:
+#   Cannot scavenge register without an emergency spill slot!
+#
+# which is an error from the backend, not from rustc, so `cargo check`
+# passes and only `cargo build` fails.
 target = "xtensa-esp32s3-none-elf"
 
 [unstable]
