@@ -1036,9 +1036,15 @@ async fn serve<C: Controller>(
             Either3::First(Some(Ok(c))) => c,
             Either3::First(Some(Err(_))) => {
                 // A central started a connection and it did not complete.
-                // The pause keeps a repeated failure off a hot spin, and it
-                // comes out of the wake budget like everything else.
-                qprintln!("connect attempt failed");
+                // The pause keeps a repeated failure off a hot spin.
+                //
+                // The window is held open for the retry rather than left to
+                // run out: a phone that fizzled a handshake comes back
+                // within a second or two, and before this it could find the
+                // board dark for `ble_off_s` or asleep for a whole cadence,
+                // having tried at the wrong moment in a 15 s window.
+                qprintln!("connect attempt failed, holding the window open");
+                window.after_connect_attempt(Instant::now().as_millis());
                 Timer::after(Duration::from_millis(200)).await;
                 continue;
             }

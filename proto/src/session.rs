@@ -751,6 +751,29 @@ impl Window {
         self.ends_ms = now_ms.saturating_add(LINGER_S * 1000);
     }
 
+    /// A central tried to connect and the handshake did not complete.
+    ///
+    /// Extends rather than sets, which is the difference from
+    /// [`linger`](Self::linger): an attempt early in a long window must not
+    /// shorten it.
+    ///
+    /// Phones fizzle a first handshake routinely - the app's own reconnect
+    /// loop exists for it - and the retry lands a second or two later.
+    /// Without this the window can expire in between, and then the retry
+    /// arrives at a board that has gone dark for `ble_off_s` or asleep for
+    /// a whole cadence. From the hand holding the phone that is not "it
+    /// will connect in a moment", it is "it did not connect", and the wait
+    /// is as long as the duty cycle rather than as long as a handshake.
+    ///
+    /// [`Mode::Stored`] reaches this too, after the promotion has already
+    /// re-armed the window on the idle budget: the extension is a `max`, so
+    /// it changes nothing there.
+    pub fn after_connect_attempt(&mut self, now_ms: u64) {
+        self.ends_ms = self
+            .ends_ms
+            .max(now_ms.saturating_add(LINGER_S * 1000));
+    }
+
     /// Re-arm the budget after a central disconnects.
     ///
     /// [`Mode::Idle`] restarts the whole timeout rather than spending what
@@ -1529,6 +1552,43 @@ mod tests {
         }
         assert_eq!(w.next(now, &s), Next::Sleep { interval_s: 30 });
         assert_eq!(w.ends_ms(), 15_000, "the deadline moved");
+    }
+
+    /// A handshake that fizzled at the end of the window buys the same
+    /// short hold a disconnect does, so the retry lands on a board that is
+    /// still advertising rather than one that has gone down for a cadence.
+    #[test]
+    fn a_failed_attempt_holds_the_window_open() {
+        let s = cadence(60);
+        let mut w = Window::new(0, 15);
+        // The phone tried at 14.9 s of a 15 s window and did not finish.
+        let tried_at = 14_900;
+        w.after_connect_attempt(tried_at);
+        assert_eq!(w.next(tried_at, &s), Next::Advertise);
+        assert_eq!(
+            w.next(15_100, &s),
+            Next::Advertise,
+            "the window it tried in has expired, and it is still advertising"
+        );
+        assert_eq!(
+            w.next(tried_at + LINGER_S * 1000, &s),
+            Next::Sleep { interval_s: 60 },
+            "and the hold is a hold, not a new window"
+        );
+    }
+
+    /// The hold extends; it never shortens. An attempt in the first second
+    /// of a ten minute idle timeout must not cut it to five seconds.
+    #[test]
+    fn a_failed_attempt_cannot_shorten_a_longer_window() {
+        let s = Stored {
+            mode: Mode::Idle,
+            idle_timeout_s: 600,
+            ..Stored::new()
+        };
+        let mut w = Window::new(0, s.budget_s());
+        w.after_connect_attempt(1_000);
+        assert_eq!(w.ends_ms(), 600_000);
     }
 
     /// A disconnect buys a short linger, so the phone can come straight
