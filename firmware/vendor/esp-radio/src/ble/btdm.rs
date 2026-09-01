@@ -869,6 +869,13 @@ pub fn send_hci(data: &[u8]) {
 
                 if !can_send {
                     trace!("can_send is false");
+                    // LOCAL PATCH: yield rather than spin. What frees a
+                    // controller buffer is the controller task, and this
+                    // loop can otherwise deny it the CPU it needs to do
+                    // that. With modem sleep the spin is worse than a hang:
+                    // the wakeup request above is still held, so the modem
+                    // stays powered for as long as it lasts.
+                    crate::preempt::yield_task();
                     continue;
                 }
 
@@ -894,7 +901,11 @@ pub fn send_hci(data: &[u8]) {
             }
 
             // make sure the packet buffer doesn't get touched until sent
-            while !PACKET_SENT.load(Ordering::Relaxed) {}
+            while !PACKET_SENT.load(Ordering::Relaxed) {
+                // LOCAL PATCH: as above - the notification that sets this
+                // comes from the controller.
+                crate::preempt::yield_task();
+            }
 
             #[cfg(any(esp32c3, esp32s3))]
             async_wakeup_request_end();

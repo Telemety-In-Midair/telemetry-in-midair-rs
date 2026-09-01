@@ -93,8 +93,20 @@ enum HciOutType {
     Command,
 }
 
+/// Largest H4 packet the transport can hand [`HciOutCollector::push`].
+///
+/// LOCAL PATCH. `Transport::write` builds its frame in a `[u8; 259]` - the
+/// worst case being an HCI command, one type byte plus a three byte header
+/// plus a 255 byte parameter - and upstream collects it into 256, with no
+/// check. An ACL packet reaches 1 + 4 + `le_acl_data_packet_length`, and
+/// trouble-host fragments to exactly the length the controller reports, so
+/// at the usual 251 that lands on 256 with nothing to spare and a
+/// controller that reported more would panic on a slice range rather than
+/// drop anything.
+const HCI_OUT_MAX: usize = 259;
+
 struct HciOutCollector {
-    data: [u8; 256],
+    data: [u8; HCI_OUT_MAX],
     index: usize,
     ready: bool,
     kind: HciOutType,
@@ -103,7 +115,7 @@ struct HciOutCollector {
 impl HciOutCollector {
     fn new() -> HciOutCollector {
         HciOutCollector {
-            data: [0u8; 256],
+            data: [0u8; HCI_OUT_MAX],
             index: 0,
             ready: false,
             kind: HciOutType::Unknown,
@@ -115,6 +127,21 @@ impl HciOutCollector {
     }
 
     fn push(&mut self, data: &[u8]) {
+        // LOCAL PATCH: refuse rather than panic. Nothing this stack sends
+        // is this long, so reaching here means the controller reported an
+        // ACL length the buffer above was not sized for - in which case
+        // dropping the packet loses one HCI exchange, and the slice panic
+        // it replaces lost the board.
+        if data.len() > self.data.len() - self.index {
+            error!(
+                "HCI packet does not fit: {} bytes with {} already collected",
+                data.len(),
+                self.index
+            );
+            self.reset();
+            return;
+        }
+
         self.data[self.index..(self.index + data.len())].copy_from_slice(data);
         self.index += data.len();
 

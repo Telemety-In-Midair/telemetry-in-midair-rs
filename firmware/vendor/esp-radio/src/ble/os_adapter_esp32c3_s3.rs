@@ -681,7 +681,20 @@ pub(crate) unsafe extern "C" fn interrupt_on(intr_num: i32) -> i32 {
 }
 
 pub(crate) unsafe extern "C" fn interrupt_off(_intr_num: i32) -> i32 {
-    todo!();
+    // LOCAL PATCH: a no-op rather than a `todo!()`, which is to say a
+    // reset rather than a panic if the controller ever calls it.
+    //
+    // This slot is ESP-IDF's `_interrupt_disable`, an `esp_intr_disable`
+    // on the handle its `_interrupt_alloc` returned. There is no such
+    // handle here: `interrupt_set` above stores the handler and enables the
+    // interrupt through esp-hal, and `interrupt_on` is already a no-op, so
+    // nothing in this crate masks these interrupts at all. Not masking is
+    // what the pair already does; panicking would be new.
+    //
+    // Teardown is not affected: `Controller::drop` disables BT_BB and
+    // RWBLE at the CPU (`radio_esp32s3::shutdown_radio_isr`).
+    trace!("interrupt_off {}", _intr_num);
+    0
 }
 
 pub(crate) fn btdm_controller_mem_init() {
@@ -720,7 +733,12 @@ pub(crate) unsafe extern "C" fn interrupt_set(
 }
 
 pub(crate) unsafe extern "C" fn interrupt_clear(_handler: *const ()) -> i32 {
-    todo!();
+    // LOCAL PATCH, same reasoning as `interrupt_off`. ESP-IDF's
+    // `_interrupt_free` frees the allocation `_interrupt_alloc` made;
+    // `interrupt_set` here allocates nothing, so there is nothing to free
+    // and the honest answer is success.
+    trace!("interrupt_clear {:?}", _handler);
+    0
 }
 
 pub(crate) unsafe extern "C" fn interrupt_handler_set(
@@ -782,12 +800,26 @@ pub(crate) unsafe extern "C" fn coex_core_ble_conn_dyn_prio_get(
     0
 }
 
+// LOCAL PATCH: the MAC/BB power-down trio, as no-ops.
+//
+// ESP-IDF installs all three unconditionally and wraps their bodies in
+// `#if CONFIG_MAC_BB_PD`, so in a build without that option - which is the
+// default on this controller, and the shape this crate is in, since nothing
+// calls `btdm_deep_sleep_mem_init` - they are empty functions rather than
+// absent ones. Espressif does not rely on the controller never calling
+// them, and neither should this.
+//
+// They were `todo!()` while nothing could reach them. Modem sleep is the
+// first thing here that puts the controller through a power transition at
+// all, so "unreachable" became "unreachable as far as anyone has seen",
+// and the cost of being wrong was a panic inside a controller callback:
+// a reset with no message, indistinguishable from a brownout.
 pub(crate) unsafe extern "C" fn esp_hw_power_down() {
-    todo!();
+    trace!("esp_hw_power_down");
 }
 
 pub(crate) unsafe extern "C" fn esp_hw_power_up() {
-    todo!();
+    trace!("esp_hw_power_up");
 }
 
 pub(crate) unsafe extern "C" fn ets_backup_dma_copy(
@@ -796,5 +828,7 @@ pub(crate) unsafe extern "C" fn ets_backup_dma_copy(
     _num: u32,
     _to_rem: i32,
 ) {
-    todo!();
+    // The third of the trio above: ESP-IDF's body is one `ets_backup_dma_copy`
+    // call under the same `#if CONFIG_MAC_BB_PD`.
+    trace!("ets_backup_dma_copy");
 }
