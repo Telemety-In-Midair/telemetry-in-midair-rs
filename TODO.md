@@ -54,6 +54,18 @@ cadence cannot be tuned against a number nobody has.
 Also unproven on hardware: whether the receiver comes back at all after a
 park, and what TTFF costs when it does.
 
+Two things the first bench run of the modes changed (2026-08-31):
+
+- The receiver measures **~10 mA**, not the 25-31 the documents carry -
+  taken by toggling `gps_sleep`, so confirm it with `--features
+  iso-gps-backup` before rewriting the floor around it. Everything
+  downstream of "the GPS is ~30 mA of the floor" is now suspect.
+- `UBX-RXM-PMREQ` was missing the `force` flag the MAX-M10N requires for
+  software standby, so parks held only sometimes. Fixed; the park path now
+  prints `gps: talking at park - the last park did not hold` when it
+  catches one. **Any floor reading taken before this is one of two
+  numbers**, so retake them.
+
 ## Bench work
 
 **Measure the BLE modem sleep.** It is implemented now - a port of
@@ -68,6 +80,15 @@ that hands the controller an HCI packet is the part with the least margin.
 The console prints `ble modem sleep on` at the first window if the
 controller really took it, so a run that says `off` is a finding rather
 than a measurement.
+
+Still open on the advertising window, and not fixable from the firmware
+side: a connect attempt that is *in flight* when the window expires.
+`with_timeout(left, advertiser.accept())` cancels the accept, and
+trouble-host reports that as "nobody came" rather than "someone was halfway
+in", so the board goes dark on a phone that was seconds from connecting. A
+returned-but-failed handshake is now held open for the retry
+(`Window::after_connect_attempt`); this one needs the host stack to say
+that a connection is being made.
 
 Then work the rest of `docs/POWER-AUDIT.md`, which is ordered by what it is
 worth. The board is measured - ~126 mA awake, a 60 mA floor with BLE dark -

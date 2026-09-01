@@ -761,6 +761,13 @@ MAX-M10 at 25-31 mA, the S3 itself around 12, the USB PHY 3-5, the idle
 SX1262 ~2, leakage ~1. `--features iso-gps-backup` is what turns the first
 of those from an estimate into a measurement.
 
+**And the first bench reading says the estimate is high.** Toggling
+`gps_sleep` on 2026-08-31 moves the board by ~10 mA, so the receiver is a
+third of what is written above and the rest of this decomposition has to
+absorb the difference. Treat the 25-31 mA figure in the diagram and the
+table further up as the datasheet's rather than this board's until the
+isolation build confirms which is right.
+
 What each subtraction means:
 
 - **baseline - `iso-no-ble`** is what BLE and the PHY actually cost on this

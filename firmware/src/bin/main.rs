@@ -1630,6 +1630,25 @@ async fn hardware_task(
                     // the part a reader would use to work out where the
                     // board was when it went down.
                     sdlog.park(now);
+                    // Did the last park hold?
+                    //
+                    // Free to ask here and nowhere else. Nothing polls the
+                    // receiver while the board is in standby, so whatever
+                    // is sitting in the UART FIFO at this point came from a
+                    // receiver that was awake during a wake check - the
+                    // ~10 mA failure that costs a whole sleep interval, and
+                    // that is otherwise invisible, because the deep sleep
+                    // reset this driver's idea of the module's state along
+                    // with everything else.
+                    if standby {
+                        let before = gps.rx_bytes();
+                        gps.poll();
+                        if gps.rx_bytes() != before {
+                            status_println!(
+                                "gps: talking at park - the last park did not hold"
+                            );
+                        }
+                    }
                     // The receiver is the largest load a sleeping board can
                     // carry, at around 30 mA against a chip that is
                     // otherwise in microamps - and a sleeping S3 cannot use

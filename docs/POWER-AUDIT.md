@@ -125,6 +125,24 @@ conclusion in `POWER-S3.md` - including the claim that the floor is a
 floor. It is the single cheapest measurement left and the document already
 identifies it as such, twice, without it having happened.
 
+**A first reading, 2026-08-31, and it is not the estimate.** Toggling
+`gps_sleep` on the bench with a meter attached moves the board by a
+consistent **~10 mA**, not 25-31. That is the receiver's whole
+contribution, so the ~30 mA GPS term in the floor decomposition above is
+roughly three times what the part actually draws, and the largest single
+number in this document's model of the board is wrong in the direction that
+makes everything else larger. It was taken by toggling a setting rather
+than by the isolation build, so it wants confirming with
+`--features iso-gps-backup` before the model is rewritten around it - but
+the estimate should not be repeated as if it were still standing.
+
+That same bench run found the reason a sleeping board's floor moved around:
+`UBX-RXM-PMREQ` was going out without the `force` flag, which the MAX-M10N
+integration manual (3.7.4.2) requires for software standby, so the receiver
+ignored the park on some cycles and took it on others. Fixed, and the park
+path now reports a park that did not hold. Every floor reading taken before
+2026-08-31 may be either value.
+
 ### B2. The S3 core never sleeps, and the document does not mention this
 
 esp-rtos idles at `waiti 0` with every clock running at 80 MHz. That is

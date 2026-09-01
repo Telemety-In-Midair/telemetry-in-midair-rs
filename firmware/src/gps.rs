@@ -416,11 +416,25 @@ impl<'d> Gps<'d> {
             return;
         }
         // Version-0 16-byte payload: version, reserved[3], duration (0 =
-        // until wake source), flags (bit1 = backup), wakeupSources
-        // (bit3 = uartrx, bit5 = extint0).
+        // until wake source), flags (bit1 = backup, bit2 = force),
+        // wakeupSources (bit3 = uartrx, bit5 = extint0).
+        //
+        // `force` is not optional on this part, whatever the name suggests.
+        // It reads like the u-blox 8 flag for "back up even though USB is
+        // attached", which is why it was left clear here, and on a MAX-M10N
+        // that is wrong: the integration manual's software standby section
+        // (3.7.4.2) says flatly that the force flag must be set in
+        // UBX-RXM-PMREQ to enter software standby mode.
+        //
+        // Without it the request is simply not honored, and nothing says
+        // so - there is no NAK, the driver marks the module asleep, and the
+        // receiver keeps tracking through the whole sleep at around 10 mA
+        // on this board. It is not even reliably broken: a request without
+        // the flag is sometimes taken, which is what made this look random
+        // on the meter rather than like a missing bit.
         let mut payload = [0u8; 16];
         payload[4..8].copy_from_slice(&ms.to_le_bytes());
-        payload[8..12].copy_from_slice(&2u32.to_le_bytes()); // flags: backup
+        payload[8..12].copy_from_slice(&0x6u32.to_le_bytes()); // flags: backup | force
         payload[12..16].copy_from_slice(&((1u32 << 3) | (1u32 << 5)).to_le_bytes());
         self.ubx(0x02, 0x41, &payload); // class RXM, id PMREQ
         self.sleeping = true;
