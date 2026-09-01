@@ -196,8 +196,12 @@ struct GpsService {
     #[characteristic(uuid = ble::TELEMETRY_UUID_U128, read, notify)]
     telemetry: [u8; link::TELEMETRY_LEN],
     /// Bulk transfer ops: a radio config, or a firmware image.
+    ///
+    /// Sized from the protocol, so the attribute layer rejects an
+    /// over-length write with an ATT error rather than accepting bytes the
+    /// handler will refuse further in.
     #[characteristic(uuid = ble::BULK_UUID_U128, write)]
-    bulk: heapless::Vec<u8, 200>,
+    bulk: heapless::Vec<u8, { ble::WRITE_MAX }>,
     /// Last remote position heard over LoRa.
     #[characteristic(uuid = ble::REMOTE_UUID_U128, read, notify)]
     remote: [u8; ble::REMOTE_LEN_V2],
@@ -205,8 +209,12 @@ struct GpsService {
     #[characteristic(uuid = ble::NODE_PING_UUID_U128, read, notify)]
     node_ping: [u8; ble::NODE_PING_LEN],
     /// Latest status/log line (ASCII text).
+    ///
+    /// The same bound the lines are built to. A characteristic smaller than
+    /// that would not truncate them, it would drop them: `notify` fails on
+    /// an over-length value and the logger arm has nowhere to report it.
     #[characteristic(uuid = ble::LOG_UUID_U128, read, notify)]
-    log: heapless::Vec<u8, 128>,
+    log: heapless::Vec<u8, { link::LOG_MAX }>,
     /// Current power/sleep settings, so an app can populate its controls
     /// on connect instead of assuming defaults.
     #[characteristic(uuid = ble::SETTINGS_UUID_U128, read, notify)]
