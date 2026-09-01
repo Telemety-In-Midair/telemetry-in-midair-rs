@@ -838,19 +838,24 @@ async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
     // visible afterwards because the wake re-inits the radio anyway. The
     // hardware loop also declines to start a beacon while a sleep is
     // pending, so this only has to cover one already in flight.
-    let park = Duration::from_millis(u64::from(state::tx_worst_case_ms()) + 500);
+    //
+    // The second on top of that covers the park itself. It was 500 ms,
+    // which is enough for the bounded parts of the sequence and not for the
+    // card, whose flush and unmount can stall on wear levelling - and an
+    // expiry there was enough to sleep over a park that had not finished.
+    // Nothing is spent in the ordinary case: this is a timeout rather than
+    // a delay, so the wait ends when the park does.
+    let park = Duration::from_millis(u64::from(state::tx_worst_case_ms()) + 1_500);
     if with_timeout(park, state::SLEEP_READY.wait()).await.is_err() {
         // Worth saying: it means the sleep is about to cost more than it
         // should, and it is otherwise undetectable from the far side.
         //
-        // Named for the whole sequence rather than the radio. The budget is
-        // sized for a transmit in flight, which is the longest thing in it,
-        // but the signal comes at the *end* of a park that also flushes and
-        // unmounts the card and takes the receiver into backup - so a card
-        // that stalled is enough to expire it, and what is left awake then
-        // is whatever the hardware task had not reached. A receiver still
-        // acquiring is the expensive one, at around 10 mA for the whole
-        // interval.
+        // What is still awake is whatever the hardware task had not reached.
+        // `PrepareSleep` takes the receiver, the radio and the panel down
+        // before it touches the card, so an expiry here is most likely the
+        // card alone - which costs buffered log lines rather than current.
+        // The expensive shape is a loop still inside a transmit that outran
+        // the budget above, because that one reaches none of it.
         println!("sleep: park did not finish in time, sleeping over it");
     }
 
@@ -1685,15 +1690,22 @@ async fn hardware_task(
                 }
                 Request::PrepareSleep => {
                     // Everything a sleeping board cannot use, in the order
-                    // that loses the least: the card first, because it is
-                    // the only one holding data that a reset would destroy.
+                    // that loses the least when the sequence does not
+                    // finish - and it does not have to finish, because
+                    // `enter_deep_sleep` waits a bounded time for the signal
+                    // at the bottom and then sleeps anyway.
                     //
-                    // Deep sleep is a full reset, so the pending log buffer
-                    // is simply gone - up to five fixes at the 1 Hz rate,
-                    // and always the five at the end of the wake, which is
-                    // the part a reader would use to work out where the
-                    // board was when it went down.
-                    sdlog.park(now);
+                    // So the three that cost current go first. Each is
+                    // bounded work - a couple of UART bytes, an SPI command,
+                    // an I2C frame - and each is milliamps for the whole
+                    // interval if it is skipped, against a chip that is
+                    // otherwise in microamps. The card goes last because it
+                    // is the only one that can stall arbitrarily: a flush
+                    // that lands on wear levelling is what expires the
+                    // budget, and behind the other three that costs the
+                    // buffered log lines rather than the sleep current the
+                    // whole mode exists for.
+                    //
                     // Did the last park hold?
                     //
                     // Free to ask here and nowhere else. Nothing polls the
@@ -1732,6 +1744,15 @@ async fn hardware_task(
                     {
                         o.blank(&mut j.i2c).await;
                     }
+                    // Last, per the order above. Deep sleep is a full reset,
+                    // so the pending log buffer is otherwise simply gone -
+                    // up to five fixes at the 1 Hz rate, and always the five
+                    // at the end of the wake, which is the part a reader
+                    // would use to work out where the board was when it went
+                    // down. The unmount that follows leaves the FAT
+                    // directory entry closed rather than trusting a sleeping
+                    // card to have finished.
+                    sdlog.park(now);
                     standby = true;
                     state::SLEEP_READY.signal(());
                 }
