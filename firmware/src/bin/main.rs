@@ -694,10 +694,7 @@ async fn main(spawner: Spawner) -> ! {
             // `gatt_session`. Re-seeded per window because the settings may
             // have moved while the modem was down.
             let _ = server.gps.settings.set(&server, &current_settings().encode());
-            let _ = server
-                .gps
-                .name
-                .set(&server, &name_value());
+            let _ = server.gps.name.set(&server, &name_value());
 
             let _ = select(
                 async {
