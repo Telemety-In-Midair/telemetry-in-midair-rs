@@ -842,7 +842,16 @@ async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
     if with_timeout(park, state::SLEEP_READY.wait()).await.is_err() {
         // Worth saying: it means the sleep is about to cost more than it
         // should, and it is otherwise undetectable from the far side.
-        println!("sleep: radio did not park in time, sleeping with it awake");
+        //
+        // Named for the whole sequence rather than the radio. The budget is
+        // sized for a transmit in flight, which is the longest thing in it,
+        // but the signal comes at the *end* of a park that also flushes and
+        // unmounts the card and takes the receiver into backup - so a card
+        // that stalled is enough to expire it, and what is left awake then
+        // is whatever the hardware task had not reached. A receiver still
+        // acquiring is the expensive one, at around 10 mA for the whole
+        // interval.
+        println!("sleep: park did not finish in time, sleeping over it");
     }
 
     // Hold what the sleeping board still needs held.

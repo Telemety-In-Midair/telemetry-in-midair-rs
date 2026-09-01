@@ -92,10 +92,28 @@ impl Flash {
     /// cycle, and only the survive-a-flat-battery guarantee is lost.
     pub fn save_settings(&mut self, stored: &Stored) -> bool {
         let rec = stored.encode_record();
-        // `Storage::write` erases and rewrites the whole sector around the
-        // record, so there is no separate erase step to get wrong.
-        self.with_nvs(|region| region.write(0, &rec).is_ok())
-            .unwrap_or(false)
+        self.with_nvs(|region| {
+            // An identical record is not written again.
+            //
+            // `Storage::write` erases and rewrites the whole sector around
+            // the record - which is what makes it safe, since there is no
+            // separate erase step to get wrong, and also what makes it
+            // expensive. Every accepted settings write asks for a save
+            // whether or not the value moved, so an app that pushes what
+            // the board already has spends a sector erase and something
+            // like 40 ms with interrupts disabled on a no-op, inside a BLE
+            // session, where that is a dropped connection event or two.
+            //
+            // The record is deterministic - fixed fields and a crc over
+            // them, no timestamps - so comparing it is exact rather than a
+            // heuristic. A read costs nothing next to an erase.
+            let mut current = [0u8; RECORD_LEN];
+            if region.read(0, &mut current).is_ok() && current == rec {
+                return true;
+            }
+            region.write(0, &rec).is_ok()
+        })
+        .unwrap_or(false)
     }
 
     fn with_nvs<R>(

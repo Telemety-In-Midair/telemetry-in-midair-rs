@@ -48,8 +48,11 @@ static IDLE_TIMEOUT: AtomicU32 = AtomicU32::new(0);
 /// reset, so from the console a board that sleeps and a board that resets in
 /// a loop produce the same boot banner. The counter is what separates them,
 /// and it is the first thing to look at when the question is whether sleep
-/// is working at all. Both are inside the magic-word guard, so a cold boot
-/// reads zero rather than whatever was in that memory.
+/// is working at all.
+///
+/// Zeroed by [`set`] when it stamps the magic word, which is the only thing
+/// that makes them readable: RTC RAM is not zero-initialized, so before
+/// that they hold whatever was in the die.
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static WAKE_COUNT: AtomicU32 = AtomicU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
@@ -75,6 +78,19 @@ pub fn get() -> Stored {
 }
 
 pub fn set(s: Stored) {
+    // The instrumentation words come with the magic word or not at all.
+    //
+    // Persistent RTC RAM is not zero-initialized, and `note_sleep` stamps
+    // the magic word without touching these two - so on the first sleep
+    // after a cold boot the word says "this block is ours" while
+    // `WAKE_COUNT` still holds whatever was in that memory. The wake on the
+    // far side then reports a nonsense count, which is exactly the number
+    // the console tells a reader to trust first: a board that sleeps and a
+    // board that resets in a loop are told apart by it.
+    if MAGIC_WORD.load(Ordering::Relaxed) != MAGIC {
+        WAKE_COUNT.store(0, Ordering::Relaxed);
+        LAST_SLEEP_S.store(0, Ordering::Relaxed);
+    }
     INTERVAL.store(s.sleep_interval_s, Ordering::Relaxed);
     FLAGS.store(s.flags, Ordering::Relaxed);
     ADV_WINDOW.store(s.adv_window_s, Ordering::Relaxed);
