@@ -1073,6 +1073,13 @@ async fn serve<C: Controller>(
         };
 
         let Ok(conn) = conn.with_attribute_server(server) else {
+            // A central connected and the attribute server did not attach -
+            // the link dropped in between, or the stack is out of room. The
+            // window is held open for the same reason a fizzled handshake
+            // holds it: something was connecting, and letting the budget
+            // expire here sends the board dark or asleep on a phone that is
+            // about to try again.
+            window.after_connect_attempt(Instant::now().as_millis());
             continue;
         };
         qprintln!("central connected");
@@ -1165,20 +1172,39 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
                     // apply reaches the SD card and a firmware chunk erases
                     // a flash sector, either of which is long enough that a
                     // central would otherwise see its write time out.
-                    let mut data = [0u8; 200];
+                    //
+                    // Sized from the protocol rather than rounded: the
+                    // longest write it defines is a bulk chunk behind its
+                    // three-byte header. A buffer that merely fits today
+                    // truncates silently the moment `BULK_DATA_MAX` moves,
+                    // and a truncated chunk fails as a CRC error at the end
+                    // of the transfer rather than as a write that was too
+                    // long.
+                    let mut data = [0u8; ble::WRITE_MAX];
                     let mut len = 0usize;
                     let mut wrote = Wrote::Other;
                     if let GattEvent::Write(w) = &event {
                         let d = w.data();
-                        len = d.len().min(data.len());
-                        data[..len].copy_from_slice(&d[..len]);
-                        wrote = if w.handle() == server.gps.config.handle {
-                            Wrote::Config
-                        } else if w.handle() == server.gps.bulk.handle {
-                            Wrote::Bulk
+                        if d.len() > data.len() {
+                            // Refused rather than clipped, and left as
+                            // `Wrote::Other` so no handler sees half a
+                            // frame. The central still gets its write
+                            // acknowledged below - the transaction belongs
+                            // to the attribute server - and then hears
+                            // nothing back, which is what a clipped chunk
+                            // did too, only silently.
+                            qprintln!("ble write too long ({} B), ignored", d.len());
                         } else {
-                            Wrote::Other
-                        };
+                            len = d.len();
+                            data[..len].copy_from_slice(&d[..len]);
+                            wrote = if w.handle() == server.gps.config.handle {
+                                Wrote::Config
+                            } else if w.handle() == server.gps.bulk.handle {
+                                Wrote::Bulk
+                            } else {
+                                Wrote::Other
+                            };
+                        }
                     }
                     if let Ok(reply) = event.accept() {
                         reply.send().await;

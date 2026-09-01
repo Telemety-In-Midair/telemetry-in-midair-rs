@@ -536,6 +536,18 @@ pub const ACK_BAD_STATE: u8 = 0x12;
 /// 3-byte op header while staying under the UART link chunk size.
 pub const BULK_DATA_MAX: usize = crate::link::DATA_CHUNK;
 
+/// Longest write any characteristic in this protocol takes: an `OP_DATA`
+/// frame, which is [`BULK_DATA_MAX`] behind a three-byte
+/// `[op, seq u16le]` header. Every other write - a config item, a bulk
+/// begin or end - is shorter.
+///
+/// It exists so that a device can size the buffer it copies a write into
+/// from the protocol rather than from a round number. A buffer that is
+/// merely close enough truncates the tail of a full-length chunk silently,
+/// and what the sender sees for that is a CRC failure at the end of a
+/// transfer that looked fine.
+pub const WRITE_MAX: usize = 3 + BULK_DATA_MAX;
+
 #[cfg(test)]
 mod tests {
     use gps_proto::str_eq;
