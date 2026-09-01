@@ -1268,15 +1268,30 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
                 continue;
             }
 
+            // `set` before each notify, so both of these answer a plain read
+            // as well. They are declared `read`, and a central that never
+            // subscribed would otherwise get the table's initial zeros - which
+            // decode as a report rather than as nothing, since a telemetry
+            // `secs_since_rx` of 0 reads as "just heard from" and not as
+            // "never". The attribute table outlives the connection, so what is
+            // written here is also what the next window opens holding.
+            //
+            // A failed `set` is not a failed link, so unlike a failed position
+            // notify it does not end the notifier.
             let (position, dirty) = state::take_position();
             if let Some(p) = position
                 && dirty
-                && server.gps.position.notify(conn, &p.encode()).await.is_err()
             {
-                break;
+                let v = p.encode();
+                let _ = server.gps.position.set(server, &v);
+                if server.gps.position.notify(conn, &v).await.is_err() {
+                    break;
+                }
             }
             if let Some(t) = state::telemetry() {
-                let _ = server.gps.telemetry.notify(conn, &t.encode()).await;
+                let v = t.encode();
+                let _ = server.gps.telemetry.set(server, &v);
+                let _ = server.gps.telemetry.notify(conn, &v).await;
             }
         }
     };
