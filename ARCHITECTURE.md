@@ -265,6 +265,7 @@ sequenceDiagram
             Gatt-->>Gatt: skip this tick
         else
             Gatt->>St: take_position(), telemetry()
+            Gatt-->>Gatt: set both attributes, so a read answers too
             Gatt->>App: notify position, telemetry
         end
     end
