@@ -5,6 +5,8 @@
 //!
 //! - [`bulk`]: the transfer a radio config or a firmware image arrives in,
 //!   over either BLE or the USB console.
+//! - [`cfgstore`]: the radio config's copy in the board's own flash, which
+//!   is what a board with no card comes back on.
 //! - [`link`]: the frame format. It was the UART protocol between the
 //!   ESP32-C6 and the WIO-E5 on the two-MCU board; one module has nothing
 //!   to link to, so what survives is the framing the host tools speak over
@@ -27,6 +29,7 @@ pub use gps_proto;
 
 pub mod ble;
 pub mod bulk;
+pub mod cfgstore;
 pub mod geo;
 pub mod link;
 pub mod lora;

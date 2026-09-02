@@ -214,7 +214,9 @@ def main() -> int:
     # The board logs "config applied, node N, <where it was saved>" once it has
     # parsed and adopted the file, which is the only read-back there is: an
     # ack proves the bytes arrived, this proves which address is now live and
-    # whether it will still be there after a power cycle.
+    # whether it will still be there after a power cycle. There are two
+    # stores - the card and a backup in the board's own flash - and only a
+    # push that reached neither is lost on the next reboot.
     applied = link.read_console(ser, "config applied", timeout=3.0)
     if not applied:
         print("config accepted (no 'config applied' line seen; it may have "
@@ -223,11 +225,18 @@ def main() -> int:
 
     print(applied)
     if "NOT SAVED" in applied:
-        print("\nWARNING: the config is live but did not reach the SD card.\n"
+        print("\nWARNING: the config is live but reached neither store.\n"
               "It will be lost on the next power cycle, reverting to firmware "
               "defaults.\nCheck that a card is seated, readable, and FAT "
               "formatted.")
         return 2
+    if "NOT to" in applied:
+        # One store took it, so the config survives a reboot - but the two
+        # now disagree, and at the next boot the card is the one that wins.
+        print("\nNote: only one of the two stores took the config. It will "
+              "survive a reboot,\nbut check the line above: a card that "
+              "refused the write is a card problem,\nand a board running "
+              "without one is expected to say so.")
     return 0
 
 

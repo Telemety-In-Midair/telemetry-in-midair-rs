@@ -84,3 +84,15 @@ advertises before anything has mounted one. It comes back on the name
 characteristic (`c3a1000c-...`) and in the USB `INFO` reply, and the prefix
 is a firmware constant so a board can never be named something a scanner
 cannot find.
+
+## Config backup in flash
+
+A pushed config now goes into a record in the `nvs` partition as well as onto
+the card, and the boot path reads it when the card has nothing to say - so a
+board with no card, or with a card that has failed, comes back on the config
+it was given rather than on firmware defaults with the node address reset to
+1. The card still wins at boot, and a boot that reads one refreshes the
+backup from it. The record is `midair_proto::cfgstore`, host-tested: a length
+and a crc in front of the config text, so an interrupted write reads as
+nothing stored rather than as a config half of which is the previous one. This restores what the two-MCU board kept in
+the WIO-E5's flash page 122 and the S3 port had dropped.

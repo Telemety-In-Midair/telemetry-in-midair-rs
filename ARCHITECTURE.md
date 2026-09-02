@@ -90,8 +90,9 @@ classDiagram
         handle(owner, op)
     }
     class FlashStore {
-        <<one peripheral, two users>>
+        <<one peripheral, three users>>
         nvs settings record
+        nvs config backup
         OtaSink into the idle slot
     }
     class Settings {
@@ -170,6 +171,7 @@ classDiagram
     Xfer --> FlashStore : OtaSink
     Xfer ..> State : request(ApplyConfig)
     Settings --> FlashStore : nvs mirror
+    HardwareTask --> FlashStore : config backup
     GattSession --> Settings
 
     MidairProto *-- SessionPolicy
@@ -287,7 +289,7 @@ sequenceDiagram
     Gatt->>Gatt: reassemble, check the crc, parse
     Gatt->>App: ack per op
     Gatt->>St: request(ApplyConfig)
-    St->>Hw: re-init the radio, rewrite RADIO.CFG
+    St->>Hw: re-init the radio, rewrite RADIO.CFG and the nvs backup
     Hw->>App: status line, then the new radio config
 
     App->>Serve: disconnect
@@ -364,7 +366,8 @@ flowchart TB
     Parse -->|Ok| Pending["pending config"]
     Pending --> Hw["HardwareTask"]
     Hw --> Radio["re-init the radio<br/>reconfigure the node<br/>re-push GPS settings"]
-    Hw --> Card["write RADIO.CFG<br/>(the only copy that survives a reboot)"]
+    Hw --> Card["write RADIO.CFG"]
+    Hw --> Nvs["write the nvs backup<br/>(what a board with no card comes back on)"]
 
     Xfer -->|KIND_OTA| Sink["OtaSink<br/>stage a sector, write it"]
     Sink --> Slot["the app slot that is NOT running"]
@@ -479,6 +482,15 @@ with its GPS running is the safer failure" - true for a tracker, and it
 drains the cell of a device in a bag. The mode answers both: a cold boot
 lands in Idle, which is reachable *and* has the GPS down, and only an
 explicit stored `tracking` raises everything.
+
+The radio config is the partition's other tenant, one sector along, and it
+is stored for the opposite reason: not because it is needed before the card
+is mounted, but because there may be no card to mount. The card still wins
+at boot - editing `RADIO.CFG` on a computer has to do what it looks like -
+and a boot that reads one refreshes the backup from it, so the copy a
+card-less board falls back to is the last one anybody wrote. Without it a
+board that lost or never had a card came back on firmware defaults, and the
+node address is the one setting nothing can guess back.
 
 ## The states over time
 
@@ -698,7 +710,7 @@ gantt
 
     section Bulk transfer
     config push - console quiet beacon held :crit, w1, 20, 15s
-    ApplyConfig - radio re-init GPS re-pushed RADIO.CFG rewritten :active, w2, 35, 2s
+    ApplyConfig - radio re-init GPS re-pushed both config stores rewritten :active, w2, 35, 2s
 
     section Commanded sleep
     CFG_SLEEP_NOW written    :milestone, k1, 50, 0s

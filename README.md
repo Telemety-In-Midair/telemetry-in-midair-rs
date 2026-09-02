@@ -80,10 +80,12 @@ that fills the editor from the board itself.
 
 A pushed config is written back to the card as `RADIO.CFG`, which is where
 it survives a power cycle - so editing that file on a computer and pushing
-over USB are the same thing arriving two ways. The two-MCU board also kept a
-backup in the WIO-E5's own flash; this one does not, so a board running
-without a card keeps a pushed config only until it reboots. It says so on
-the status line, and `wio-config` exits non-zero when that happens.
+over USB are the same thing arriving two ways. It also goes into a backup
+record in the board's own flash, so a board with no card (or a failed one)
+keeps what it was told. The card wins at boot, and a boot that reads one
+refreshes the backup, so the two cannot drift apart while a card is in the
+slot. A push that reached neither store says so on the status line, and
+`wio-config` exits non-zero when that happens.
 
 The GPS and SD sit directly on +3V3 on this board, so there is no rail to
 raise before they answer.
@@ -91,8 +93,10 @@ raise before they answer.
 ## Radio configuration
 
 The firmware loads `RADIO.CFG` from the SD card at boot; the same file can be
-pushed over BLE (bulk characteristic) at runtime, which also rewrites the
-SD copy. All keys are optional; defaults in parentheses:
+pushed over BLE (bulk characteristic) at runtime, which also rewrites the SD
+copy and the flash backup (see [Where a config
+lives](#where-a-config-lives)). All keys are optional; defaults in
+parentheses:
 
 ```toml
 [radio]
@@ -137,6 +141,33 @@ meas_rate_ms = 1000        # measurement/nav period, 25-10000 (1000)
 dynamic_model = "portable" # portable|stationary|pedestrian|automotive|
                            #   sea|airborne1g|airborne2g|airborne4g (portable)
 ```
+
+### Where a config lives
+
+Two stores hold the same text, and the card is the one people edit:
+
+| Store | What it is | Written when |
+|-|-|-|
+| `RADIO.CFG` on the card | the file, in the card root, 8.3 name, at most 1024 bytes | a config is pushed |
+| a record in the `nvs` partition | the same text behind a length and a crc, one sector past the settings record | a config is pushed, and at every boot that reads the card |
+
+At boot the card wins - pulling it to edit `RADIO.CFG` on a computer has to
+do what it looks like - and a boot that reads one refreshes the backup, so a
+card edited offline is what both stores hold from then on. A board with no
+card, or with a card that has failed or gone unreadable, comes up on the
+backup instead of on firmware defaults. That is what the backup is for: the
+node address is the one setting nothing can guess back, since two senders
+sharing an address are mutually deaf.
+
+An invalid `RADIO.CFG` falls through to the backup rather than to defaults,
+and says so on the console. A record that fails its crc reads as nothing
+stored, which is also what an interrupted write leaves behind - the length
+and the crc sit in front of the text precisely so that a half-written record
+cannot be read as a whole one.
+
+The backup is not erased by `cargo run` - only `otadata` is - so a reflash
+keeps a board's address. Erasing the whole chip does take it, along with the
+duty cycle and the board's name, since both records live in `nvs`.
 
 ### Modulation
 

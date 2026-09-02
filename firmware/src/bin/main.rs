@@ -1504,7 +1504,7 @@ async fn hardware_task(
     let mut cfg = RadioConfig::default();
     let mut cfg_loaded = false;
     if card_up {
-        cfg_loaded = adopt_card_config(&mut sdlog, &mut cfg, 0, cold).await;
+        cfg_loaded = adopt_stored_config(&mut sdlog, &mut cfg, 0, cold).await;
     }
 
     let mut node = Node::new(lora, &cfg);
@@ -1688,7 +1688,7 @@ async fn hardware_task(
                     // is the one the radio is about to be initialized from.
                     if !card_up {
                         card_up = true;
-                        cfg_loaded = adopt_card_config(&mut sdlog, &mut cfg, now, false).await;
+                        cfg_loaded = adopt_stored_config(&mut sdlog, &mut cfg, now, false).await;
                         node.reconfigure(&cfg);
                     }
                     match m {
@@ -2201,18 +2201,17 @@ fn draw_screen(
     oled::render_compass(oled, &target, heading, fix, sats);
 }
 
-/// Read the card and adopt what is on it.
+/// Read the stored config and adopt it.
 ///
 /// A function rather than a stretch of `hardware_task` because a wake check
 /// defers all of it: the card stays off the bus until the board knows it is
 /// more than a check, and a promotion runs this then. Everything here is
 /// about the *stored* config - the radio settings, the console verbosity,
-/// the `[power]` section - so it costs nothing on a board with no card and
-/// nothing on a wake nobody answers.
+/// the `[power]` section - so it costs nothing on a wake nobody answers.
 ///
-/// Returns whether a config actually came off the card, which is what the
+/// Returns whether a config was adopted at all, which is what the
 /// `CFG_LOADED` telemetry flag reports.
-async fn adopt_card_config(
+async fn adopt_stored_config(
     sdlog: &mut SdLog<'static>,
     cfg: &mut RadioConfig,
     now: u32,
@@ -2222,34 +2221,62 @@ async fn adopt_card_config(
     // Give the card a chance to mount before its config is asked for.
     sdlog.poll(now);
 
-    // Unlike the two-MCU board there is no second copy in the MCU's own
-    // flash - the card is the store, and a config pushed over BLE or USB is
-    // written back to it.
+    // Two stores, and the card wins. Editing `RADIO.CFG` on a computer has
+    // to do what it looks like, so a card that says anything outranks the
+    // backup - which exists for the board the card cannot answer for: one
+    // that never had a card, or whose card has failed. Without it such a
+    // board came back on firmware defaults and lost its address, the one
+    // setting nothing can guess back.
     //
-    // Scoped so the kilobyte of buffer is not still alive at the await
-    // below, which would put it in this future rather than on the stack.
-    let from_sd = {
-        let mut cfg_buf = [0u8; CONFIG_MAX];
-        sdlog
-            .read_config(&mut cfg_buf)
-            .and_then(|n| match radiocfg::parse_bytes(&cfg_buf[..n]) {
-                Ok(c) => Some(c),
-                Err(e) => {
-                    println!("config: RADIO.CFG invalid ({:?}), using defaults", e);
-                    None
-                }
-            })
-    };
-    let loaded = match from_sd {
-        Some(c) => {
+    // The buffer spans the awaits below rather than being scoped around the
+    // card read, because both stores are read and written through it. It
+    // costs a kilobyte of this task's future.
+    let mut text = [0u8; CONFIG_MAX];
+    let from_card = sdlog
+        .read_config(&mut text)
+        .and_then(|n| match radiocfg::parse_bytes(&text[..n]) {
+            Ok(c) => Some((c, n)),
+            Err(e) => {
+                println!("config: RADIO.CFG invalid ({:?}), trying the backup", e);
+                None
+            }
+        });
+    let loaded = match from_card {
+        Some((c, n)) => {
             println!("config: RADIO.CFG loaded (address {})", c.address);
             *cfg = c;
+            // Keep the backup level with the card, so a card pulled or lost
+            // later does not take the config with it. An unchanged card
+            // costs a comparison rather than the two erases of a write,
+            // which is the common case for every boot after the first.
+            if !flash::with_flash(|f| f.save_config(&text[..n]))
+                .await
+                .unwrap_or(false)
+            {
+                println!("config: RADIO.CFG could not be backed up to flash");
+            }
             true
         }
-        None => {
-            println!("config: none stored, using defaults");
-            false
-        }
+        None => match flash::with_flash(|f| f.load_config(&mut text)).await.flatten() {
+            Some(n) => match radiocfg::parse_bytes(&text[..n]) {
+                Ok(c) => {
+                    println!("config: flash backup loaded (address {})", c.address);
+                    *cfg = c;
+                    true
+                }
+                // Only a config that parsed is ever written, so this is the
+                // record disagreeing with a firmware that has since changed
+                // what it accepts - not a bad push. Defaults, and say so.
+                Err(e) => {
+                    println!("config: flash backup invalid ({:?}), using defaults", e);
+                    false
+                }
+            },
+            None => {
+                println!("config: none stored, using defaults");
+                false
+            }
+        },
     };
     // Honor sd_enabled only now: the setting itself lives on the card, so
     // the card has to be read before it can say to stop using it.
@@ -2333,15 +2360,21 @@ async fn apply_radio_config(
     state::set_verbose(cfg.verbose);
     state::set_radio_config(cfg.encode());
     state::set_tx_worst_case_ms(cfg.tx_poll_timeout_ms());
-    // The card is the only place this survives a reboot, so a write that
-    // did not land has to reach the operator rather than sit in a console
-    // nobody is reading - it is the difference between a config that is
-    // applied and one that is applied until the next power cycle.
+    // Both stores, because either one alone leaves a board that loses this
+    // config at the next power cycle: a card can be absent or failed, and
+    // the backup is behind whatever a computer last wrote to the card. A
+    // write that reached neither has to be reported to the operator rather
+    // than left in a console nobody is reading - it is the difference
+    // between a config that is applied and one that is applied until the
+    // next reboot.
     //
     // Written before `sd_enabled` is honored, and deliberately: a config
     // that turns the card off still has to be *on* the card, or the next
-    // boot reads nothing and comes up with the card enabled again.
-    let stored = sdlog.write_config(now, &raw[..len]);
+    // boot reads nothing there and comes up with the card enabled again.
+    let on_card = sdlog.write_config(now, &raw[..len]);
+    let in_flash = flash::with_flash(|f| f.save_config(&raw[..len]))
+        .await
+        .unwrap_or(false);
     if !cfg.sd_enabled {
         status_println!("SD: disabled by config");
         sdlog.disable(now);
@@ -2350,10 +2383,11 @@ async fn apply_radio_config(
         "config applied, node {} ({}), {}",
         cfg.address,
         cfg.role.as_str(),
-        if stored {
-            "saved to SD"
-        } else {
-            "NOT SAVED - lost on reboot"
+        match (on_card, in_flash) {
+            (true, true) => "saved to SD and flash",
+            (true, false) => "saved to SD, NOT to flash",
+            (false, true) => "saved to flash, NOT to SD",
+            (false, false) => "NOT SAVED - lost on reboot",
         }
     );
     if regps && !gps.sleeping {

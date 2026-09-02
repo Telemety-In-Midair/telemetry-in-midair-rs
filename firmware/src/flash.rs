@@ -1,9 +1,10 @@
-//! The internal flash, and the two things that share it.
+//! The internal flash, and the three things that share it.
 //!
-//! One peripheral, two unrelated users - the settings mirror and the OTA
-//! writer - so they live in one object rather than two that would each need
-//! their own claim on it. Nothing here is on a hot path: the settings are
-//! written when an app changes one, and an image only during an update.
+//! One peripheral, three unrelated users - the settings mirror, the radio
+//! config's backup copy and the OTA writer - so they live in one object
+//! rather than three that would each need their own claim on it. Nothing
+//! here is on a hot path: the settings are written when an app changes one,
+//! a config when somebody pushes one, and an image only during an update.
 //!
 //! **Settings.** RTC RAM is lost when the cell goes flat, so a sleeping
 //! board would come back with nothing configured and advertise at full
@@ -11,8 +12,16 @@
 //! the `nvs` partition, which RTC RAM then caches (see [`crate::settings`]);
 //! only a cold boot reads flash, so the wake-check path stays free of it.
 //! This claims the partition but does *not* use the ESP-IDF NVS key/value
-//! format - it is one fixed record at the partition start, and nothing else
-//! on this board reads the region.
+//! format - it is two fixed records at fixed offsets, and nothing else on
+//! this board reads the region.
+//!
+//! **Radio config.** The card is the store, and a board with no card had
+//! nowhere to keep a pushed config: it ran until the next power cycle and
+//! then came back on firmware defaults, losing the node address, which is
+//! the one setting nothing can guess back. A copy of the config text
+//! therefore goes into the sector after the settings record, and the boot
+//! path reads it when the card has nothing to say (see
+//! [`midair_proto::cfgstore`] for the record and why it is framed that way).
 //!
 //! **OTA.** [`OtaSink`] writes an application image into whichever slot is
 //! not running and hands it to the bootloader, replacing the WIO-E5's
@@ -32,13 +41,29 @@ use esp_bootloader_esp_idf::partitions::{
     self, AppPartitionSubType, DataPartitionSubType, PartitionType,
 };
 use embedded_storage::{ReadStorage, Storage};
+use esp_println::println;
 use esp_storage::FlashStorage;
 use midair_proto::bulk::Sink;
+use midair_proto::cfgstore;
 use midair_proto::session::{Stored, RECORD_LEN};
 
 /// Flash sector size: the unit an erase works in, and so the unit an image
 /// is staged in.
 const SECTOR: usize = FlashStorage::SECTOR_SIZE as usize;
+
+/// Where the config backup starts inside `nvs`: the sector after the one the
+/// settings record sits in.
+///
+/// A sector of its own rather than a neighboring offset, because a write is
+/// a read-modify-erase-write of the whole sector around it - so sharing one
+/// would put every config push through an erase of the settings, and a power
+/// loss during a config write would take the duty cycle with it.
+const CONFIG_AT: u32 = SECTOR as u32;
+
+/// Bytes compared at a time when checking whether a write would change
+/// anything. Small enough to be a stack buffer on the boot path, which is
+/// the only reason the comparison is chunked at all.
+const COMPARE_CHUNK: usize = 64;
 
 pub struct Flash {
     storage: FlashStorage<'static>,
@@ -112,6 +137,84 @@ impl Flash {
                 return true;
             }
             region.write(0, &rec).is_ok()
+        })
+        .unwrap_or(false)
+    }
+
+    /// Read the backed-up config text into `buf`, returning its length.
+    ///
+    /// `None` when there is nothing to read, which is every reason a record
+    /// can fail to be one: no partition table, no `nvs` partition, erased
+    /// flash, another program's bytes, a header this build does not
+    /// understand, or a text the crc rejects. The caller then falls back to
+    /// the card or to defaults rather than acting on garbage.
+    ///
+    /// A text longer than `buf` is refused rather than truncated, for the
+    /// reason [`crate::sdlog::SdLog::read_config`] refuses one: the parser
+    /// accepts any prefix that ends on a line boundary, so a truncated read
+    /// would be adopted as whatever fitted and reported as loaded.
+    pub fn load_config(&mut self, buf: &mut [u8]) -> Option<usize> {
+        self.with_nvs(|region| {
+            if !config_fits(region) {
+                return None;
+            }
+            let mut hdr = [0u8; cfgstore::HEADER_LEN];
+            region.read(CONFIG_AT, &mut hdr).ok()?;
+            let header = cfgstore::Header::decode(&hdr)?;
+            if header.len > buf.len() {
+                println!("nvs: stored config is {} bytes, too big to read", header.len);
+                return None;
+            }
+            let text = &mut buf[..header.len];
+            region
+                .read(CONFIG_AT + cfgstore::HEADER_LEN as u32, text)
+                .ok()?;
+            // Said out loud rather than folded into "none stored", because
+            // the two have different causes: a header that decoded and a
+            // text that does not match it is an interrupted write or a
+            // failing part, not a board that has never been configured.
+            if !header.matches(text) {
+                println!("nvs: stored config failed its crc, ignoring it");
+                return None;
+            }
+            Some(header.len)
+        })
+        .flatten()
+    }
+
+    /// Back up the config text. Returns whether it landed.
+    ///
+    /// The header and the text go down in one write, and the record is
+    /// assembled here rather than written in two halves: `Storage::write`
+    /// erases the whole sector around whatever it is handed, so two writes
+    /// would be two erases - and the first of them would already have taken
+    /// the record being replaced. Which makes the crc, not the order the
+    /// halves are programmed in, the thing that makes an interrupted write
+    /// safe: a half-programmed sector fails it and reads as nothing stored.
+    ///
+    /// An identical record is not written again. Every cold boot with a card
+    /// asks for this save so the backup keeps up with a card edited on a
+    /// computer, and a card that has not changed is the common case - where
+    /// a comparison is a handful of reads and a write is a sector erase,
+    /// tens of milliseconds of it with interrupts off, in the middle of
+    /// whatever the BLE side is doing.
+    pub fn save_config(&mut self, text: &[u8]) -> bool {
+        let Some(header) = cfgstore::Header::for_text(text) else {
+            return false;
+        };
+        let mut buf = [0u8; cfgstore::RECORD_MAX];
+        let len = cfgstore::HEADER_LEN + text.len();
+        buf[..cfgstore::HEADER_LEN].copy_from_slice(&header.encode());
+        buf[cfgstore::HEADER_LEN..len].copy_from_slice(text);
+        let rec = &buf[..len];
+        self.with_nvs(|region| {
+            if !config_fits(region) {
+                return false;
+            }
+            if region_holds(region, CONFIG_AT, rec) {
+                return true;
+            }
+            region.write(CONFIG_AT, rec).is_ok()
         })
         .unwrap_or(false)
     }
@@ -307,6 +410,40 @@ impl Flash {
         }
         ok
     }
+}
+
+/// The `nvs` partition as the two config-backup helpers see it.
+type NvsRegion<'a> = partitions::FlashRegion<'a, FlashStorage<'static>>;
+
+/// Whether the partition has room for a full-length config behind the
+/// settings record.
+///
+/// The table this firmware flashes gives `nvs` 16 KiB, which is four times
+/// what the two records need. A board carrying a smaller one keeps its
+/// settings and simply has no backup, rather than writing a record that
+/// runs off the end of the partition into whatever follows it.
+fn config_fits(region: &mut NvsRegion<'_>) -> bool {
+    region.capacity() >= CONFIG_AT as usize + cfgstore::RECORD_MAX
+}
+
+/// Whether the region already holds `bytes` at `at`.
+///
+/// The whole record is compared, byte for byte and in chunks so it costs a
+/// small stack buffer rather than a second copy of the config. Comparing
+/// only the header would be cheaper and wrong: an interrupted write leaves
+/// one that still describes the record it was replacing, and re-pushing that
+/// config is exactly when a header-only check would report a save over a
+/// record that does not load.
+fn region_holds(region: &mut NvsRegion<'_>, at: u32, bytes: &[u8]) -> bool {
+    let mut chunk = [0u8; COMPARE_CHUNK];
+    for (i, want) in bytes.chunks(COMPARE_CHUNK).enumerate() {
+        let off = at + (i * COMPARE_CHUNK) as u32;
+        let got = &mut chunk[..want.len()];
+        if region.read(off, got).is_err() || got != want {
+            return false;
+        }
+    }
+    true
 }
 
 /// App slots this build expects, and the count the ota-data arithmetic is

@@ -11,9 +11,10 @@
 #
 # The card file goes in the SD root as RADIO.CFG (uppercase). A config
 # pushed over USB or BLE is applied live and written to both the card and a
-# backup page in the WIO's internal flash, so it survives a power cycle on a
+# backup record in the board's own flash, so it survives a power cycle on a
 # board with no card. At boot the card wins over the backup, so pulling the
-# card to edit RADIO.CFG on a computer does what it looks like it does.
+# card to edit RADIO.CFG on a computer does what it looks like it does - and
+# a boot that reads the card refreshes the backup from it.
 #
 # Every key is optional - an absent key keeps its default, and an empty
 # file is valid. Section headers are cosmetic: keys are unique across
@@ -109,7 +110,7 @@ fields_description = "Which GPS fields each broadcast carries: lat, lon, altitud
 # -- SD card ------------------------------------------------------------
 [sd]
 sd_enabled = true
-sd_enabled_description = "Use the SD card. false stops position logging and the card's power draw. The config itself still persists: it is backed up to the WIO's internal flash either way."
+sd_enabled_description = "Use the SD card. false stops position logging and the card's power draw. The config itself still persists: it is backed up to the board's internal flash either way."
 
 # -- Debug --------------------------------------------------------------
 [debug]

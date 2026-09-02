@@ -114,7 +114,8 @@ pub const PING_LEN: usize = 1 + 2 + 1 + 2;
 pub const TELEM_FLAG_SD_OK: u8 = 0x01;
 /// Set when the GPS currently has a fix.
 pub const TELEM_FLAG_GPS_FIX: u8 = 0x02;
-/// Set when the radio config was loaded from SD or BLE (not defaults).
+/// Set when a stored radio config was adopted - off the card, out of the
+/// flash backup, or pushed - rather than firmware defaults.
 pub const TELEM_FLAG_CFG_LOADED: u8 = 0x04;
 /// Set when the config asks for verbose console logging.
 ///
