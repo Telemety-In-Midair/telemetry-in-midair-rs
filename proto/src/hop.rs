@@ -367,6 +367,28 @@ impl Clock {
         self.origin_slot = slot & SLOT_MASK;
     }
 
+    /// Slots an interval of `interval_ms` spans, at least one. A beacon
+    /// interval on a hopping network is a count of slots, so "every
+    /// second" at the default dwell means every slot rather than every
+    /// slot and a bit, which would skip one every few.
+    pub fn slots_for(&self, interval_ms: u32) -> u32 {
+        interval_ms.div_ceil(self.dwell_ms).max(1)
+    }
+
+    /// Whether `now_ms` is in, or past, the slot `interval_ms` after the
+    /// one `last_ms` fell in. Slot numbers wrap, so "past" is the nearer
+    /// half of the ring.
+    pub fn interval_elapsed(&self, last_ms: u64, interval_ms: u32, now_ms: u64) -> bool {
+        let due = self.slot(last_ms).wrapping_add(self.slots_for(interval_ms)) & SLOT_MASK;
+        let ahead = self.slot(now_ms).wrapping_sub(due) & SLOT_MASK;
+        ahead < (1 << (SLOT_BITS - 1))
+    }
+
+    /// Local time the slot after the one `now_ms` is in begins.
+    pub fn next_slot_start_ms(&self, now_ms: u64) -> u64 {
+        now_ms + u64::from(self.dwell_ms - self.phase_ms(now_ms))
+    }
+
     /// The sync word for a transmission starting at local time
     /// `tx_start_ms`, with the stratum as of the same instant.
     pub fn word_at(&self, tx_start_ms: u64) -> SyncWord {
@@ -639,6 +661,30 @@ mod tests {
         assert_eq!(c.wait_for_window_ms(&p, 10_020, 289), 80);
         // Too late for the frame to end in this slot: wait for the next.
         assert_eq!(c.wait_for_window_ms(&p, 10_700, 289), 400);
+    }
+
+    /// An interval is a count of slots: one second at the default dwell is
+    /// every slot, five seconds every fifth, and the interval is up at the
+    /// slot boundary rather than a phase later.
+    #[test]
+    fn intervals_are_counted_in_slots() {
+        let mut c = Clock::new(1000, 0, 1);
+        c.discipline_gps(0, 0);
+        assert_eq!(c.slots_for(1000), 1);
+        assert_eq!(c.slots_for(1001), 2);
+        assert_eq!(c.slots_for(5000), 5);
+        assert_eq!(c.slots_for(0), 1);
+        // Last transmission 300 ms into slot 10.
+        let last = 10_300;
+        assert!(!c.interval_elapsed(last, 1000, 10_900));
+        assert!(c.interval_elapsed(last, 1000, 11_000));
+        assert!(c.interval_elapsed(last, 1000, 11_050));
+        assert!(!c.interval_elapsed(last, 5000, 14_999));
+        assert!(c.interval_elapsed(last, 5000, 15_000));
+        // Long past is still elapsed, not wrapped around to "not yet".
+        assert!(c.interval_elapsed(last, 1000, 400_000));
+        assert_eq!(c.next_slot_start_ms(10_300), 11_000);
+        assert_eq!(c.next_slot_start_ms(11_000), 12_000);
     }
 
     /// The channel a slot maps to is the same on every node that agrees

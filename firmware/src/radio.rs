@@ -108,6 +108,10 @@ pub struct Sx1262Driver<'d> {
     /// Local time the last packet finished arriving, which with its length
     /// gives the instant it began - what a hop clock is measured against.
     last_rx_done_ms: u64,
+    /// Local `(start, end)` of the last transmission, whatever it carried.
+    /// The start places it in a hop slot, which no second transmission may
+    /// share; the end is what a single-channel interval is measured from.
+    last_tx: Option<(u64, u64)>,
     rx_active: bool,
     /// Whether the receiver is used at all. False on a transmit-only node,
     /// which idles in standby instead of continuous RX - that idle current
@@ -136,6 +140,7 @@ impl<'d> Sx1262Driver<'d> {
             max_frame_ms: 0,
             rx_busy_since: None,
             last_rx_done_ms: 0,
+            last_tx: None,
             rx_active: false,
             listen: true,
             last_snr_cb: 0,
@@ -441,15 +446,50 @@ impl<'d> Sx1262Driver<'d> {
     /// after `now_ms`: a random point in the current or next hop slot's
     /// window, or `now_ms` itself on a single channel.
     ///
+    /// One transmission per slot, whatever it carries: a beacon and a
+    /// repeat in the same slot would be two visits' worth of air on one
+    /// channel, which is the thing the band's hopping rule caps. A slot
+    /// that already had one plans for the next.
+    ///
     /// Planning the instant here and having the caller come back for it
     /// keeps the wait out of [`send`](Self::send), where it would hold the
     /// whole hardware loop - and so the receiver - for up to a slot.
     pub fn tx_window_start(&mut self, now_ms: u64, frame_len: usize) -> u64 {
         let airtime_ms = self.cfg.time_on_air_us(frame_len).div_ceil(1000);
         match &mut self.hop {
-            Some(h) => h.clock.tx_start(&h.plan, now_ms, airtime_ms),
+            Some(h) => {
+                let from = match self.last_tx {
+                    Some((start, _)) if h.clock.slot(start) == h.clock.slot(now_ms) => {
+                        h.clock.next_slot_start_ms(now_ms)
+                    }
+                    _ => now_ms,
+                };
+                h.clock.tx_start(&h.plan, from, airtime_ms)
+            }
             None => now_ms,
         }
+    }
+
+    /// Whether a beacon interval of `interval_ms` has run out since the
+    /// transmission `last`, a `(start, end)` pair from
+    /// [`last_tx_span`](Self::last_tx_span). Hopping, the interval is a
+    /// count of slots from the one the last transmission started in, so
+    /// "every second" is every slot; on a single channel it is time from
+    /// the end of the last transmission, so a slow frame does not eat its
+    /// own interval. No last transmission means one is due.
+    pub fn beacon_due(&self, last: Option<(u64, u64)>, interval_ms: u32, now_ms: u64) -> bool {
+        let Some((start, end)) = last else {
+            return true;
+        };
+        match &self.hop {
+            Some(h) => h.clock.interval_elapsed(start, interval_ms, now_ms),
+            None => now_ms >= end + u64::from(interval_ms),
+        }
+    }
+
+    /// Local `(start, end)` of the last transmission, if any.
+    pub fn last_tx_span(&self) -> Option<(u64, u64)> {
+        self.last_tx
     }
 
     /// Set the hop clock from the board's own GPS: `tod_ms` is the time of
@@ -716,8 +756,9 @@ impl<'d> Sx1262Driver<'d> {
         }
 
         self.radio.set_standby(StandbyClk::Rc);
+        let tx_start_ms = Instant::now().as_millis();
         if let Some(h) = &mut self.hop {
-            let now_ms = Instant::now().as_millis();
+            let now_ms = tx_start_ms;
             let slot = h.clock.slot(now_ms);
             self.radio.set_rf_frequency(h.plan.frequency_for_slot(slot));
             // The receiver comes back up on this channel after TxDone; the
@@ -769,6 +810,8 @@ impl<'d> Sx1262Driver<'d> {
             }
             Timer::after(Duration::from_millis(1)).await;
         };
+
+        self.last_tx = Some((tx_start_ms, Instant::now().as_millis()));
 
         // Re-enter continuous RX immediately: the node is deaf while it
         // transmits, so every millisecond spent out of RX after TxDone is

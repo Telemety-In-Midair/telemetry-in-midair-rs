@@ -24,8 +24,11 @@ listening, nothing transmitting:
 | SD card, mounted idle | 1-10 mA | `sd_enabled` |
 | **Total** | **~126 mA** | |
 
-Plus one 288 ms LoRa transmit per `interval_s` at 127 mA, which averages to
-about 1.3 mA at the 20 s default.
+Plus one 288 ms LoRa transmit per `interval_s` at 127 mA, which averages
+to about 37 mA at the 1 s default - the price of a position every second,
+and the one line in this table the config moves by tens of milliamps. A
+node with no fix pings on `ping_interval_s` instead, 248 ms every 5 s, or
+about 6 mA.
 
 Two things to take from that table. The BLE controller is more than half of
 everything, and the GPS is most of what is left - so those are the two
@@ -138,7 +141,8 @@ of - see "Where a setting lives" below.
 | Key | Range | Default | Effect |
 |-|-|-|-|
 | `role` | `leaf`, `repeater`, `tx_only`, `rx_only` | `leaf` | `tx_only` never enables the receiver: **saves ~6 mA continuously** and the node hears nobody. `repeater` doubles the traffic it forwards. |
-| `interval_s` | 0-3600 | 20 | Beacon period. Each beacon is 288 ms at 127 mA, so this is ~1.3 mA at the default and ~0.4 mA at 60 s. 0 disables the beacon. |
+| `interval_s` | 0-3600 | 1 | Position period with a fix. Each beacon is 288 ms at 127 mA, so this is ~37 mA at the default, ~1.3 mA at 20 s and ~0.4 mA at 60 s. 0 silences the node, pings included. |
+| `ping_interval_s` | 0-3600 | 5 | No-fix ping period. 248 ms at 127 mA, so ~6 mA at the default. 0 sends no pings. |
 | `power_dbm` | -9 to 22 | 22 | Transmit power. Only paid during those 288 ms, so dropping it buys little and costs range. |
 | `rx_boost` | bool | `true` | ~+2 dB of sensitivity for a few mA while listening. Free on a `tx_only` node. |
 | `spreading_factor` | 5-12 | 12 | Lower is shorter on air, so less energy per beacon, at less range. |

@@ -227,8 +227,12 @@ struct GpsService {
     settings: [u8; ble::SETTINGS_LEN],
     /// The current radio configuration, so an app can populate its radio
     /// editor from the board rather than a local file.
+    ///
+    /// A `Vec` rather than an array for the same reason the log line is:
+    /// the blob is past the 32 bytes an array can be `Default` for, which
+    /// the service macro needs, and always sent whole.
     #[characteristic(uuid = ble::RADIO_CONFIG_UUID_U128, read, notify)]
-    radio_config: [u8; radiocfg::RADIO_CONFIG_LEN],
+    radio_config: heapless::Vec<u8, { radiocfg::RADIO_CONFIG_LEN }>,
     /// What this board is called, as it advertises it.
     ///
     /// A connected app should not have to have kept the scan around to know
@@ -1193,9 +1197,11 @@ async fn publish_name<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<
 /// been configured, so the characteristic never carries the all-zero
 /// placeholder as if it were a real config.
 async fn publish_radio_config<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>) {
-    let Some(value) = state::radio_config() else {
+    let Some(blob) = state::radio_config() else {
         return;
     };
+    // Cannot fail: the buffer is exactly the blob's length.
+    let value = heapless::Vec::from_slice(&blob).unwrap_or_default();
     if server.gps.radio_config.set(server, &value).is_err() {
         return;
     }
@@ -1630,9 +1636,10 @@ async fn hardware_task(
     // transmit as one. Folded into eight slots rather than scaled by the
     // address itself, which made node 200 sit silent for three and a half
     // minutes after boot with nothing on the console to explain it.
-    let mut next_beacon = boot
-        .wrapping_add((cfg.address as u32 % 8) * 1_000)
-        .wrapping_add(2_000);
+    let first_beacon_at = Instant::now().as_millis() + (u64::from(cfg.address) % 8) * 1_000 + 2_000;
+    // The last beacon this node sent, as the radio timed it, which is what
+    // the interval is measured from. `None` before the first.
+    let mut last_beacon: Option<(u64, u64)> = None;
     // The instant the owed beacon is planned for, once the interval has
     // run out; `None` while none is.
     let mut beacon_at: Option<u64> = None;
@@ -1928,12 +1935,15 @@ async fn hardware_task(
             // receive-only node never claims the air for a broadcast it was
             // never going to send.
             //
-            // One transmission per interval either way. A fix goes out as a
-            // position; without one the slot carries a ping, so a node
-            // searching for the sky is a node a receiver can hear rather than
-            // one indistinguishable from out of range or dead. A ping is the
+            // A fix goes out as a position on the beacon interval; without
+            // one a ping goes out on the ping interval, so a node searching
+            // for the sky is a node a receiver can hear rather than one
+            // indistinguishable from out of range or dead. Which interval
+            // applies is decided by what the next transmission would carry,
+            // so a fix gained is reported as soon as the beacon interval
+            // allows, not when the slower ping would have. A ping is the
             // smaller of the two on air, so this cannot push a node past the
-            // duty cycle its beacon already fits in.
+            // budget its beacon already fits in.
             // The sleep gate is not politeness: a transmit awaits for the frame's
             // time on air, which at the slowest settings the config accepts is
             // nearly ten seconds, and a sleep that arrives just after one starts
@@ -1951,9 +1961,17 @@ async fn hardware_task(
             // The last gate is a frame arriving: keying up over it would
             // lose both, and the poll below will have delivered it by the
             // next pass. Bounded, since a preamble can be noise.
+            let interval_ms = if cfg.beacon_interval_s == 0 {
+                0
+            } else if gps.has_fix() {
+                u32::from(cfg.beacon_interval_s) * 1_000
+            } else {
+                u32::from(cfg.ping_interval_s) * 1_000
+            };
             let beacon_owed = cfg.role.transmits()
-                && cfg.beacon_interval_s != 0
-                && due(now, next_beacon)
+                && interval_ms != 0
+                && now_ms >= first_beacon_at
+                && node.radio().beacon_due(last_beacon, interval_ms, now_ms)
                 && !state::transfer_active()
                 && !state::sleep_now_pending();
             if beacon_owed && beacon_at.is_none() {
@@ -1963,7 +1981,17 @@ async fn hardware_task(
                     } else {
                         lora::PING_MSG_LEN
                     };
-                beacon_at = Some(node.radio_mut().tx_window_start(now_ms, len));
+                // Single channel: jitter on top of the interval so two nodes
+                // that happened to line up do not stay lined up. Hopping,
+                // the random start inside the slot window is that jitter,
+                // and a delay here would only push a beacon out of its slot.
+                let jitter = if node.radio().hopping() {
+                    0
+                } else {
+                    node.random((interval_ms / 2).min(2_000))
+                };
+                beacon_at =
+                    Some(node.radio_mut().tx_window_start(now_ms + u64::from(jitter), len));
             }
             if beacon_owed
                 && beacon_at.is_some_and(|at| now_ms >= at)
@@ -2009,18 +2037,13 @@ async fn hardware_task(
                     }
                     Err(e) => vprintln!("beacon TX failed: {:?}", e),
                 }
-                // Jitter on top of the interval so two nodes that happened to
-                // line up do not stay lined up.
-                //
-                // Timed from after the transmit, not from the top of this pass:
-                // the send awaited, and at the slowest settings the config
-                // accepts that is nearly ten seconds. Measuring the interval
-                // from a stale `now` would spend most of it inside the
-                // transmission it is supposed to follow.
-                let jitter = node.random(2_000);
-                next_beacon = (Instant::now().as_millis() as u32)
-                    .wrapping_add(cfg.beacon_interval_s as u32 * 1_000)
-                    .wrapping_add(jitter);
+                // As the radio timed it, so the interval runs from the end of
+                // the transmission on a single channel - at the slowest
+                // settings the config accepts a frame is nearly ten seconds -
+                // and from the slot it started in when hopping. Recorded for
+                // a failed transmit too: a radio that will not key up should
+                // be retried on the interval, not on every pass.
+                last_beacon = node.radio().last_tx_span();
             }
 
             // ---- LoRa receive -------------------------------------------------

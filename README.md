@@ -121,8 +121,8 @@ max_hops = 1               # retransmissions allowed, 0-8 (1)
 dedup_ttl_s = 3            # how long a (sender, id) pair is remembered (3)
 
 [beacon]
-interval_s = 20            # broadcast period, 0 = off (20); also paces the
-                           #   no-fix ping
+interval_s = 1             # position period with a fix, 0 = silent (1)
+ping_interval_s = 5        # no-fix ping period, 0 = no pings (5)
 fields = "lat,lon"         # what each broadcast carries (lat,lon); also
                            #   altitude|speed|course|sats|time
 
@@ -237,12 +237,12 @@ slot, so an aged clock is still a usable one.
 
 What all this costs is the join. A node that knows nobody's clock hears the
 network only when its channel happens to coincide, so it waits on average
-`hop_channels x interval_s / nodes transmitting` seconds - 500 s at the old
-20 s interval with two nodes, 50 s at a 1 s interval with one. A node with
-a fix never waits, and a node that has synced once stays synced through
-fix loss, a config push, a standby and a brownout of the radio. The base
-station on a desk is the case to know about: give it a fix, or a short
-interval on the nodes it is waiting for.
+`hop_channels x interval / nodes transmitting` seconds - 50 s with one node
+beaconing every second, 250 s if that node has no fix and is pinging every
+five. A node with a fix never waits, and a node that has synced once stays
+synced through fix loss, a config push, a standby and a brownout of the
+radio. The base station on a desk is the case to know about: give it a
+fix, or a short interval on the nodes it is waiting for.
 
 On the air, a transmission is planned for a random point in the slot's
 window (the slot less a 100 ms guard at each end, less the frame), which
@@ -285,11 +285,14 @@ then knows the node is up, roughly how long it has been searching, and
 whether to look at the sky or at the board - a silent module is usually the
 GPS/LoRa rail being off rather than a receiver that cannot see satellites.
 
-It is the same one transmission per `interval_s`, not an extra one, and a
-ping is smaller than the leanest position (248 ms against 289 ms on air at
-the defaults), so a node that never gets a fix costs the channel less than
-one that does. `interval_s = 0` and `role = "rx_only"` turn it off along
-with the beacon; there is no separate switch.
+It goes out on its own, slower period, `ping_interval_s` - every 5 s
+against the position's every second - since a receiver still searching has
+nothing new to report between pings, and a ping is smaller than the leanest
+position (248 ms against 289 ms on air at the defaults). The moment a fix
+lands, the next transmission is a position on the beacon interval rather
+than a ping waiting out its own. `ping_interval_s = 0` turns the ping off
+by itself; `interval_s = 0` and `role = "rx_only"` silence the node
+altogether, pings included.
 
 A node that hears a ping reports it as a status line (`node 3 ping: rssi
 -97, up 214s, gps ok`) rather than a position, so it reaches the app

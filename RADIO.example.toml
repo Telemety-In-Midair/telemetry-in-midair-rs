@@ -109,12 +109,15 @@ max_hops = 1
 max_hops_description = "Retransmissions allowed for a broadcast this node sends, 0-8. 0 means no repeater forwards it."
 
 dedup_ttl_s = 3
-dedup_ttl_s_description = "How long a broadcast is remembered so a repeat of it is dropped rather than delivered or forwarded again, 1-3600 s. Keep it well under the time the beacon runs through 256 ids (about 85 min at the 20 s default), or a node starts suppressing its own later broadcasts as duplicates."
+dedup_ttl_s_description = "How long a broadcast is remembered so a repeat of it is dropped rather than delivered or forwarded again, 1-3600 s. Keep it well under the time the beacon runs through 256 ids (about four minutes at the 1 s default), or a node starts suppressing its own later broadcasts as duplicates."
 
 # -- Beacon -------------------------------------------------------------
 [beacon]
-interval_s = 20
-interval_s_description = "Broadcast period in seconds, 0-3600. Each slot carries a position, or a small ping when there is no fix, so a node that cannot see the sky is still heard. 0 disables both, as does a role of rx_only. With hopping on, a node transmits at most once per hop slot, so 1 means every slot at the default dwell."
+interval_s = 1
+interval_s_description = "Position broadcast period in seconds while the node has a fix, 0-3600. With hopping on a node transmits at most once per hop slot, so 1 is every slot at the default dwell. 0 silences the node's own transmissions altogether, pings included, as does a role of rx_only."
+
+ping_interval_s = 5
+ping_interval_s_description = "How often a node with no fix says so, 0-3600 s: a small ping goes out in place of the position, so a node that cannot see the sky is still heard. Slower than the beacon by default, since a searching receiver has nothing new to report every second. 0 sends no pings."
 
 fields = "lat,lon"
 fields_description = "Which GPS fields each broadcast carries: lat, lon, altitude, speed, course, sats, time. lat and lon are required. More fields result in more air time."

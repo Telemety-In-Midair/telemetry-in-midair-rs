@@ -29,7 +29,8 @@
 //! max_hops = 1              # retransmissions allowed per broadcast
 //!
 //! [beacon]
-//! interval_s = 10           # position broadcast period
+//! interval_s = 1            # position broadcast period
+//! ping_interval_s = 5       # no-fix ping period
 //! ```
 
 use crate::ble;
@@ -430,14 +431,21 @@ pub struct RadioConfig {
     /// Ids wrap every 256 transmissions, so this has to stay well under the time
     /// that takes at the beacon interval in use, or a node's own sequence
     /// would eventually collide with its remembered history and be suppressed
-    /// as a duplicate. At the 20 s default interval that wrap is ~85 min.
+    /// as a duplicate. At the 1 s default interval that wrap is about four
+    /// minutes; at 20 s it is 85.
     pub dedup_ttl_s: u16,
-    /// Broadcast interval in seconds (0 disables the beacon).
+    /// Position broadcast interval in seconds, while the node has a fix.
     ///
-    /// One transmission per interval, carrying a position while the sender
-    /// has a fix and a [`crate::lora::Ping`] while it does not - so this is
-    /// the period a node is heard on, not the period it has a position on.
+    /// 0 silences the node's own transmissions altogether - positions and
+    /// the no-fix ping both - which is what a card that says 0 has always
+    /// meant.
     pub beacon_interval_s: u16,
+    /// How often a node with no fix says so, in seconds: the period of the
+    /// [`crate::lora::Ping`] that goes out in place of a position. Slower
+    /// than the beacon by default, since a node searching for the sky has
+    /// nothing new to report between pings. 0 sends no pings, and so does
+    /// a `beacon_interval_s` of 0.
+    pub ping_interval_s: u16,
     /// Which [`PositionPacket`](gps_proto::packet::PositionPacket) fields the
     /// beacon puts on the air, as a mask of the `FIELD_*` bits in
     /// [`crate::lora`]. Every extra field is airtime paid on every
@@ -549,11 +557,14 @@ impl Default for RadioConfig {
             // fleet works without reconfiguring the nodes already deployed.
             max_hops: 1,
             dedup_ttl_s: 3,
-            // 20 s. The wideband default carries no dwell or duty-cycle
-            // ceiling, so this is no longer a budget the modulation has to
-            // fit inside - it is a plain trade of battery life and shared air
-            // time against how stale a position is allowed to get.
-            beacon_interval_s: 20,
+            // Every second: every hop slot at the default dwell. Hopping
+            // caps one visit to a channel, not how often a node transmits,
+            // so the interval is a trade of battery life and shared air time
+            // against how stale a position is allowed to get - and a node
+            // being followed in flight wants the freshest one. The ping is
+            // slower: a node with no fix has nothing new to say every second.
+            beacon_interval_s: 1,
+            ping_interval_s: 5,
             // Position only. Everything else a fix produces is written to
             // the SD log, where a byte costs nothing, rather than spent on
             // air time that has to be paid on every single transmission.
@@ -745,14 +756,18 @@ pub const MAX_HOPS_LIMIT: u8 = 8;
 // with no stored file at all.
 
 /// Wire length of the [`RadioConfig`] read-back blob.
-pub const RADIO_CONFIG_LEN: usize = 32;
+pub const RADIO_CONFIG_LEN: usize = 34;
 
 /// Length of the blob before the hop plan was appended. A board on that
 /// firmware sends this much, and its byte 27 - now `hop_channels` - was a
 /// reserved zero, which reads back as hopping off: exactly what that board
-/// does. [`RadioConfig::decode`] accepts either length so a newer app can
-/// still read an older board.
+/// does. [`RadioConfig::decode`] accepts any length from this one up, so a
+/// newer app can still read an older board; the ping interval, appended
+/// after the plan, reads as the beacon interval when absent, which is the
+/// period such a board pings on.
 pub const RADIO_CONFIG_LEN_V1: usize = 28;
+/// Length with the hop plan but before the ping interval.
+const RADIO_CONFIG_LEN_HOP: usize = 32;
 
 /// Layout version in byte 0, so an app meeting a newer firmware can reject
 /// the blob rather than misread it.
@@ -834,6 +849,7 @@ impl RadioConfig {
         b[27] = self.hop_channels;
         b[28..30].copy_from_slice(&self.hop_step_khz.to_le_bytes());
         b[30..32].copy_from_slice(&self.hop_dwell_ms.to_le_bytes());
+        b[32..34].copy_from_slice(&self.ping_interval_s.to_le_bytes());
         b
     }
 
@@ -850,7 +866,8 @@ impl RadioConfig {
         let flags = b[1];
         let g = b[2];
         let u16at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
-        let hopping = b.len() >= RADIO_CONFIG_LEN;
+        let hopping = b.len() >= RADIO_CONFIG_LEN_HOP;
+        let has_ping = b.len() >= RADIO_CONFIG_LEN;
         let defaults = Self::default();
         Some(Self {
             frequency_hz: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
@@ -867,6 +884,7 @@ impl RadioConfig {
             max_hops: b[14],
             dedup_ttl_s: u16at(15),
             beacon_interval_s: u16at(17),
+            ping_interval_s: if has_ping { u16at(32) } else { u16at(17) },
             beacon_fields: b[19],
             sd_enabled: flags & RCFG_SD_ENABLED != 0,
             verbose: flags & RCFG_VERBOSE != 0,
@@ -1049,6 +1067,13 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                     return Err(ConfigError::OutOfRange(lineno));
                 }
                 cfg.beacon_interval_s = v as u16;
+            }
+            "ping_interval_s" => {
+                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
+                if v > 3600 {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+                cfg.ping_interval_s = v as u16;
             }
             "fields" | "beacon_fields" => {
                 cfg.beacon_fields = parse_fields(value).ok_or(ConfigError::BadValue(lineno))?;
@@ -1465,6 +1490,24 @@ mod tests {
         assert!(plan.fits(on.beacon_airtime_us().div_ceil(1000)));
     }
 
+    /// A position every second and a ping every five: the defaults, each
+    /// on its own key with the same bounds as the beacon interval.
+    #[test]
+    fn ping_has_its_own_slower_interval() {
+        let cfg = RadioConfig::default();
+        assert_eq!(cfg.beacon_interval_s, 1);
+        assert_eq!(cfg.ping_interval_s, 5);
+        assert_eq!(parse("ping_interval_s = 30").unwrap().ping_interval_s, 30);
+        assert_eq!(parse("ping_interval_s = 0").unwrap().ping_interval_s, 0);
+        assert_eq!(parse("ping_interval_s = 3601"), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("ping_interval_s = soon"), Err(ConfigError::BadValue(1)));
+        // The beacon key alone does not move the ping.
+        assert_eq!(parse("interval_s = 20").unwrap().ping_interval_s, 5);
+        // At a 1 s interval the id wraps in about four minutes, and the
+        // dedup window still sits well inside that.
+        assert!(u32::from(cfg.dedup_ttl_s) * 10 < 256 * u32::from(cfg.beacon_interval_s));
+    }
+
     #[test]
     fn dedup_ttl_parses_and_is_bounded() {
         assert_eq!(RadioConfig::default().dedup_ttl_s, 3);
@@ -1742,6 +1785,7 @@ mod tests {
             max_hops: 3,
             dedup_ttl_s: 120,
             beacon_interval_s: 30,
+            ping_interval_s: 7,
             beacon_fields: crate::lora::FIELD_LAT | crate::lora::FIELD_LON | crate::lora::FIELD_ALT,
             sd_enabled: false,
             verbose: false,
@@ -1816,14 +1860,27 @@ mod tests {
     /// the same way rather than half a plan.
     #[test]
     fn radio_config_blob_from_before_hopping_reads_as_hopping_off() {
-        let good = RadioConfig::default().encode();
+        let good = RadioConfig { beacon_interval_s: 20, ..RadioConfig::default() }.encode();
         let old = RadioConfig::decode(&good[..RADIO_CONFIG_LEN_V1]).unwrap();
         assert_eq!(old.hop_channels, 0);
         assert_eq!(old.hop_step_khz, RadioConfig::default().hop_step_khz);
         assert_eq!(old.hop_dwell_ms, RadioConfig::default().hop_dwell_ms);
-        assert_eq!(RadioConfig { hop_channels: 50, ..old }, RadioConfig::default());
+        // Such a board pinged on its beacon interval, so that is what it
+        // reads back as pinging on.
+        assert_eq!(old.ping_interval_s, 20);
+        assert_eq!(
+            RadioConfig { hop_channels: 50, ping_interval_s: 5, ..old },
+            RadioConfig { beacon_interval_s: 20, ..RadioConfig::default() }
+        );
+        // A blob with the plan but not the ping interval: hopping as sent,
+        // ping on the beacon interval.
+        let hop_only = RadioConfig::decode(&good[..RADIO_CONFIG_LEN_HOP]).unwrap();
+        assert_eq!(hop_only.hop_channels, 50);
+        assert_eq!(hop_only.ping_interval_s, 20);
+        // Cut inside a field, the field is absent rather than half-read.
         let cut = RadioConfig::decode(&good[..RADIO_CONFIG_LEN - 1]).unwrap();
-        assert_eq!(cut.hop_channels, 0);
+        assert_eq!(cut.ping_interval_s, 20);
+        assert_eq!(RadioConfig::decode(&good[..RADIO_CONFIG_LEN_HOP - 1]).unwrap().hop_channels, 0);
     }
 
     /// A longer buffer must still decode: a future layout can only grow, and
