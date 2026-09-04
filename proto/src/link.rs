@@ -125,12 +125,20 @@ pub const TELEM_FLAG_CFG_LOADED: u8 = 0x04;
 /// place a connected app learns whether the console is verbose.
 pub const TELEM_FLAG_VERBOSE: u8 = 0x08;
 
-pub const TELEMETRY_LEN: usize = 16;
+/// Set in [`Telemetry::hop`] when the radio is frequency hopping. The low
+/// nibble is then the hop clock's stratum: 0 on the board's own GPS time,
+/// [`crate::hop::STRATUM_MAX`] free-running with nothing to follow.
+pub const TELEM_HOP_ON: u8 = 0x80;
+/// Mask of the stratum in [`Telemetry::hop`].
+pub const TELEM_HOP_STRATUM: u8 = 0x0F;
+
+pub const TELEMETRY_LEN: usize = 18;
 
 /// Periodic radio/GPS status, served over BLE (see [`crate::ble`]).
 ///
 /// Layout (little-endian): `last_rssi: i16, last_snr_cb: i16,
-/// secs_since_rx: u16, rx_count: u32, tx_count: u32, flags: u8, sats: u8`.
+/// secs_since_rx: u16, rx_count: u32, tx_count: u32, flags: u8, sats: u8,
+/// hop: u8, hop_channel: u8`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Telemetry {
     /// RSSI of the last received LoRa packet (dBm), 0 if none yet.
@@ -147,9 +155,19 @@ pub struct Telemetry {
     pub flags: u8,
     /// Satellites used in the current GPS fix.
     pub sats: u8,
+    /// [`TELEM_HOP_ON`] plus the hop clock's stratum, 0 when not hopping.
+    pub hop: u8,
+    /// Index of the channel the receiver is on right now, 0 when not
+    /// hopping. Watching it change is the cheapest proof the radio hops.
+    pub hop_channel: u8,
 }
 
 impl Telemetry {
+    /// The hop clock's stratum, or `None` when the radio is not hopping.
+    pub fn hop_stratum(&self) -> Option<u8> {
+        (self.hop & TELEM_HOP_ON != 0).then_some(self.hop & TELEM_HOP_STRATUM)
+    }
+
     pub fn encode(&self) -> [u8; TELEMETRY_LEN] {
         let mut b = [0u8; TELEMETRY_LEN];
         b[0..2].copy_from_slice(&self.last_rssi.to_le_bytes());
@@ -159,6 +177,8 @@ impl Telemetry {
         b[10..14].copy_from_slice(&self.tx_count.to_le_bytes());
         b[14] = self.flags;
         b[15] = self.sats;
+        b[16] = self.hop;
+        b[17] = self.hop_channel;
         b
     }
 
@@ -175,6 +195,8 @@ impl Telemetry {
             tx_count: u32::from_le_bytes(b[10..14].try_into().ok()?),
             flags: b[14],
             sats: b[15],
+            hop: b[16],
+            hop_channel: b[17],
         })
     }
 }
@@ -431,9 +453,13 @@ mod tests {
             tx_count: 42,
             flags: TELEM_FLAG_SD_OK | TELEM_FLAG_GPS_FIX | TELEM_FLAG_VERBOSE,
             sats: 11,
+            hop: TELEM_HOP_ON | 3,
+            hop_channel: 27,
         };
         let b = t.encode();
         assert_eq!(Telemetry::decode(&b), Some(t));
+        assert_eq!(t.hop_stratum(), Some(3));
+        assert_eq!(Telemetry { hop: 0, ..t }.hop_stratum(), None);
         assert_eq!(Telemetry::decode(&b[..TELEMETRY_LEN - 1]), None);
         let mut longer = b.to_vec();
         longer.push(0xAB);

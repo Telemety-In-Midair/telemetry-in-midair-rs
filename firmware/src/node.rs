@@ -31,7 +31,9 @@
 //!   every single time; the delay also keeps the radio out of a transmit
 //!   while more of the same burst is still arriving.
 
-use midair_proto::lora::{Frame, FRAME_MAX, HEADER_LEN};
+use embassy_time::Instant;
+use midair_proto::hop::{Offer, SyncWord};
+use midair_proto::lora::{Frame, FLAG_SYNC, FRAME_MAX, HEADER_LEN};
 use midair_proto::radiocfg::{RadioConfig, Role};
 
 use crate::radio::{Sx1262Driver, Sx1262Error};
@@ -121,6 +123,9 @@ pub struct Node<'d> {
     have_rx: bool,
     drops: RxDrops,
     rng: u32,
+    /// A hop clock adopted from a heard frame since the last time anyone
+    /// asked: `(sender, this node's new stratum)`. For the log.
+    sync_note: Option<(u8, u8)>,
 }
 
 impl<'d> Node<'d> {
@@ -151,6 +156,7 @@ impl<'d> Node<'d> {
             last_rx_ms: 0,
             have_rx: false,
             drops: RxDrops::default(),
+            sync_note: None,
             // Seeded from the address, which is what has to differ: the
             // jitter exists to separate two repeaters that heard the same
             // frame, and two repeaters cannot share an address. Never zero,
@@ -215,6 +221,19 @@ impl<'d> Node<'d> {
         self.drops
     }
 
+    /// The last hop clock adopted from a heard frame, once: who it came
+    /// from and the stratum this node has because of it.
+    pub fn take_sync_note(&mut self) -> Option<(u8, u8)> {
+        self.sync_note.take()
+    }
+
+    /// The sync word a frame this node sends carries: a placeholder the
+    /// radio overwrites at the instant of transmission on a hopping
+    /// network, nothing otherwise.
+    fn sync_placeholder(&self) -> Option<SyncWord> {
+        self.radio.hopping().then_some(SyncWord::default())
+    }
+
     /// Broadcast a payload as a new frame from this node.
     ///
     /// Fails with [`TxError::Muted`] on a receive-only node rather than
@@ -227,6 +246,7 @@ impl<'d> Node<'d> {
             src: self.address,
             id: self.next_id,
             hops_left: self.max_hops,
+            sync: self.sync_placeholder(),
             payload,
         };
         let mut buf = [0u8; FRAME_MAX];
@@ -234,7 +254,15 @@ impl<'d> Node<'d> {
         // Claim the id even if the transmission fails, so a retry is a new
         // frame rather than one receivers have already discarded.
         self.next_id = self.next_id.wrapping_add(1);
-        self.radio.send(&buf[..n]).await.map_err(TxError::Radio)
+        self.radio
+            .send(&mut buf[..n], frame.sync_offset())
+            .await
+            .map_err(TxError::Radio)
+    }
+
+    /// Bytes ahead of the payload in a frame this node sends.
+    pub fn frame_overhead(&self) -> usize {
+        HEADER_LEN + if self.radio.hopping() { midair_proto::hop::SYNC_LEN } else { 0 }
     }
 
     /// Poll the radio for one frame.
@@ -254,13 +282,22 @@ impl<'d> Node<'d> {
         // Take the header out as values first: the bookkeeping below needs
         // `&mut self`, so the payload is borrowed back from `rx_buf` only
         // once that is done.
-        let (src, id, hops_left) = match Frame::decode(&self.rx_buf[..len]) {
-            Some(f) => (f.src, f.id, f.hops_left),
+        let (src, id, hops_left, sync, hlen) = match Frame::decode(&self.rx_buf[..len]) {
+            Some(f) => (f.src, f.id, f.hops_left, f.sync, f.header_len()),
             None => {
                 self.drops.malformed = self.drops.malformed.saturating_add(1);
                 return None;
             }
         };
+        // Every frame that decoded is a real transmission with a real clock
+        // behind it, so all of them are offered - the echo of this node's
+        // own broadcast included, since what it carries is the repeater's
+        // clock, not this node's. What is dropped below is the *message*.
+        if let Some(word) = sync
+            && let Offer::Adopted(stratum) = self.radio.hop_heard(word, src, self.address, len)
+        {
+            self.sync_note = Some((src, stratum));
+        }
         // Our own transmission, forwarded back to us by a repeater.
         //
         // Only a node that transmits can hear itself. One that does not has
@@ -277,13 +314,22 @@ impl<'d> Node<'d> {
             return None;
         }
         if self.role.repeats() && hops_left > 0 {
-            let due = now.wrapping_add(self.random(self.jitter_ms));
+            let jitter = self.random(self.jitter_ms);
             let onward = Frame {
                 src,
                 id,
                 hops_left: hops_left - 1,
-                payload: &self.rx_buf[HEADER_LEN..len],
+                // This node's clock, not the sender's: the radio writes it
+                // when the repeat actually goes out.
+                sync: self.sync_placeholder(),
+                payload: &self.rx_buf[hlen..len],
             };
+            // The jitter picks a moment; on a hopping network the moment
+            // is then moved into a slot's window, which the same clock the
+            // poll runs on decides. Kept in the caller's 32-bit domain.
+            let wanted = Instant::now().as_millis() + u64::from(jitter);
+            let start = self.radio.tx_window_start(wanted, onward.encoded_len());
+            let due = now.wrapping_add((start - Instant::now().as_millis().min(start)) as u32);
             if !queue_repeat(&mut self.repeats, &onward, due) {
                 self.drops.repeat_full = self.drops.repeat_full.saturating_add(1);
             }
@@ -291,7 +337,7 @@ impl<'d> Node<'d> {
         Some(Received {
             src,
             rssi,
-            payload: &self.rx_buf[HEADER_LEN..len],
+            payload: &self.rx_buf[hlen..len],
         })
     }
 
@@ -320,7 +366,10 @@ impl<'d> Node<'d> {
         let len = self.repeats[idx].len;
         let mut buf = [0u8; FRAME_MAX];
         buf[..len].copy_from_slice(&self.repeats[idx].buf[..len]);
-        self.radio.send(&buf[..len]).await.is_ok()
+        // The queued copy carries the flag that says where the sync word
+        // sits, which is all the radio needs to stamp it afresh.
+        let sync_at = (buf[2] & FLAG_SYNC != 0).then_some(HEADER_LEN);
+        self.radio.send(&mut buf[..len], sync_at).await.is_ok()
     }
 
     /// Record a `(src, id)` pair, returning whether it had already been

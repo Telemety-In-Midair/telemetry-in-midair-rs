@@ -382,6 +382,25 @@ pub struct RadioConfig {
     /// saving and boosted), so this is a bool rather than an enum - the
     /// intermediate values have no specified behavior to expose.
     pub rx_boost: bool,
+    /// Channels to hop across, 0 for a single channel at
+    /// [`frequency_hz`](Self::frequency_hz). With hopping on, the plan is
+    /// this many channels [`hop_step_khz`](Self::hop_step_khz) apart,
+    /// centered on `frequency_hz`, and every node changes channel once per
+    /// [`hop_dwell_ms`](Self::hop_dwell_ms) on a clock the frames themselves
+    /// keep in step (see [`crate::hop`]).
+    ///
+    /// Hopping is what lets a node transmit as often as once a slot: the
+    /// 902-928 MHz band caps how long any one channel is occupied, not how
+    /// often a hopping node transmits. Fifty channels is that band's floor
+    /// for a signal narrower than 250 kHz, and enough for the wider ones.
+    pub hop_channels: u8,
+    /// Spacing between hop channels, kHz. At least the signal bandwidth,
+    /// or adjacent channels overlap.
+    pub hop_step_khz: u16,
+    /// How long the network stays on each channel, ms. One transmission per
+    /// node per slot, which has to fit inside it with a guard at each end
+    /// for clock error - see [`crate::hop::Plan::window_ms`].
+    pub hop_dwell_ms: u16,
     /// This node's address (1-255). It travels in every frame this node
     /// originates and is how receivers tell one sender's positions from
     /// another's, so it must be unique among the nodes that transmit: two
@@ -487,11 +506,11 @@ impl Default for RadioConfig {
             //
             // The bandwidth is the deliberate part. A 500 kHz signal is wide
             // enough to count as a digital modulation in the 902-928 MHz
-            // band, which is the difference between being allowed to sit on
-            // one channel and having to hop across fifty. Hopping needs a
-            // clock every node agrees on, and the only one here is GPS time -
-            // which a node that has never had a fix does not have, and that
-            // is precisely the node the no-fix ping exists to keep audible.
+            // band, so with hopping turned off it may sit on one channel
+            // indefinitely; anything narrower has to hop there. With hopping
+            // on, 500 kHz also keeps the beacon well inside a one-second
+            // slot: 289 ms, against the 1.15 s the same frame costs at
+            // BW125, which is longer than the band's 400 ms occupancy cap.
             //
             // SF12 buys most of that width back. Against the SF9/BW62.5 this
             // replaces it costs 1.5 dB of sensitivity (-131 against -132.5
@@ -507,6 +526,21 @@ impl Default for RadioConfig {
             // already listening continuously, and range is set by the worse
             // of the two directions.
             rx_boost: true,
+            // Hopping, across fifty 500 kHz channels filling 902-928 MHz,
+            // one second per channel. The slot is what makes a short beacon
+            // interval legal on that band: the occupancy cap is per channel
+            // per visit, and a node visits each channel once a cycle.
+            //
+            // The clock every node needs for this comes from GPS where a
+            // node has a fix and from the frames it hears where it does not,
+            // so a node without a fix is still on the air and still heard -
+            // after it has heard one frame. What that costs is the join: a
+            // node that knows nobody's clock coincides with the network on
+            // about one slot in fifty, so it waits, on average, fifty beacon
+            // intervals divided by the number of nodes transmitting.
+            hop_channels: 50,
+            hop_step_khz: 500,
+            hop_dwell_ms: 1_000,
             address: 1,
             // Leaf by default: repeating is a job you give one well-placed
             // node, not something every node should do to every frame.
@@ -581,6 +615,19 @@ impl RadioConfig {
         self.tx_poll_timeout_ms() + 500
     }
 
+    /// The longest a transmit can hold the hardware loop, ms: the TxDone
+    /// deadline, plus a whole hop slot for a send that finds its clock has
+    /// moved and waits for the next window. What a sleep that arrives
+    /// mid-beacon has to budget for.
+    pub fn tx_worst_case_ms(&self) -> u32 {
+        self.tx_poll_timeout_ms()
+            + if self.hop_channels > 0 {
+                u32::from(self.hop_dwell_ms)
+            } else {
+                0
+            }
+    }
+
     /// Upper bound of the random delay a repeater waits before forwarding
     /// a frame (ms).
     ///
@@ -640,14 +687,43 @@ impl RadioConfig {
         t_preamble_us + t_payload_us
     }
 
+    /// Bytes every frame this node sends carries ahead of its payload: the
+    /// header, plus the hop sync word on a hopping network.
+    pub fn frame_overhead(&self) -> usize {
+        if self.hop_channels > 0 {
+            crate::lora::HEADER_SYNC_LEN
+        } else {
+            crate::lora::HEADER_LEN
+        }
+    }
+
     /// Time-on-air of one beacon transmission at the current settings, in
-    /// microseconds: the frame header plus whichever position fields
-    /// [`beacon_fields`](Self::beacon_fields) selects.
+    /// microseconds: the frame header (and sync word, when hopping) plus
+    /// whichever position fields [`beacon_fields`](Self::beacon_fields)
+    /// selects.
     pub fn beacon_airtime_us(&self) -> u32 {
-        let payload = crate::lora::HEADER_LEN + crate::lora::position_msg_len(self.beacon_fields);
+        let payload = self.frame_overhead() + crate::lora::position_msg_len(self.beacon_fields);
         self.time_on_air_us(payload)
     }
+
+    /// Time-on-air of one no-fix ping at the current settings, in
+    /// microseconds.
+    pub fn ping_airtime_us(&self) -> u32 {
+        self.time_on_air_us(self.frame_overhead() + crate::lora::PING_MSG_LEN)
+    }
 }
+
+/// Ceiling on [`RadioConfig::hop_dwell_ms`]. Past ten seconds a slot is no
+/// longer a hop, it is a channel with a schedule.
+pub const HOP_DWELL_MAX_MS: u16 = 10_000;
+/// Floor on [`RadioConfig::hop_dwell_ms`]: below this the guards leave no
+/// room for even the fastest beacon.
+pub const HOP_DWELL_MIN_MS: u16 = 100;
+/// Bounds on [`RadioConfig::hop_step_khz`]. 25 kHz is the narrowest spacing
+/// the band rules recognize as separate channels; 5 MHz steps with more than
+/// a handful of channels would not fit any band the radio covers.
+pub const HOP_STEP_MIN_KHZ: u16 = 25;
+pub const HOP_STEP_MAX_KHZ: u16 = 5_000;
 
 /// Ceiling on [`RadioConfig::max_hops`]. Each hop costs another full
 /// transmission of the same frame on a shared channel, so the useful range
@@ -669,7 +745,14 @@ pub const MAX_HOPS_LIMIT: u8 = 8;
 // with no stored file at all.
 
 /// Wire length of the [`RadioConfig`] read-back blob.
-pub const RADIO_CONFIG_LEN: usize = 28;
+pub const RADIO_CONFIG_LEN: usize = 32;
+
+/// Length of the blob before the hop plan was appended. A board on that
+/// firmware sends this much, and its byte 27 - now `hop_channels` - was a
+/// reserved zero, which reads back as hopping off: exactly what that board
+/// does. [`RadioConfig::decode`] accepts either length so a newer app can
+/// still read an older board.
+pub const RADIO_CONFIG_LEN_V1: usize = 28;
 
 /// Layout version in byte 0, so an app meeting a newer firmware can reject
 /// the blob rather than misread it.
@@ -748,21 +831,27 @@ impl RadioConfig {
         b[23] = self.gps.power_mode.operate_mode();
         b[24..26].copy_from_slice(&self.gps.meas_rate_ms.to_le_bytes());
         b[26] = self.gps.dyn_model.dynmodel();
-        // b[27] reserved, kept zero.
+        b[27] = self.hop_channels;
+        b[28..30].copy_from_slice(&self.hop_step_khz.to_le_bytes());
+        b[30..32].copy_from_slice(&self.hop_dwell_ms.to_le_bytes());
         b
     }
 
     /// Decode a read-back blob. `None` for a short buffer, an unknown layout
     /// version, or an enum byte this build does not recognize - the caller
     /// then keeps its own values rather than acting on a half-read config.
-    /// Trailing bytes are tolerated so a future layout can only grow.
+    /// Trailing bytes are tolerated so a future layout can only grow, and a
+    /// [`RADIO_CONFIG_LEN_V1`] blob from a board that predates hopping reads
+    /// as a config with hopping off.
     pub fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() < RADIO_CONFIG_LEN || b[0] != RADIO_CONFIG_VERSION {
+        if b.len() < RADIO_CONFIG_LEN_V1 || b[0] != RADIO_CONFIG_VERSION {
             return None;
         }
         let flags = b[1];
         let g = b[2];
         let u16at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
+        let hopping = b.len() >= RADIO_CONFIG_LEN;
+        let defaults = Self::default();
         Some(Self {
             frequency_hz: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
             spreading_factor: b[8],
@@ -770,6 +859,9 @@ impl RadioConfig {
             coding_rate: b[11],
             power_dbm: b[12] as i8,
             rx_boost: flags & RCFG_RX_BOOST != 0,
+            hop_channels: if hopping { b[27] } else { 0 },
+            hop_step_khz: if hopping { u16at(28) } else { defaults.hop_step_khz },
+            hop_dwell_ms: if hopping { u16at(30) } else { defaults.hop_dwell_ms },
             address: b[13],
             role: Role::from_wire(b[3])?,
             max_hops: b[14],
@@ -821,6 +913,9 @@ pub enum ConfigError {
 /// partial file is fine. Unknown keys are ignored (forward compatibility).
 pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
     let mut cfg = RadioConfig::default();
+    // The last line that shaped the hop plan, so a plan that does not fit
+    // the radio's range is reported against something the author wrote.
+    let mut hop_line = 0u32;
     for (idx, raw_line) in text.lines().enumerate() {
         let lineno = idx as u32 + 1;
         let line = match raw_line.split_once('#') {
@@ -846,10 +941,34 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
             "frequency_hz" => {
                 let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
                 // Sub-GHz ISM range the SX126x covers.
-                if !(150_000_000..=960_000_000).contains(&v) {
+                if !(RF_MIN_HZ..=RF_MAX_HZ).contains(&v) {
                     return Err(ConfigError::OutOfRange(lineno));
                 }
                 cfg.frequency_hz = v as u32;
+                hop_line = lineno;
+            }
+            "hop_channels" => {
+                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
+                if v > 255 {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+                cfg.hop_channels = v as u8;
+                hop_line = lineno;
+            }
+            "hop_step_khz" => {
+                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
+                if !(HOP_STEP_MIN_KHZ as u64..=HOP_STEP_MAX_KHZ as u64).contains(&v) {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+                cfg.hop_step_khz = v as u16;
+                hop_line = lineno;
+            }
+            "hop_dwell_ms" => {
+                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
+                if !(HOP_DWELL_MIN_MS as u64..=HOP_DWELL_MAX_MS as u64).contains(&v) {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+                cfg.hop_dwell_ms = v as u16;
             }
             "spreading_factor" => {
                 let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
@@ -1052,8 +1171,22 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
             _ => {} // unknown key: ignore
         }
     }
+    // The plan as a whole: every channel has to be somewhere the radio can
+    // tune. Checked after the loop because it depends on three keys that
+    // can arrive in any order.
+    if let Some(plan) = crate::hop::Plan::from_config(&cfg) {
+        let (lo, hi) = plan.span_hz();
+        if u64::from(lo) < RF_MIN_HZ || u64::from(hi) > RF_MAX_HZ || lo > hi {
+            return Err(ConfigError::OutOfRange(hop_line));
+        }
+    }
     Ok(cfg)
 }
+
+/// The carrier range the SX126x covers, Hz: the bounds on `frequency_hz`
+/// and on every channel of a hop plan.
+pub const RF_MIN_HZ: u64 = 150_000_000;
+pub const RF_MAX_HZ: u64 = 960_000_000;
 
 /// Parse raw file bytes (validates UTF-8 first).
 pub fn parse_bytes(bytes: &[u8]) -> Result<RadioConfig, ConfigError> {
@@ -1265,6 +1398,73 @@ mod tests {
         assert_eq!(parse("listen_ms = 900").unwrap(), RadioConfig::default());
     }
 
+    /// Hopping is on by default, with the plan the 902-928 MHz band asks
+    /// for, and every key of it is bounded.
+    #[test]
+    fn hopping_is_the_default_and_bounded() {
+        let cfg = RadioConfig::default();
+        assert_eq!((cfg.hop_channels, cfg.hop_step_khz, cfg.hop_dwell_ms), (50, 500, 1000));
+        assert!(crate::hop::Plan::from_config(&cfg).is_some());
+
+        let off = parse("hop_channels = 0").unwrap();
+        assert_eq!(off.hop_channels, 0);
+        assert!(crate::hop::Plan::from_config(&off).is_none());
+
+        assert_eq!(parse("hop_channels = 64").unwrap().hop_channels, 64);
+        assert_eq!(parse("hop_channels = 256"), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("hop_channels = many"), Err(ConfigError::BadValue(1)));
+        assert_eq!(parse("hop_step_khz = 200").unwrap().hop_step_khz, 200);
+        assert_eq!(parse("hop_step_khz = 24"), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("hop_step_khz = 5001"), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("hop_dwell_ms = 400").unwrap().hop_dwell_ms, 400);
+        assert_eq!(parse("hop_dwell_ms = 99"), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("hop_dwell_ms = 10001"), Err(ConfigError::OutOfRange(1)));
+    }
+
+    /// A plan has to fit the radio: fifty 5 MHz channels around 915 MHz
+    /// would put channels below 150 MHz and above 960. The error names the
+    /// last of the keys that shaped the plan, whatever order they came in.
+    #[test]
+    fn a_hop_plan_must_fit_the_radio() {
+        assert_eq!(
+            parse("hop_step_khz = 5000\nhop_channels = 200"),
+            Err(ConfigError::OutOfRange(2))
+        );
+        assert_eq!(
+            parse("hop_channels = 200\nhop_step_khz = 5000"),
+            Err(ConfigError::OutOfRange(2))
+        );
+        // A plan at the band edge fits only while every carrier is in range:
+        // 41 channels about 160 MHz put the lowest exactly on 150 MHz, and
+        // one more puts it below.
+        assert!(parse("frequency_hz = 160_000_000\nhop_channels = 41").is_ok());
+        assert_eq!(
+            parse("frequency_hz = 160_000_000\nhop_channels = 42"),
+            Err(ConfigError::OutOfRange(2))
+        );
+        // Turned off, the plan cannot fail to fit.
+        assert!(parse("hop_channels = 0\nhop_step_khz = 5000").is_ok());
+    }
+
+    /// The sync word is four bytes on every hopped frame, so the beacon and
+    /// the ping both cost more air with hopping on than off - and the
+    /// estimate the app prints has to say so.
+    #[test]
+    fn hopping_adds_the_sync_word_to_the_airtime() {
+        let on = RadioConfig::default();
+        let off = RadioConfig { hop_channels: 0, ..on };
+        assert_eq!(on.frame_overhead(), lora::HEADER_SYNC_LEN);
+        assert_eq!(off.frame_overhead(), lora::HEADER_LEN);
+        assert!(on.beacon_airtime_us() >= off.beacon_airtime_us());
+        assert!(on.ping_airtime_us() >= off.ping_airtime_us());
+        assert!(on.ping_airtime_us() < on.beacon_airtime_us());
+        // At SF12/BW500 the four bytes ride in the same symbol block, so the
+        // default beacon stays under 300 ms and well inside a 1 s slot.
+        assert!(on.beacon_airtime_us() < 300_000, "{} us", on.beacon_airtime_us());
+        let plan = crate::hop::Plan::from_config(&on).unwrap();
+        assert!(plan.fits(on.beacon_airtime_us().div_ceil(1000)));
+    }
+
     #[test]
     fn dedup_ttl_parses_and_is_bounded() {
         assert_eq!(RadioConfig::default().dedup_ttl_s, 3);
@@ -1323,14 +1523,19 @@ mod tests {
     #[test]
     fn time_on_air_matches_hand_calc() {
         // SF7, BW125, CR 4/5, with a header (3) + position lat/lon (10) =
-        // 13-byte PHY payload: the 46.3 ms figure the docs quote.
+        // 13-byte PHY payload: the 46.3 ms figure the docs quote. With
+        // hopping on the sync word makes it 17 bytes and one more symbol
+        // block, 5.1 ms at this modulation.
         let mut cfg = RadioConfig {
             spreading_factor: 7,
             bandwidth_khz: 125,
+            hop_channels: 0,
             ..RadioConfig::default()
         };
         assert_eq!(cfg.time_on_air_us(13), 46_336);
         assert_eq!(cfg.beacon_airtime_us(), 46_336);
+        cfg.hop_channels = 50;
+        assert_eq!(cfg.beacon_airtime_us(), 51_456);
 
         // The shipped default (SF12/BW500) beacon: ~289 ms. Shorter than the
         // ~330 ms of the SF9/BW62.5 it replaced, despite the far higher
@@ -1344,17 +1549,22 @@ mod tests {
         let ping = crate::lora::HEADER_LEN + crate::lora::PING_MSG_LEN;
         assert_eq!(RadioConfig::default().time_on_air_us(ping), 247_808);
 
+        // The same ping with the sync word (11 bytes) rides in the same
+        // symbol block, so hopping costs it nothing at this modulation.
+        assert_eq!(RadioConfig::default().ping_airtime_us(), 247_808);
+
         // Slowest modulation the parser accepts, largest frame the firmware
-        // sends: SF12 / BW62.5 / CR 4/8 with LDRO on, 35 bytes -> ~5 s.
+        // sends: SF12 / BW62.5 / CR 4/8 with LDRO on, 39 bytes (header,
+        // sync word and a full payload) -> ~5.5 s.
         cfg.spreading_factor = 12;
         cfg.bandwidth_khz = 62;
         cfg.coding_rate = 8;
         assert!(cfg.ldro());
-        assert_eq!(cfg.time_on_air_us(crate::lora::FRAME_MAX), 4_997_120);
+        assert_eq!(cfg.time_on_air_us(crate::lora::FRAME_MAX), 5_521_408);
 
-        // Same frame at BW125 is exactly half the symbol time, so ~2.5 s.
+        // Same frame at BW125 is exactly half the symbol time, so ~2.8 s.
         cfg.bandwidth_khz = 125;
-        assert_eq!(cfg.time_on_air_us(crate::lora::FRAME_MAX), 2_498_560);
+        assert_eq!(cfg.time_on_air_us(crate::lora::FRAME_MAX), 2_760_704);
     }
 
     /// A longer beacon payload costs more airtime, and airtime climbs steeply
@@ -1524,6 +1734,9 @@ mod tests {
             coding_rate: 8,
             power_dbm: -9,
             rx_boost: false,
+            hop_channels: 64,
+            hop_step_khz: 200,
+            hop_dwell_ms: 400,
             address: 200,
             role: Role::Repeater,
             max_hops: 3,
@@ -1590,10 +1803,27 @@ mod tests {
     #[test]
     fn radio_config_blob_rejects_short_and_wrong_version() {
         let good = RadioConfig::default().encode();
-        assert_eq!(RadioConfig::decode(&good[..RADIO_CONFIG_LEN - 1]), None);
+        assert_eq!(RadioConfig::decode(&good[..RADIO_CONFIG_LEN_V1 - 1]), None);
         let mut bad = good;
         bad[0] = RADIO_CONFIG_VERSION + 1;
         assert_eq!(RadioConfig::decode(&bad), None);
+    }
+
+    /// A blob from a board that predates the hop plan is the first 28 bytes
+    /// of this one with a zero where `hop_channels` now sits. It decodes,
+    /// and it decodes as a board that does not hop - which is the truth
+    /// about that board. A blob cut anywhere inside the hop fields reads
+    /// the same way rather than half a plan.
+    #[test]
+    fn radio_config_blob_from_before_hopping_reads_as_hopping_off() {
+        let good = RadioConfig::default().encode();
+        let old = RadioConfig::decode(&good[..RADIO_CONFIG_LEN_V1]).unwrap();
+        assert_eq!(old.hop_channels, 0);
+        assert_eq!(old.hop_step_khz, RadioConfig::default().hop_step_khz);
+        assert_eq!(old.hop_dwell_ms, RadioConfig::default().hop_dwell_ms);
+        assert_eq!(RadioConfig { hop_channels: 50, ..old }, RadioConfig::default());
+        let cut = RadioConfig::decode(&good[..RADIO_CONFIG_LEN - 1]).unwrap();
+        assert_eq!(cut.hop_channels, 0);
     }
 
     /// A longer buffer must still decode: a future layout can only grow, and

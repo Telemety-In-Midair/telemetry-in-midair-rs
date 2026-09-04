@@ -129,6 +129,12 @@ pub mod mode {
 pub mod irq {
     pub const TX_DONE: u16 = 1 << 0;
     pub const RX_DONE: u16 = 1 << 1;
+    /// A LoRa preamble has been detected: a frame may be arriving.
+    pub const PREAMBLE_DETECTED: u16 = 1 << 2;
+    /// The explicit header decoded, so a payload is on its way.
+    pub const HEADER_VALID: u16 = 1 << 4;
+    /// The header failed its CRC; the radio has given up on this frame.
+    pub const HEADER_ERR: u16 = 1 << 5;
     pub const CRC_ERR: u16 = 1 << 6;
     pub const TIMEOUT: u16 = 1 << 9;
     /// Every bit, for a blanket clear.

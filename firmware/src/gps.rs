@@ -85,6 +85,9 @@ pub struct Gps<'d> {
     /// Total valid NMEA sentences parsed since boot (saturating). >0 means
     /// the module is talking at the expected baud.
     rx_sentences: u32,
+    /// The last `(time of day ms, local ms)` pair from a sentence with a
+    /// fix, until something takes it.
+    time_mark: Option<(u32, u64)>,
 }
 
 impl<'d> Gps<'d> {
@@ -100,6 +103,7 @@ impl<'d> Gps<'d> {
             configured: false,
             rx_bytes: 0,
             rx_sentences: 0,
+            time_mark: None,
         }
     }
 
@@ -210,6 +214,7 @@ impl<'d> Gps<'d> {
 
     fn fold(&mut self, s: Sentence) {
         let p = &mut self.packet;
+        let mut mark = None;
         match s {
             Sentence::Rmc(rmc) => {
                 if rmc.valid {
@@ -217,6 +222,14 @@ impl<'d> Gps<'d> {
                         p.lat_e7 = lat;
                         p.lon_e7 = lon;
                         p.flags |= FLAG_FIX;
+                    }
+                    // Time from a sentence with a fix behind it, and the
+                    // instant it was parsed: the pair a hop clock is set
+                    // from. Only with a fix - a receiver still searching
+                    // reports a time too, but its error is the unknown
+                    // range to the satellites it is tracking.
+                    if let Some(v) = rmc.tod_ms {
+                        mark = Some((v, Instant::now().as_millis()));
                     }
                 } else {
                     p.flags &= !FLAG_FIX;
@@ -241,6 +254,15 @@ impl<'d> Gps<'d> {
                 }
             }
         }
+        if mark.is_some() {
+            self.time_mark = mark;
+        }
+    }
+
+    /// The last time of day reported with a fix, and the local millisecond
+    /// it arrived, once. Consumed by the hop clock.
+    pub fn take_time_mark(&mut self) -> Option<(u32, u64)> {
+        self.time_mark.take()
     }
 
     fn write_all(&mut self, bytes: &[u8]) {

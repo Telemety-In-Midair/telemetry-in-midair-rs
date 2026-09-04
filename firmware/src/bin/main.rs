@@ -1633,6 +1633,9 @@ async fn hardware_task(
     let mut next_beacon = boot
         .wrapping_add((cfg.address as u32 % 8) * 1_000)
         .wrapping_add(2_000);
+    // The instant the owed beacon is planned for, once the interval has
+    // run out; `None` while none is.
+    let mut beacon_at: Option<u64> = None;
     let mut next_status = boot.wrapping_add(5_000);
     let mut idle_mark = wio_s3_gps::idle::entries();
     let mut idle_at = boot;
@@ -1865,6 +1868,15 @@ async fn hardware_task(
                 gps_nmea_seen = true;
                 status_println!("gps: NMEA up ({} bytes)", gps.rx_bytes());
             }
+            // The hop clock's best reference. Taken whether or not there is
+            // a fix, so a stale mark cannot be handed over later as if it
+            // were fresh; used only with one.
+            if let Some((tod_ms, at_ms)) = gps.take_time_mark()
+                && gps.has_fix()
+                && node.radio_mut().hop_discipline_gps(tod_ms, at_ms)
+            {
+                status_println!("hop: clock on gps time");
+            }
             // Settings retry. Two things leave the module running its own
             // defaults while the firmware reports the ones it asked for: a
             // boot-time push that landed before the receiver had finished
@@ -1928,12 +1940,36 @@ async fn hardware_task(
             // waits all of it out. Declining to start one keeps the sleep path's
             // parking budget covering a beacon already in flight rather than one
             // this pass was about to begin.
-            if cfg.role.transmits()
+            //
+            // Two stages. The interval decides *that* a beacon is owed; on
+            // a hopping network the slot clock then decides *when* in a slot
+            // it goes, and that instant is planned here and waited for by
+            // this loop rather than inside the transmit, where the wait would
+            // hold the receiver off the air for up to a slot. On a single
+            // channel the planned instant is now.
+            //
+            // The last gate is a frame arriving: keying up over it would
+            // lose both, and the poll below will have delivered it by the
+            // next pass. Bounded, since a preamble can be noise.
+            let beacon_owed = cfg.role.transmits()
                 && cfg.beacon_interval_s != 0
                 && due(now, next_beacon)
                 && !state::transfer_active()
-                && !state::sleep_now_pending()
+                && !state::sleep_now_pending();
+            if beacon_owed && beacon_at.is_none() {
+                let len = node.frame_overhead()
+                    + if gps.has_fix() {
+                        lora::position_msg_len(cfg.beacon_fields)
+                    } else {
+                        lora::PING_MSG_LEN
+                    };
+                beacon_at = Some(node.radio_mut().tx_window_start(now_ms, len));
+            }
+            if beacon_owed
+                && beacon_at.is_some_and(|at| now_ms >= at)
+                && !node.radio().rx_in_progress(now_ms)
             {
+                beacon_at = None;
                 // The SX1262 does not reset with the MCU. If it browned out and
                 // restarted on its own it is back at its power-up defaults -
                 // antenna switch unpowered, DIO2 not switching - and keying up
@@ -1988,6 +2024,9 @@ async fn hardware_task(
             }
 
             // ---- LoRa receive -------------------------------------------------
+            if let Some((src, stratum)) = node.take_sync_note() {
+                status_println!("hop: clock from node {} (stratum {})", src, stratum);
+            }
             if let Some(rx) = node.poll(now) {
                 rx_count = rx_count.saturating_add(1);
                 rx_led.pulse(now);
@@ -2030,7 +2069,10 @@ async fn hardware_task(
             // ---- Repeat forwarding --------------------------------------------
             // Only a node configured as a repeater ever has one of these
             // queued; a leaf-only network never enters this branch.
-            if node.repeat_due(now) && !state::transfer_active() {
+            if node.repeat_due(now)
+                && !state::transfer_active()
+                && !node.radio().rx_in_progress(now_ms)
+            {
                 state::set_radio_busy(true);
                 tx_led.pulse(now);
                 let went = node.send_due_repeat(now).await;
@@ -2059,6 +2101,10 @@ async fn hardware_task(
         if cfg.verbose {
             flags |= link::TELEM_FLAG_VERBOSE;
         }
+        let (hop, hop_channel) = match node.radio().hop_status(now_ms) {
+            Some((stratum, channel)) => (link::TELEM_HOP_ON | stratum, channel),
+            None => (0, 0),
+        };
         state::set_telemetry(link::Telemetry {
             last_rssi: node.last_rssi(),
             last_snr_cb: node.radio().last_snr_cb(),
@@ -2067,6 +2113,8 @@ async fn hardware_task(
             tx_count,
             flags,
             sats: gps.packet().sats,
+            hop,
+            hop_channel,
         });
 
         sdlog.poll(now);
@@ -2108,13 +2156,19 @@ async fn hardware_task(
             idle_at = now;
             next_status = now.wrapping_add(10_000);
             let (mode, err) = node.radio_mut().health();
+            let (hop_ch, hop_stratum) = match node.radio().hop_status(now_ms) {
+                Some((stratum, channel)) => (channel as i32, stratum as i32),
+                None => (-1, -1),
+            };
             status_println!(
-                "t={}s radio {} err {:04x} rx {} tx {} | gps {} nmea fix {} sats {} | sd {} | nodes {} | idle {} Hz",
+                "t={}s radio {} err {:04x} rx {} tx {} hop ch {} s {} | gps {} nmea fix {} sats {} | sd {} | nodes {} | idle {} Hz",
                 now_ms / 1000,
                 mode,
                 err,
                 rx_count,
                 tx_count,
+                hop_ch,
+                hop_stratum,
                 gps.rx_sentences(),
                 gps.has_fix() as u8,
                 gps.packet().sats,
@@ -2286,7 +2340,7 @@ async fn adopt_stored_config(
     }
     state::set_verbose(cfg.verbose);
     state::set_radio_config(cfg.encode());
-    state::set_tx_worst_case_ms(cfg.tx_poll_timeout_ms());
+    state::set_tx_worst_case_ms(cfg.tx_worst_case_ms());
     adopt_power(cfg, cold).await;
     loaded
 }
@@ -2359,7 +2413,7 @@ async fn apply_radio_config(
     node.reconfigure(cfg);
     state::set_verbose(cfg.verbose);
     state::set_radio_config(cfg.encode());
-    state::set_tx_worst_case_ms(cfg.tx_poll_timeout_ms());
+    state::set_tx_worst_case_ms(cfg.tx_worst_case_ms());
     // Both stores, because either one alone leaves a board that loses this
     // config at the next power cycle: a card can be absent or failed, and
     // the backup is behind whatever a computer last wrote to the card. A

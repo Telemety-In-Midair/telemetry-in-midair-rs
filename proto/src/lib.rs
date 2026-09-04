@@ -12,6 +12,8 @@
 //!   to link to, so what survives is the framing the host tools speak over
 //!   USB and the bulk transfer that carries a radio config.
 //! - [`lora`]: the LoRa over-air frame and the payloads it carries.
+//! - [`hop`]: frequency hopping - the channel plan, the slot clock the
+//!   network keeps in step, and the sync word a hopped frame carries.
 //! - [`ble`]: BLE GATT extensions on top of the gps-proto service (extra
 //!   characteristic UUIDs and config command ids).
 //! - [`radiocfg`]: the radio TOML configuration file format and its parser.
@@ -31,6 +33,7 @@ pub mod ble;
 pub mod bulk;
 pub mod cfgstore;
 pub mod geo;
+pub mod hop;
 pub mod link;
 pub mod lora;
 pub mod radiocfg;

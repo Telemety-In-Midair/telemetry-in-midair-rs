@@ -106,6 +106,9 @@ bandwidth_khz = 500        # 62|125|250|500 (500)
 coding_rate = 5            # 4/5..4/8 (5)
 power_dbm = 22             # -9..22 (22)
 rx_boost = true            # boosted RX gain (true)
+hop_channels = 50          # channels to hop across, 0 = single channel (50)
+hop_step_khz = 500         # channel spacing, 25-5000 (500)
+hop_dwell_ms = 1000        # time on each channel, 100-10000 (1000)
 dcdc_enabled = true        # internal DC-DC instead of LDO (true)
 tcxo_volts = "3.3"         # TCXO supply; board hardware, not a tuning knob
                            #   (also the antenna switch VDD - floored at 2.7)
@@ -171,29 +174,89 @@ duty cycle and the board's name, since both records live in `nvs`.
 
 ### Modulation
 
-The default is SF12 at 500 kHz, which is a deliberately wide signal rather
-than the narrow one a range-first reading would pick.
+The default is SF12 at 500 kHz, hopping across fifty 500 kHz channels that
+fill 902-928 MHz, one second on each.
 
-In the 902-928 MHz band a 500 kHz signal counts as a digital modulation and
-is allowed to sit on a single channel indefinitely, with no dwell or duty
-cycle ceiling. Anything narrower has to qualify as frequency hopping
-instead: at least 50 channels, no more than 0.4 s on any one of them per
-20 s, and receivers hopping in step with the sender. That last part is what
-rules it out here. Hopping needs a clock the whole network agrees on, the
-only one available is GPS time, and a node that has never had a fix does not
-have it - which is exactly the node the no-fix ping exists to keep audible.
+That band gives a transmitter two ways to be legal. A 500 kHz signal counts
+as a digital modulation and may sit on one channel indefinitely, with no
+dwell or duty cycle ceiling. Anything narrower has to hop: at least 50
+channels, no more than 0.4 s on any one of them per 20 s, and receivers
+hopping in step with the sender. Hopping is the default here for what that
+rule does *not* say. The 0.4 s is per visit, a hopping node visits each
+channel once a cycle, and nothing caps how often it transmits - so where a
+single channel made the beacon interval a trade of shared air time against
+staleness, a hopping node may transmit every slot, and `interval_s = 1` is
+a legal setting. The other thing hopping buys is that a fade on one channel
+costs one beacon rather than every beacon.
 
-SF12 buys most of the width back. The narrow alternative it replaced,
-SF9 at 62.5 kHz, is 1.5 dB more sensitive (-132.5 against -131 dBm), worth
-roughly a tenth of the range on real terrain. It is also *longer* on air:
-2^12/500 kHz and 2^9/62.5 kHz are the same 8.192 ms symbol, and SF12 needs
-fewer symbols per byte, so the default beacon is 289 ms where the narrow one
-was 330 ms.
+SF12 at 500 kHz keeps the frame inside a slot. The default beacon is 289 ms
+on air, and the same frame at BW125 is 1.15 s - past the 0.4 s a visit may
+occupy a channel, and past the 800 ms window a 1 s slot leaves after its
+guards. The narrower modulations are still config keys, and the estimate on
+the app's Radio page says whether a frame fits; a frame that does not is
+still sent, since receivers hold their hop for a frame in progress, but it
+is one channel held longer than a hop is meant to be.
 
-Both are still config keys. If you are somewhere the band rules differ - EU
-868, say, where there is no minimum bandwidth and the constraint is a duty
-cycle instead - `spreading_factor = 9` and `bandwidth_khz = 62` on the card
-gets the narrow modulation back, along with `power_dbm = 14`.
+Somewhere the band rules differ - EU 868, say, where there is no minimum
+bandwidth and the constraint is a duty cycle - `hop_channels = 0` puts the
+node on `frequency_hz` alone, and `spreading_factor = 9`,
+`bandwidth_khz = 62` and `power_dbm = 14` get the narrow modulation back.
+
+### Frequency hopping
+
+Every node keeps a slot clock: time cut into `hop_dwell_ms` slots, and in
+slot `s` every node is on the `s mod 50`-th channel of a permutation of all
+fifty, reshuffled every cycle of fifty slots from the cycle number. A node
+that beacons every slot uses each channel once a cycle; one that beacons
+every twentieth slot still lands somewhere different each time, because the
+order under it changes. The reshuffle is also what lets two nodes that do
+not agree on the time find each other at all: their channels coincide in
+about one slot in fifty, where a fixed order at a fixed offset never meets.
+
+The clock has three sources, in order of trust, and every frame says which
+its sender is on:
+
+- **GPS time**, for a node with a fix: the slot is the second of the day.
+  Every node with a fix agrees without hearing anyone. Stratum 0.
+- **A heard frame.** A hopped frame carries a four-byte sync word - the
+  slot it went out in, how far into the slot, and the sender's stratum. The
+  frame's length and modulation fix its time on air, so the receiver knows
+  to a few milliseconds when the sender's slot began, and adopts the clock
+  if it is better than its own: a lower stratum, or the same stratum from a
+  lower address. It then sits one stratum below.
+- **Nothing.** A node with neither hops on its own free-running clock at
+  stratum 15, so a follower can still be in step with it, and takes the
+  first better clock it hears.
+
+A clock nobody has refreshed ages one stratum every ten minutes, so a
+network cut off from its GPS reference reorganizes around the lowest
+address instead of every node insisting it is still stratum 1, and a node
+that gets a fix back outranks everyone again at once. Crystal drift is a
+few milliseconds per ten minutes, against a 100 ms guard at each end of the
+slot, so an aged clock is still a usable one.
+
+What all this costs is the join. A node that knows nobody's clock hears the
+network only when its channel happens to coincide, so it waits on average
+`hop_channels x interval_s / nodes transmitting` seconds - 500 s at the old
+20 s interval with two nodes, 50 s at a 1 s interval with one. A node with
+a fix never waits, and a node that has synced once stays synced through
+fix loss, a config push, a standby and a brownout of the radio. The base
+station on a desk is the case to know about: give it a fix, or a short
+interval on the nodes it is waiting for.
+
+On the air, a transmission is planned for a random point in the slot's
+window (the slot less a 100 ms guard at each end, less the frame), which
+also spreads two nodes beaconing on the same interval. A receiver that has
+seen a preamble holds its hop until the frame lands, bounded by the longest
+frame the modulation allows, and a node holds a transmit for the same
+reason. The console reports `hop: clock on gps time` and `hop: clock from
+node N (stratum K)` as the clock changes hands, the periodic status line
+carries the channel and stratum, and the telemetry characteristic reports
+both to the app's Status page.
+
+None of this is a certification. The plan follows the shape of the band's
+hopping rule - fifty channels, each used equally on average, receivers in
+step - but whether a given board and antenna comply is a measurement.
 
 ### Beacon payload
 

@@ -112,6 +112,17 @@ classDiagram
     }
     class LoraCodec {
         encode_position() Ping
+        Frame with a sync word
+    }
+    class HopClock {
+        <<slot clock, per node>>
+        slot() phase_ms() stratum()
+        discipline_gps() offer()
+        tx_start() word_at()
+    }
+    class HopPlan {
+        channels, step, dwell
+        frequency_for_slot()
     }
     class RadioConfig {
         parse_bytes() encode()
@@ -131,7 +142,7 @@ classDiagram
     }
     class Sx1262Driver {
         init() send() poll_recv()
-        looks_reset()
+        looks_reset() hop_tick()
     }
     class Sx1262Cmds {
         <<SPI + NSS + BUSY + DIO1 + NRST>>
@@ -177,6 +188,8 @@ classDiagram
     MidairProto *-- SessionPolicy
     MidairProto *-- Roster
     MidairProto *-- LoraCodec
+    MidairProto *-- HopClock
+    MidairProto *-- HopPlan
     MidairProto *-- RadioConfig
     MidairProto *-- LinkCodec
     MidairProto *-- BulkTransfer
@@ -190,6 +203,10 @@ classDiagram
     Node ..> LoraCodec
     Sx1262Driver --> Sx1262Cmds
     Sx1262Driver --> RadioConfig : live settings
+    Sx1262Driver --> HopClock : retune each slot,<br/>stamp each transmit
+    Sx1262Driver --> HopPlan
+    HopClock <.. MaxM10 : time of day, with a fix
+    HopClock <.. RemoteNode : sync word in every frame
     SdCardHw ..> RadioConfig : RADIO.CFG
     Sx1262Cmds --> RfSwitch : DIO2, DIO3
     RfSwitch <..> RemoteNode : broadcasts and hops
@@ -344,6 +361,71 @@ is a chance to miss someone else's broadcast.
 Receive polling checks DIO1 as a GPIO before paying for an SPI round trip,
 which is most of what an idle node does. On the WIO-E5 there was no such
 pin - DIO1 was an internal NVIC vector - so every poll cost a transaction.
+
+## Frequency hopping
+
+The radio is on a different channel every slot, and every node has to
+agree on which. The agreement is a clock, and the clock is set by whatever
+the node has: its own GPS, the frames it hears, or nothing.
+
+```mermaid
+stateDiagram-v2
+    [*] --> Free : boot, or a config with a new dwell
+
+    Free : stratum 15, own counter
+    Free : hops anyway, so a follower can be in step
+    Synced : stratum 1-14
+    Synced : one below the clock it follows
+    Gps : stratum 0
+    Gps : slot = second of the day
+
+    Free --> Gps : fix, time of day parsed
+    Free --> Synced : any frame heard<br/>(equal stratum only from a lower address)
+    Synced --> Gps : fix
+    Gps --> Synced : fix lost, aged 10 min,<br/>then a frame outranks it
+    Synced --> Synced : better frame heard - re-anchor<br/>same reference - refresh
+    Synced --> Synced : 10 min unrefreshed - one stratum worse
+    Synced --> Free : aged to 15
+    Gps --> Gps : every fix report - refresh
+```
+
+The stratum is the tie-breaker, not the accuracy: an aged clock is a few
+milliseconds off against a 100 ms guard. It exists so that a network cut
+off from GPS settles on one reference (the lowest address among equals)
+instead of every node holding to its own.
+
+Inside a slot, the transmit is planned by the hardware task for a random
+point in the window and made only when that instant arrives, so the wait
+never holds the receiver. The receiver retunes at the slot boundary unless
+a frame is arriving, in which case it stays for the frame - bounded by the
+longest frame the modulation allows.
+
+```mermaid
+gantt
+    title One hop slot at the default dwell - a beacon, and the receiver following it
+    dateFormat x
+    axisFormat %L ms
+
+    section Sender
+    guard                       :done,    g1, 0, 100ms
+    window - start planned here :active,  w1, 100, 511ms
+    beacon 289 ms on air        :crit,    b1, 350, 289ms
+    guard                       :done,    g2, 900, 100ms
+
+    section Receiver
+    on channel of slot s        :active,  r1, 0, 1000ms
+    preamble seen, hop held     :milestone, m1, 400, 0ms
+    frame lands, clock offered  :milestone, m2, 639, 0ms
+    retune to slot s+1          :crit,     r2, 1000, 3ms
+    on channel of slot s+1      :active,  r3, 1003, 300ms
+```
+
+The window is the slot less a guard at each end and less the frame, so a
+planned beacon always ends before the far guard. A frame the window cannot
+hold - the default beacon at BW125 is 1.15 s - starts at the near guard and
+runs into the next slot; the hold on the receiver is what still gets it
+through, at the cost of that node occupying one channel longer than a hop
+should.
 
 ## Where the config and the firmware live
 

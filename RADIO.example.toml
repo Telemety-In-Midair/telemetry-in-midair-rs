@@ -34,16 +34,28 @@
 # -- Radio --------------------------------------------------------------
 # frequency, spreading factor, bandwidth, coding rate and power are the
 # LoRa link-budget knobs: together they set sensitivity, on-air time and
-# radiated power - i.e. range.
+# radiated power - i.e. range. The three hop_* keys are the channel plan:
+# by default the network hops across fifty 500 kHz channels filling
+# 902-928 MHz, one second on each, which is what lets a node beacon every
+# second on that band instead of every twenty.
 [radio]
 frequency_hz = 915000000
-frequency_hz_description = "RF center frequency in Hz. Valid 150000000-960000000."
+frequency_hz_description = "RF center frequency in Hz. Valid 150000000-960000000. With hopping on this is the center of the channel plan, and the channels straddle it."
+
+hop_channels = 50
+hop_channels_description = "Channels to hop across, 0-255. 0 stays on frequency_hz. Hopping is what allows a short beacon interval in the 902-928 MHz band: the rule there caps how long one channel is occupied per visit, and a hopping node visits each channel once a cycle. 50 is the band's minimum for a signal narrower than 250 kHz. Every node hops on one shared clock - from GPS where a node has a fix, from the frames it hears where it does not - so a node that knows nobody's clock spends roughly hop_channels times the beacon interval, divided by the number of nodes transmitting, finding the network."
+
+hop_step_khz = 500
+hop_step_khz_description = "Spacing between hop channels in kHz, 25-5000. At least the bandwidth, or adjacent channels overlap. 500 kHz for 50 channels spans 902.75-927.25 MHz around the 915 MHz center."
+
+hop_dwell_ms = 1000
+hop_dwell_ms_description = "How long every node stays on each channel, 100-10000 ms. One transmission per node per slot, which has to fit the slot with a 100 ms guard at each end, so at 1000 ms a beacon may be up to 800 ms on air. The band caps one visit at 400 ms; the default beacon is 289 ms."
 
 spreading_factor = 12
 spreading_factor_description = "LoRa spreading factor, 5-12. Higher gives longer range at a lower data rate."
 
 bandwidth_khz = 500
-bandwidth_khz_description = "LoRa bandwidth in kHz: 62, 125, 250 or 500 (62 means 62.5). Narrower gives longer range at a lower data rate, but only 500 is wide enough to count as a digital modulation in the 902-928 MHz band - narrower settings there have to hop across 50 channels instead of sitting on one."
+bandwidth_khz_description = "LoRa bandwidth in kHz: 62, 125, 250 or 500 (62 means 62.5). Narrower gives longer range at a lower data rate, and a longer frame: the default beacon is 289 ms at 500 and 1150 ms at 125, past the 400 ms one hop visit may occupy a channel. In the 902-928 MHz band only 500 is wide enough to sit on one channel with hopping off."
 
 coding_rate = 5
 coding_rate_description = "Coding rate denominator 5-8 for 4/5..4/8. Higher adds forward error correction at a lower data rate."
@@ -102,7 +114,7 @@ dedup_ttl_s_description = "How long a broadcast is remembered so a repeat of it 
 # -- Beacon -------------------------------------------------------------
 [beacon]
 interval_s = 20
-interval_s_description = "Broadcast period in seconds, 0-3600. Each slot carries a position, or a small ping when there is no fix, so a node that cannot see the sky is still heard. 0 disables both, as does a role of rx_only."
+interval_s_description = "Broadcast period in seconds, 0-3600. Each slot carries a position, or a small ping when there is no fix, so a node that cannot see the sky is still heard. 0 disables both, as does a role of rx_only. With hopping on, a node transmits at most once per hop slot, so 1 means every slot at the default dwell."
 
 fields = "lat,lon"
 fields_description = "Which GPS fields each broadcast carries: lat, lon, altitude, speed, course, sats, time. lat and lon are required. More fields result in more air time."

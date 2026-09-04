@@ -1,19 +1,28 @@
 //! The LoRa over-air frame and the payload formats it carries.
 //!
-//! Every transmission is a message: one 3-byte header followed by an
-//! application payload. There is no addressing beyond the originator and
-//! no routing state - a node either repeats a frame or it does not, which
-//! is all a leaf/repeater topology needs.
+//! Every transmission is a message: one 3-byte header, a 4-byte hop sync
+//! word when the network is hopping, then an application payload. There is
+//! no addressing beyond the originator and no routing state - a node either
+//! repeats a frame or it does not, which is all a leaf/repeater topology
+//! needs.
 //!
 //! ```text
 //! [0] src        originating node address, 1-255
 //! [1] id         originator's sequence number, wraps at 256
 //! [2] hops_left  remaining retransmissions; 0 = nobody repeats this
-//! [3..] payload  1..=PAYLOAD_MAX application bytes
+//!                bit 7 (FLAG_SYNC) set: a sync word follows the header
+//! [3..7] sync    the transmitter's hop clock (crate::hop::SyncWord),
+//!                only when FLAG_SYNC is set
+//! [..] payload   1..=PAYLOAD_MAX application bytes
 //! ```
 //!
 //! `(src, id)` identifies a frame for as long as it is in flight, which is
 //! what lets a receiver drop duplicates and a repeater avoid looping.
+//!
+//! The sync word describes the *transmission*, not the message: a repeater
+//! re-stamps it with its own clock on the way out, so a node that hears
+//! only the repeater can still hop in step with it. The originator's
+//! address and id are left alone, which is what the dedup keys on.
 //!
 //! There is no checksum here: the SX126x transmits LoRa packets with its
 //! hardware CRC enabled and the driver discards frames that fail it, so a
@@ -24,15 +33,24 @@
 
 use gps_proto::packet::{PositionPacket, FLAG_FIX};
 
+use crate::hop::{SyncWord, SYNC_LEN};
+
 /// Frame header length: `[src, id, hops_left]`.
 pub const HEADER_LEN: usize = 3;
+
+/// Header length with the hop sync word behind it.
+pub const HEADER_SYNC_LEN: usize = HEADER_LEN + SYNC_LEN;
+
+/// Set in the `hops_left` byte when a sync word follows the header. The
+/// hop count itself never needs the bit: `MAX_HOPS_LIMIT` is 8.
+pub const FLAG_SYNC: u8 = 0x80;
 
 /// Largest application payload carried in one frame. Matches the payload
 /// space the ESP link reserves for a forwarded frame.
 pub const PAYLOAD_MAX: usize = 32;
 
 /// Largest encoded frame.
-pub const FRAME_MAX: usize = HEADER_LEN + PAYLOAD_MAX;
+pub const FRAME_MAX: usize = HEADER_SYNC_LEN + PAYLOAD_MAX;
 
 /// A decoded over-air frame borrowing its payload from the receive buffer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,14 +62,34 @@ pub struct Frame<'a> {
     /// Retransmissions still permitted. A repeater forwards only when this
     /// is non-zero, and decrements it on the way out.
     pub hops_left: u8,
+    /// The transmitter's hop clock, when the frame carries one. `Some` on
+    /// a hopping network; the value in an outgoing frame is a placeholder
+    /// the radio overwrites at the instant it keys up, since only then is
+    /// the phase known.
+    pub sync: Option<SyncWord>,
     /// Application payload.
     pub payload: &'a [u8],
 }
 
 impl<'a> Frame<'a> {
+    /// Bytes ahead of the payload: the header, and the sync word if any.
+    pub fn header_len(&self) -> usize {
+        if self.sync.is_some() {
+            HEADER_SYNC_LEN
+        } else {
+            HEADER_LEN
+        }
+    }
+
+    /// Where the sync word sits in the encoded frame, if it carries one.
+    /// The radio stamps the real word there on transmit.
+    pub fn sync_offset(&self) -> Option<usize> {
+        self.sync.map(|_| HEADER_LEN)
+    }
+
     /// Encoded length of this frame.
     pub fn encoded_len(&self) -> usize {
-        HEADER_LEN + self.payload.len()
+        self.header_len() + self.payload.len()
     }
 
     /// Write the frame into `out`, returning the number of bytes written.
@@ -65,8 +103,13 @@ impl<'a> Frame<'a> {
         }
         out[0] = self.src;
         out[1] = self.id;
-        out[2] = self.hops_left;
-        out[HEADER_LEN..n].copy_from_slice(self.payload);
+        out[2] = self.hops_left & !FLAG_SYNC;
+        if let Some(sync) = self.sync {
+            out[2] |= FLAG_SYNC;
+            out[HEADER_LEN..HEADER_SYNC_LEN].copy_from_slice(&sync.to_bytes());
+        }
+        let h = self.header_len();
+        out[h..n].copy_from_slice(self.payload);
         Some(n)
     }
 
@@ -79,11 +122,20 @@ impl<'a> Frame<'a> {
         if bytes.len() <= HEADER_LEN || bytes[0] == 0 {
             return None;
         }
+        let synced = bytes[2] & FLAG_SYNC != 0;
+        let h = if synced { HEADER_SYNC_LEN } else { HEADER_LEN };
+        if bytes.len() <= h {
+            return None;
+        }
+        let sync = synced.then(|| {
+            SyncWord::from_bytes(bytes[HEADER_LEN..HEADER_SYNC_LEN].try_into().unwrap())
+        });
         Some(Frame {
             src: bytes[0],
             id: bytes[1],
-            hops_left: bytes[2],
-            payload: &bytes[HEADER_LEN..],
+            hops_left: bytes[2] & !FLAG_SYNC,
+            sync,
+            payload: &bytes[h..],
         })
     }
 }
@@ -443,6 +495,7 @@ mod tests {
             src: 3,
             id: 42,
             hops_left: 1,
+            sync: None,
             payload,
         };
         let mut buf = [0u8; FRAME_MAX];
@@ -450,6 +503,35 @@ mod tests {
         // 3 header + 21 payload; no padding to a fixed size.
         assert_eq!(n, 24);
         assert_eq!(Frame::decode(&buf[..n]), Some(frame));
+    }
+
+    /// A hopped frame carries its sync word behind the header, flagged in
+    /// the hop byte so a receiver knows where the payload starts. The hop
+    /// count survives the flag.
+    #[test]
+    fn sync_word_travels_behind_the_header() {
+        let sync = SyncWord { slot: 4321, stratum: 2, phase: 77 };
+        let frame = Frame {
+            src: 3,
+            id: 42,
+            hops_left: 8,
+            sync: Some(sync),
+            payload: b"\x52\x01\x02\x03",
+        };
+        assert_eq!(frame.sync_offset(), Some(HEADER_LEN));
+        let mut buf = [0u8; FRAME_MAX];
+        let n = frame.encode(&mut buf).unwrap();
+        assert_eq!(n, HEADER_SYNC_LEN + 4);
+        assert_eq!(buf[2], 8 | FLAG_SYNC);
+        assert_eq!(&buf[HEADER_LEN..HEADER_SYNC_LEN], &sync.to_bytes());
+        let back = Frame::decode(&buf[..n]).unwrap();
+        assert_eq!(back, frame);
+        assert_eq!(back.hops_left, 8);
+        assert_eq!(back.payload, b"\x52\x01\x02\x03");
+        // A flagged header with nothing behind the sync word is a runt.
+        assert_eq!(Frame::decode(&buf[..HEADER_SYNC_LEN]), None);
+        // The unflagged frame has no offset to stamp.
+        assert_eq!(Frame { sync: None, ..frame }.sync_offset(), None);
     }
 
     #[test]
@@ -462,21 +544,29 @@ mod tests {
         // Source address 0 is not assignable.
         assert_eq!(Frame::decode(&[0, 1, 1, 0x50]), None);
         // Empty and oversized payloads do not encode.
-        let empty = Frame { src: 1, id: 0, hops_left: 0, payload: &[] };
+        let empty = Frame { src: 1, id: 0, hops_left: 0, sync: None, payload: &[] };
         assert_eq!(empty.encode(&mut buf), None);
         let big = [0u8; PAYLOAD_MAX + 1];
-        let over = Frame { src: 1, id: 0, hops_left: 0, payload: &big };
+        let over = Frame { src: 1, id: 0, hops_left: 0, sync: None, payload: &big };
         assert_eq!(over.encode(&mut buf), None);
-        // Exactly full fits.
-        let full = Frame { src: 1, id: 0, hops_left: 0, payload: &big[..PAYLOAD_MAX] };
+        // Exactly full fits, with the sync word and without.
+        let full = Frame {
+            src: 1,
+            id: 0,
+            hops_left: 0,
+            sync: Some(SyncWord::default()),
+            payload: &big[..PAYLOAD_MAX],
+        };
         assert_eq!(full.encode(&mut buf), Some(FRAME_MAX));
+        let plain = Frame { sync: None, ..full };
+        assert_eq!(plain.encode(&mut buf), Some(FRAME_MAX - SYNC_LEN));
     }
 
     #[test]
     fn hops_survive_a_repeat() {
         let (payload, plen) = encode_position(&sample(), FIELDS_ALL);
         let mut buf = [0u8; FRAME_MAX];
-        let n = Frame { src: 7, id: 9, hops_left: 2, payload: &payload[..plen] }
+        let n = Frame { src: 7, id: 9, hops_left: 2, sync: None, payload: &payload[..plen] }
             .encode(&mut buf)
             .unwrap();
 

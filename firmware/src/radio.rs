@@ -18,9 +18,19 @@
 //! - Transmit waits are `.await` rather than a spin that has to feed the
 //!   watchdog, so BLE and the rest of the firmware keep running through a
 //!   slow beacon instead of being locked out for up to 10 s.
+//!
+//! Frequency hopping lives here too, because it is a property of where the
+//! radio is tuned rather than of what the node says. With a hop plan in the
+//! config the receiver retunes at every slot boundary of the network's
+//! clock ([`midair_proto::hop`]), a transmit is held to the slot's window
+//! and stamped with that clock on its way out, and every frame heard is
+//! offered to the clock as a reference. Without one, nothing here moves off
+//! `frequency_hz`.
 
 use embassy_time::{Duration, Instant, Timer};
 use esp_println::println;
+use midair_proto::hop::{self, Offer, SyncWord};
+use midair_proto::lora::FRAME_MAX;
 use midair_proto::radiocfg::RadioConfig;
 
 use crate::sx1262::{dev_err, irq, mode, reg, FallbackMode, StandbyClk, Sx1262, RX_CONTINUOUS};
@@ -74,8 +84,30 @@ fn image_band(freq_hz: u32) -> (u8, u8) {
     }
 }
 
+/// What frequency hopping keeps between polls.
+struct Hop {
+    plan: hop::Plan,
+    clock: hop::Clock,
+    /// The slot the radio is tuned for, so a poll can tell a boundary has
+    /// passed. `None` after an init, which tunes for the slot it ran in.
+    rx_slot: Option<u32>,
+}
+
 pub struct Sx1262Driver<'d> {
     radio: Sx1262<'d>,
+    /// The config the radio was last initialized from. Hopping needs the
+    /// modulation to turn a frame length into a time on air.
+    cfg: RadioConfig,
+    hop: Option<Hop>,
+    /// Longest frame the modulation allows, ms: the bound on how long a
+    /// preamble that never became a packet can hold the receiver.
+    max_frame_ms: u32,
+    /// Local time a preamble or header was last seen with no packet end
+    /// since. A frame may be arriving, so a hop or a transmit should wait.
+    rx_busy_since: Option<u64>,
+    /// Local time the last packet finished arriving, which with its length
+    /// gives the instant it began - what a hop clock is measured against.
+    last_rx_done_ms: u64,
     rx_active: bool,
     /// Whether the receiver is used at all. False on a transmit-only node,
     /// which idles in standby instead of continuous RX - that idle current
@@ -99,6 +131,11 @@ impl<'d> Sx1262Driver<'d> {
     pub fn new(radio: Sx1262<'d>) -> Self {
         Self {
             radio,
+            cfg: RadioConfig::default(),
+            hop: None,
+            max_frame_ms: 0,
+            rx_busy_since: None,
+            last_rx_done_ms: 0,
             rx_active: false,
             listen: true,
             last_snr_cb: 0,
@@ -128,9 +165,30 @@ impl<'d> Sx1262Driver<'d> {
     /// Initialize (or re-initialize) the radio from `cfg`.
     pub async fn init(&mut self, cfg: &RadioConfig) {
         self.rx_active = false;
+        self.rx_busy_since = None;
         self.listen = cfg.role.receives();
         self.tx_poll_timeout_ms = cfg.tx_poll_timeout_ms();
         self.tx_chip_timeout_ms = cfg.tx_chip_timeout_ms();
+        self.cfg = *cfg;
+        self.max_frame_ms = cfg.time_on_air_us(FRAME_MAX).div_ceil(1000);
+
+        // The hop clock outlives a re-init when the slot length does: a
+        // config push, a standby the app asked for, a radio that browned out
+        // - none of them is a reason to forget what time the network keeps,
+        // and forgetting it costs a rejoin of up to a cycle per node heard.
+        let now = Instant::now().as_millis();
+        let old = self.hop.take();
+        self.hop = hop::Plan::from_config(cfg).map(|plan| {
+            let clock = match old {
+                Some(h) if h.clock.dwell_ms() == u32::from(plan.dwell_ms) => h.clock,
+                _ => hop::Clock::new(plan.dwell_ms, now, u32::from(cfg.address)),
+            };
+            Hop {
+                plan,
+                clock,
+                rx_slot: None,
+            }
+        });
 
         // A discrete radio does not reset with the MCU, so a re-init after
         // a wedge has to say so explicitly.
@@ -199,7 +257,18 @@ impl<'d> Sx1262Driver<'d> {
         self.radio.calibrate_image(f1, f2);
 
         self.radio.set_packet_type_lora();
-        self.radio.set_rf_frequency(cfg.frequency_hz);
+        // On a hopping network the carrier is the current slot's; the poll
+        // moves it from there. Tuned once here so a transmit-only node,
+        // which never polls, still starts somewhere in the plan.
+        let carrier = match &mut self.hop {
+            Some(h) => {
+                let slot = h.clock.slot(now);
+                h.rx_slot = Some(slot);
+                h.plan.frequency_for_slot(slot)
+            }
+            None => cfg.frequency_hz,
+        };
+        self.radio.set_rf_frequency(carrier);
 
         // High-power PA, duty/hp_max per the +22 dBm datasheet preset; the
         // actual output level is set via the TX params below.
@@ -279,8 +348,18 @@ impl<'d> Sx1262Driver<'d> {
         self.radio.write_reg(reg::LORA_SYNC_WORD_LSB, lsb);
 
         self.radio.set_buffer_base_address(0x00, 0x00);
-        self.radio
-            .set_dio_irq_params(irq::RX_DONE | irq::TX_DONE | irq::CRC_ERR | irq::TIMEOUT);
+        // Preamble and header as well as the packet ends: they are how the
+        // poll knows a frame is arriving, which is what holds a hop and a
+        // transmit off a channel somebody is mid-sentence on.
+        self.radio.set_dio_irq_params(
+            irq::RX_DONE
+                | irq::TX_DONE
+                | irq::CRC_ERR
+                | irq::TIMEOUT
+                | irq::PREAMBLE_DETECTED
+                | irq::HEADER_VALID
+                | irq::HEADER_ERR,
+        );
         self.radio.set_rx_tx_fallback_mode(FallbackMode::StandbyRc);
 
         // Over-current protection: required for the HP PA to reach +22.
@@ -309,6 +388,124 @@ impl<'d> Sx1262Driver<'d> {
             cfg.coding_rate,
             cfg.power_dbm
         );
+        if let Some(h) = &self.hop {
+            let (lo, hi) = h.plan.span_hz();
+            println!(
+                "radio hop: {} ch x {} kHz, {}-{} Hz, {} ms dwell, stratum {}",
+                h.plan.channels,
+                h.plan.step_khz,
+                lo,
+                hi,
+                h.plan.dwell_ms,
+                h.clock.stratum(now)
+            );
+            // Said once here rather than on every beacon. A frame longer
+            // than the window still goes out - receivers hold their hop for
+            // a frame in progress - but it is one channel occupied for
+            // longer than a hop is meant to be, which is what the band
+            // rules cap.
+            let beacon_ms = cfg.beacon_airtime_us().div_ceil(1000);
+            if !h.plan.fits(beacon_ms) {
+                println!(
+                    "config: the {} ms beacon does not fit the {} ms hop window; lengthen hop_dwell_ms or shorten the frame",
+                    beacon_ms,
+                    h.plan.window_ms()
+                );
+            }
+        }
+    }
+
+    /// Whether the radio is hopping at all.
+    pub fn hopping(&self) -> bool {
+        self.hop.is_some()
+    }
+
+    /// The hop clock's stratum and the channel the radio is on, or `None`
+    /// when not hopping. What the telemetry and the status line report.
+    pub fn hop_status(&self, now_ms: u64) -> Option<(u8, u8)> {
+        let h = self.hop.as_ref()?;
+        Some((h.clock.stratum(now_ms), h.plan.index_for_slot(h.clock.slot(now_ms))))
+    }
+
+    /// Whether the receiver is mid-frame: a preamble or header has been
+    /// seen and the packet end has not. A transmit started now would
+    /// trample it, and on a hopping network the hop waits for it too.
+    /// Bounded by the longest frame the modulation allows, since a
+    /// preamble detection can be noise.
+    pub fn rx_in_progress(&self, now_ms: u64) -> bool {
+        self.rx_busy_since
+            .is_some_and(|since| now_ms.saturating_sub(since) < u64::from(self.max_frame_ms))
+    }
+
+    /// The local time a frame of `frame_len` bytes should be sent, at or
+    /// after `now_ms`: a random point in the current or next hop slot's
+    /// window, or `now_ms` itself on a single channel.
+    ///
+    /// Planning the instant here and having the caller come back for it
+    /// keeps the wait out of [`send`](Self::send), where it would hold the
+    /// whole hardware loop - and so the receiver - for up to a slot.
+    pub fn tx_window_start(&mut self, now_ms: u64, frame_len: usize) -> u64 {
+        let airtime_ms = self.cfg.time_on_air_us(frame_len).div_ceil(1000);
+        match &mut self.hop {
+            Some(h) => h.clock.tx_start(&h.plan, now_ms, airtime_ms),
+            None => now_ms,
+        }
+    }
+
+    /// Set the hop clock from the board's own GPS: `tod_ms` is the time of
+    /// day a fix reported, `at_ms` when that report was parsed. Returns
+    /// whether the clock was not already on GPS time, for the log.
+    pub fn hop_discipline_gps(&mut self, tod_ms: u32, at_ms: u64) -> bool {
+        let Some(h) = &mut self.hop else {
+            return false;
+        };
+        let was_gps = h.clock.from_gps(at_ms);
+        h.clock.discipline_gps(tod_ms, at_ms);
+        !was_gps
+    }
+
+    /// Offer the clock a frame just received: `word` is what it carried,
+    /// `src` who sent it, `my_addr` this node's address for the tie-break,
+    /// and `frame_len` its length, which with the modulation places the
+    /// start of the transmission at a known instant before the packet end
+    /// the poll timestamped.
+    pub fn hop_heard(&mut self, word: SyncWord, src: u8, my_addr: u8, frame_len: usize) -> Offer {
+        let Some(h) = &mut self.hop else {
+            return Offer::Kept;
+        };
+        let toa = u64::from(self.cfg.time_on_air_us(frame_len).div_ceil(1000));
+        let tx_start = self.last_rx_done_ms.saturating_sub(toa);
+        h.clock.offer(word, src, my_addr, tx_start, self.last_rx_done_ms)
+    }
+
+    /// Move the receiver to the current slot's channel if the slot has
+    /// changed, unless a frame is arriving on the one it is on.
+    ///
+    /// The hold is what lets a frame cross a slot boundary - a receiver
+    /// whose clock runs a little ahead would otherwise leave mid-packet.
+    /// It is bounded by the longest frame the modulation allows and by one
+    /// slot, whichever is shorter: a preamble that was noise would
+    /// otherwise pin the receiver on a channel the network has left.
+    fn hop_tick(&mut self, now_ms: u64) {
+        let Some(h) = &mut self.hop else {
+            return;
+        };
+        let slot = h.clock.slot(now_ms);
+        if h.rx_slot == Some(slot) {
+            return;
+        }
+        if let Some(since) = self.rx_busy_since {
+            let cap = u64::from(self.max_frame_ms.min(u32::from(h.plan.dwell_ms)));
+            if now_ms.saturating_sub(since) < cap {
+                return;
+            }
+            self.rx_busy_since = None;
+        }
+        h.rx_slot = Some(slot);
+        self.radio.set_standby(StandbyClk::Rc);
+        self.radio.set_rf_frequency(h.plan.frequency_for_slot(slot));
+        // Re-armed on the new channel by the poll, which is the one caller.
+        self.rx_active = false;
     }
 
     /// The radio's current mode and any latched operational error.
@@ -429,6 +626,9 @@ impl<'d> Sx1262Driver<'d> {
             return None;
         }
 
+        let now_ms = Instant::now().as_millis();
+        self.hop_tick(now_ms);
+
         if !self.rx_active {
             self.enter_rx();
         }
@@ -442,13 +642,27 @@ impl<'d> Sx1262Driver<'d> {
 
         let status = self.radio.irq_status();
         if status & irq::RX_DONE == 0 {
-            // Something else is latched - a TxDone or a timeout left over
-            // from a transmit whose clear did not land. Clear it, or DIO1
-            // stays asserted and every future poll pays for an SPI read
-            // that can only answer the same way.
-            self.radio.clear_irq_status(irq::ALL);
+            // A preamble or a header means a frame is on its way: note it,
+            // so a hop or a transmit waits for it. A header that failed its
+            // CRC means the radio has given the frame up.
+            if status & (irq::PREAMBLE_DETECTED | irq::HEADER_VALID) != 0 {
+                self.rx_busy_since = Some(now_ms);
+            }
+            if status & irq::HEADER_ERR != 0 {
+                self.rx_busy_since = None;
+            }
+            // Clear what was read and only that - which also covers a
+            // TxDone or a timeout left over from a transmit whose clear did
+            // not land. Clearing everything would take an RxDone that
+            // landed between the read and the clear with it, and the packet
+            // behind it would sit unread in the buffer until the next one
+            // overwrote it.
+            self.radio.clear_irq_status(status);
             return None;
         }
+
+        self.rx_busy_since = None;
+        self.last_rx_done_ms = now_ms;
 
         // The SX126x raises RxDone alongside the CRC error when a packet
         // arrives corrupt, and the payload is still sitting in the buffer.
@@ -481,10 +695,40 @@ impl<'d> Sx1262Driver<'d> {
     }
 
     /// Transmit one packet, returning once the radio reports it sent.
-    pub async fn send(&mut self, data: &[u8]) -> Result<(), Sx1262Error> {
+    ///
+    /// On a hopping network the packet goes out on the current slot's
+    /// channel, inside its window, and if `sync_at` names where the frame
+    /// keeps its sync word the clock's reading at the instant of keying
+    /// up is written there - which is why the buffer is mutable. The
+    /// caller is expected to have planned the instant with
+    /// [`tx_window_start`](Self::tx_window_start); the check here is for a
+    /// clock that moved in between, and its wait is bounded by one slot.
+    pub async fn send(&mut self, data: &mut [u8], sync_at: Option<usize>) -> Result<(), Sx1262Error> {
         self.rx_active = false;
 
+        let airtime_ms = self.cfg.time_on_air_us(data.len()).div_ceil(1000);
+        if let Some(h) = &self.hop {
+            let now_ms = Instant::now().as_millis();
+            let wait = h.clock.wait_for_window_ms(&h.plan, now_ms, airtime_ms);
+            if wait > 0 {
+                Timer::after(Duration::from_millis(u64::from(wait))).await;
+            }
+        }
+
         self.radio.set_standby(StandbyClk::Rc);
+        if let Some(h) = &mut self.hop {
+            let now_ms = Instant::now().as_millis();
+            let slot = h.clock.slot(now_ms);
+            self.radio.set_rf_frequency(h.plan.frequency_for_slot(slot));
+            // The receiver comes back up on this channel after TxDone; the
+            // next poll moves it if the slot has changed by then.
+            h.rx_slot = Some(slot);
+            if let Some(off) = sync_at
+                && let Some(word) = data.get_mut(off..off + hop::SYNC_LEN)
+            {
+                word.copy_from_slice(&h.clock.word_at(now_ms).to_bytes());
+            }
+        }
         self.radio.clear_irq_status(irq::ALL);
         self.radio.write_buffer(0x00, data);
 
