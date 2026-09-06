@@ -68,9 +68,16 @@ pub struct Stored {
     /// [`Stored::encode_record`] normalizes it, so flash never says idle.
     pub mode: Mode,
     /// How long [`Mode::Idle`] lasts before the board stores itself, 0 =
-    /// never configured. Read it through [`Stored::idle_timeout`], which
-    /// substitutes the default.
+    /// it never does, which is the default.
     pub idle_timeout_s: u32,
+    /// How long BLE stays up between off periods while tracking, 0 = never
+    /// configured. Read it through [`Stored::ble_on`], which substitutes
+    /// the default.
+    ///
+    /// The on-half of the `ble_off_s` duty cycle, and [`Mode::Tracking`]'s
+    /// alone. It was the advertising window until the two were separated:
+    /// a wake check and a tracker want different lengths of window.
+    pub ble_on_s: u32,
     /// What the board is called ([`ble::CFG_NAME`]), zero-padded ASCII.
     ///
     /// All-zero is a board that has never been named, which advertises
@@ -98,6 +105,7 @@ impl Stored {
             // reachable before it stores itself. See [`boot_mode`].
             mode: Mode::Stored,
             idle_timeout_s: 0,
+            ble_on_s: 0,
             name: [0; ble::NAME_FIELD_LEN],
         }
     }
@@ -155,18 +163,27 @@ impl Stored {
         }
     }
 
-    /// How long [`Mode::Idle`] runs before the board stores itself. A
-    /// stored 0 means never configured and resolves to the default, exactly
-    /// as the advertising window does.
+    /// How long [`Mode::Idle`] runs before the board stores itself, 0 for
+    /// a board that never does. Unlike the advertising window a 0 here is
+    /// a real setting and the default one: an idle board stays idle until
+    /// something tells it otherwise, so nobody finds a board that stored
+    /// itself while they were still setting it up.
     ///
-    /// There is no value here that means "never". A board leaves Idle by
-    /// deep-sleeping, so a `sleep_interval_s` of 0 already is "never": with
-    /// no cadence to sleep on there is nowhere for the timeout to send the
-    /// board, and it stays awake and reachable. That is the bench setting,
-    /// and it is what an unconfigured board does.
+    /// A non-zero timeout also needs a cadence: a board leaves Idle by
+    /// deep-sleeping, and with `sleep_interval_s` at 0 there is nowhere for
+    /// the timeout to send it, so it stays awake and reachable whatever
+    /// this says.
     pub fn idle_timeout(&self) -> u32 {
-        match self.idle_timeout_s {
-            0 => ble::IDLE_TIMEOUT_DEFAULT_S,
+        self.idle_timeout_s
+    }
+
+    /// How long BLE stays up between off periods while tracking. A stored
+    /// 0 means never configured and resolves to the default, exactly as the
+    /// advertising window does and for the same reason: a zero-length on
+    /// period is a tracker nobody can connect to.
+    pub fn ble_on(&self) -> u32 {
+        match self.ble_on_s {
+            0 => ble::BLE_ON_DEFAULT_S,
             s => s,
         }
     }
@@ -192,12 +209,20 @@ impl Stored {
     /// A wake check gets the advertising window - long enough for a phone
     /// to catch it, short enough to be paid for every interval forever.
     /// Idle gets the whole idle timeout, because being reachable is the
-    /// entire point of the state. Tracking gets the advertising window
-    /// again, as the on-half of the `ble_off_s` duty cycle.
+    /// entire point of the state. Tracking gets the BLE on period, the
+    /// on-half of the `ble_off_s` duty cycle.
+    ///
+    /// A mode whose budget never bites - listening, or idle with the
+    /// timeout off - is given the advertising window to fill the field, and
+    /// [`Stored::at_expiry`] is what says the number is never acted on.
     pub fn budget_s(&self) -> u32 {
         match self.mode {
-            Mode::Stored | Mode::Tracking => self.adv_window(),
-            Mode::Idle => self.idle_timeout(),
+            Mode::Stored | Mode::Listening => self.adv_window(),
+            Mode::Tracking => self.ble_on(),
+            Mode::Idle => match self.idle_timeout() {
+                0 => self.adv_window(),
+                s => s,
+            },
         }
     }
 
@@ -219,12 +244,12 @@ impl Stored {
                 interval_s: self.sleep_cadence(),
             },
             // Idle is the passive path, and nobody asked for this one: with
-            // no cadence to sleep on the board simply keeps advertising,
-            // which is what a bench board and an unconfigured board both
-            // want.
-            Mode::Idle => match self.sleep_interval_s {
-                0 => Next::Advertise,
-                interval_s => Next::Sleep { interval_s },
+            // the timeout off, or no cadence to sleep on, the board simply
+            // keeps advertising, which is what a bench board and an
+            // unconfigured board both want.
+            Mode::Idle => match (self.idle_timeout(), self.sleep_interval_s) {
+                (0, _) | (_, 0) => Next::Advertise,
+                (_, interval_s) => Next::Sleep { interval_s },
             },
             // A tracker never deep-sleeps on a cadence - that would stop
             // the beacon, the logging and the listening, which is the whole
@@ -233,6 +258,10 @@ impl Stored {
                 0 => Next::Advertise,
                 off_s => Next::BleDown { off_s },
             },
+            // The node beside the phone exists to be connected to, so it
+            // duty-cycles nothing: the phone has to be able to come back
+            // whenever it likes.
+            Mode::Listening => Next::Advertise,
         }
     }
 
@@ -273,6 +302,7 @@ impl Stored {
             ble_off_s: self.ble_off_s,
             mode: self.mode,
             idle_timeout_s: self.idle_timeout(),
+            ble_on_s: self.ble_on(),
         }
     }
 
@@ -302,6 +332,9 @@ impl Stored {
         if let Some(s) = p.idle_timeout_s {
             self.idle_timeout_s = s;
         }
+        if let Some(s) = p.ble_on_s {
+            self.ble_on_s = s;
+        }
         *self != before
     }
 
@@ -321,6 +354,7 @@ impl Stored {
         rec[24..28].copy_from_slice(&(self.mode.persisted().as_wire() as u32).to_le_bytes());
         rec[28..32].copy_from_slice(&self.idle_timeout_s.to_le_bytes());
         rec[32..32 + ble::NAME_FIELD_LEN].copy_from_slice(&self.name);
+        rec[BLE_ON_AT..BLE_ON_AT + 4].copy_from_slice(&self.ble_on_s.to_le_bytes());
         let crc = link::crc32(&rec[0..RECORD_LEN - 4]);
         rec[RECORD_LEN - 4..RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
         rec
@@ -343,31 +377,28 @@ impl Stored {
         // defaults. Their trailing bytes are erased flash, so the crc has to
         // be checked where each version put it rather than where this one
         // does.
-        let (crc_at, adv_window_s, ble_off_s, mode, idle_timeout_s, named) = match word(4) {
-            2 => (V2_CRC_AT, 0, 0, Mode::Stored, 0, false),
-            3 => (V3_CRC_AT, word(16), 0, Mode::Stored, 0, false),
-            4 => (V4_CRC_AT, word(16), word(20), Mode::Stored, 0, false),
-            5 => (
-                V5_CRC_AT,
-                word(16),
-                word(20),
-                Mode::from_wire(word(24) as u8).unwrap_or_default(),
-                word(28),
-                false,
-            ),
-            RECORD_VERSION => (
-                RECORD_LEN - 4,
-                word(16),
-                word(20),
-                // A mode this build does not know reads as the safe one: a
-                // board that stores itself can be woken, where one that
-                // guessed at tracking would run its cell down.
-                Mode::from_wire(word(24) as u8).unwrap_or_default(),
-                word(28),
-                true,
-            ),
-            _ => return None,
-        };
+        // A mode this build does not know reads as the safe one: a board
+        // that stores itself can be woken, where one that guessed at
+        // tracking would run its cell down.
+        let mode = || Mode::from_wire(word(24) as u8).unwrap_or_default();
+        let (crc_at, adv_window_s, ble_off_s, mode, idle_timeout_s, named, ble_on_s) =
+            match word(4) {
+                2 => (V2_CRC_AT, 0, 0, Mode::Stored, 0, false, 0),
+                3 => (V3_CRC_AT, word(16), 0, Mode::Stored, 0, false, 0),
+                4 => (V4_CRC_AT, word(16), word(20), Mode::Stored, 0, false, 0),
+                5 => (V5_CRC_AT, word(16), word(20), mode(), word(28), false, 0),
+                6 => (V6_CRC_AT, word(16), word(20), mode(), word(28), true, 0),
+                RECORD_VERSION => (
+                    RECORD_LEN - 4,
+                    word(16),
+                    word(20),
+                    mode(),
+                    word(28),
+                    true,
+                    word(BLE_ON_AT),
+                ),
+                _ => return None,
+            };
         if word(crc_at) != link::crc32(&rec[0..crc_at]) {
             return None;
         }
@@ -382,6 +413,7 @@ impl Stored {
             ble_off_s,
             mode,
             idle_timeout_s,
+            ble_on_s,
             name,
         })
     }
@@ -404,14 +436,26 @@ pub const RECORD_MAGIC: u32 = 0x6D69_6441;
 /// lands in [`Mode::Idle`] whatever the record says) and then stores itself
 /// on the cadence it already had. Version 6 appended the name, and a record
 /// from before it reads as never named - a board updated in the field
-/// advertises under its address until somebody names it.
-pub const RECORD_VERSION: u32 = 6;
+/// advertises under its address until somebody names it. Version 7
+/// appended the BLE on period, which an older record reads as never
+/// configured: the default, which is what the advertising window it used
+/// to share was.
+///
+/// A version 6 record also carries an idle timeout that meant "the
+/// default" when it was 0 and means "off" now. That is the change wanted:
+/// a board updated in the field stops storing itself out of idle unless
+/// somebody had set a timeout.
+pub const RECORD_VERSION: u32 = 7;
+
+/// Where the BLE on period sits: after the name, which is where version 6
+/// ended.
+const BLE_ON_AT: usize = 32 + ble::NAME_FIELD_LEN;
 
 /// magic, version, sleep interval, flags, advertising window, BLE off
-/// period, mode, idle timeout, name, crc32. Every field is a `u32` or a
-/// multiple of one, so the length is already a multiple of the flash write
-/// word.
-pub const RECORD_LEN: usize = 36 + ble::NAME_FIELD_LEN;
+/// period, mode, idle timeout, name, BLE on period, crc32. Every field is a
+/// `u32` or a multiple of one, so the length is already a multiple of the
+/// flash write word.
+pub const RECORD_LEN: usize = BLE_ON_AT + 8;
 
 /// Where the crc sits in each older record: the length that version's
 /// layout had before it.
@@ -423,6 +467,7 @@ const V2_CRC_AT: usize = 16;
 const V3_CRC_AT: usize = 20;
 const V4_CRC_AT: usize = 24;
 const V5_CRC_AT: usize = 32;
+const V6_CRC_AT: usize = BLE_ON_AT;
 
 // ---------------------------------------------------------------------------
 // Config characteristic writes
@@ -471,10 +516,15 @@ pub enum Action {
     /// [`Action::SleepNow`] and has the same requirement: the ack must
     /// leave before the board acts, because the link does not survive it.
     SetMode(Mode),
-    /// The idle timeout is now this many seconds. Already stored and
-    /// clamped; it takes effect at the next re-arm rather than shortening
-    /// the timeout already running.
+    /// The idle timeout is now this many seconds (0 = the board never
+    /// stores itself out of idle). Already stored and clamped; it takes
+    /// effect at the next re-arm rather than shortening the timeout already
+    /// running.
     IdleTimeout(u32),
+    /// BLE now stays up this many seconds between off periods while
+    /// tracking. Already stored and clamped; takes effect at the next
+    /// window, like the advertising window.
+    BleOn(u32),
     /// The board has been renamed - or, with an empty label, un-named and
     /// back to advertising under its address. Already stored.
     ///
@@ -655,15 +705,35 @@ pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
                 let Ok(bytes) = <[u8; 4]>::try_from(value) else {
                     return Outcome::reject(id, packet::ACK_BAD_VALUE);
                 };
-                // Clamped unconditionally, like the advertising window and
-                // unlike the two intervals where 0 means off: here 0 means
-                // never configured, so storing it would be storing a
-                // timeout that reads back as the default anyway.
-                let secs = u32::from_le_bytes(bytes)
-                    .clamp(ble::IDLE_TIMEOUT_MIN_S, ble::IDLE_TIMEOUT_MAX_S);
+                // 0 means off, like the sleep interval and the off period:
+                // a board that never stores itself out of idle is the
+                // default and the safe direction.
+                let asked = u32::from_le_bytes(bytes);
+                let secs = if asked == 0 {
+                    0
+                } else {
+                    asked.clamp(ble::IDLE_TIMEOUT_MIN_S, ble::IDLE_TIMEOUT_MAX_S)
+                };
                 stored.idle_timeout_s = secs;
                 return Outcome::new(
                     Action::IdleTimeout(secs),
+                    true,
+                    id,
+                    packet::ACK_OK,
+                    &secs.to_le_bytes(),
+                );
+            }
+            ble::CFG_BLE_ON_S => {
+                let Ok(bytes) = <[u8; 4]>::try_from(value) else {
+                    return Outcome::reject(id, packet::ACK_BAD_VALUE);
+                };
+                // Clamped unconditionally, like the advertising window it
+                // was split from: a zero-length on period is a tracker
+                // nobody can connect to.
+                let secs = u32::from_le_bytes(bytes).clamp(ble::BLE_ON_MIN_S, ble::BLE_ON_MAX_S);
+                stored.ble_on_s = secs;
+                return Outcome::new(
+                    Action::BleOn(secs),
                     true,
                     id,
                     packet::ACK_OK,
@@ -753,8 +823,10 @@ pub const LINGER_S: u64 = 5;
 pub fn boot_mode(persisted: Mode, woke_from_sleep: bool) -> Mode {
     match (persisted, woke_from_sleep) {
         // Tracking survives the reset, whichever kind it was. A brownout on
-        // the object is the one time it must.
+        // the object is the one time it must. Listening likewise: the node
+        // beside the phone must not go dark on it over a reset.
         (Mode::Tracking, _) => Mode::Tracking,
+        (Mode::Listening, _) => Mode::Listening,
         // A timer wake with anything else stored is a wake check: raise
         // nothing, ask whether anyone wants the board, go back down.
         (_, true) => Mode::Stored,
@@ -919,11 +991,13 @@ mod tests {
         }
     }
 
-    /// An idle board with `interval_s` to store itself on. `0` is a board
-    /// with deep sleep off, which is where "never store this board" lives.
+    /// An idle board with a timeout set and `interval_s` to store itself
+    /// on. `0` is a board with deep sleep off, which stays idle however
+    /// long the timeout is: there is nowhere for it to send the board.
     fn idle(interval_s: u32) -> Stored {
         Stored {
             sleep_interval_s: interval_s,
+            idle_timeout_s: ble::IDLE_TIMEOUT_DEFAULT_S,
             mode: Mode::Idle,
             ..Stored::new()
         }
@@ -955,7 +1029,8 @@ mod tests {
                 adv_window_s: ble::ESP_ADV_DEFAULT_S,
                 ble_off_s: 0,
                 mode: Mode::Stored,
-                idle_timeout_s: ble::IDLE_TIMEOUT_DEFAULT_S,
+                idle_timeout_s: 0,
+                ble_on_s: ble::BLE_ON_DEFAULT_S,
             }
         );
     }
@@ -1231,6 +1306,7 @@ mod tests {
             ble_off_s: 90,
             mode: Mode::Tracking,
             idle_timeout_s: 900,
+            ble_on_s: 20,
             name: *b"sky-1\0\0\0\0\0\0\0\0\0\0\0",
         };
         let rec = s.encode_record();
@@ -1307,7 +1383,7 @@ mod tests {
         // updated board is reachable first and stores itself after.
         assert_eq!(s.mode, Mode::Stored);
         assert_eq!(s.idle_timeout_s, 0);
-        assert_eq!(s.idle_timeout(), ble::IDLE_TIMEOUT_DEFAULT_S);
+        assert_eq!(s.idle_timeout(), 0, "and it never stores itself out of idle");
         assert_eq!(boot_mode(s.mode, false), Mode::Idle);
     }
 
@@ -1335,6 +1411,36 @@ mod tests {
         // The erased bytes where the name now sits are not read as one.
         assert_eq!(s.label(), "");
         assert_eq!(s.name, [0; ble::NAME_FIELD_LEN]);
+        assert_eq!(s.ble_on_s, 0);
+    }
+
+    /// A board updated in the field keeps its name and comes back on the
+    /// default on period, which is the window it used to share.
+    #[test]
+    fn a_version_6_record_still_reads() {
+        let mut rec = [0xFFu8; RECORD_LEN]; // erased flash past the record
+        rec[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
+        rec[4..8].copy_from_slice(&6u32.to_le_bytes());
+        rec[8..12].copy_from_slice(&120u32.to_le_bytes());
+        rec[12..16].copy_from_slice(&0u32.to_le_bytes());
+        rec[16..20].copy_from_slice(&45u32.to_le_bytes());
+        rec[20..24].copy_from_slice(&30u32.to_le_bytes());
+        rec[24..28].copy_from_slice(&(Mode::Tracking.as_wire() as u32).to_le_bytes());
+        rec[28..32].copy_from_slice(&0u32.to_le_bytes());
+        let mut name = [0u8; ble::NAME_FIELD_LEN];
+        name[..5].copy_from_slice(b"sky-1");
+        rec[32..32 + ble::NAME_FIELD_LEN].copy_from_slice(&name);
+        let crc = link::crc32(&rec[0..V6_CRC_AT]);
+        rec[V6_CRC_AT..V6_CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
+
+        let s = Stored::decode_record(&rec).expect("a version 6 record still reads");
+        assert_eq!(s.label(), "sky-1");
+        assert_eq!(s.adv_window_s, 45);
+        assert_eq!(s.ble_on_s, 0);
+        assert_eq!(s.ble_on(), ble::BLE_ON_DEFAULT_S);
+        // Written back, it is a version 7 record that reads the same.
+        let again = Stored::decode_record(&s.encode_record()).expect("round trip");
+        assert_eq!(again, s);
     }
 
     // -- the name ----------------------------------------------------------
@@ -1486,7 +1592,7 @@ mod tests {
             mode: Mode::Tracking,
             ..Stored::new()
         };
-        for bad in [&[3u8][..], &[255][..], &[][..]] {
+        for bad in [&[4u8][..], &[255][..], &[][..]] {
             let o = apply(&mut s, &write(ble::CFG_MODE, bad));
             assert_eq!(o.action, Action::None);
             assert_eq!(ack_status(&o), packet::ACK_BAD_VALUE);
@@ -1494,14 +1600,13 @@ mod tests {
         }
     }
 
-    /// The idle timeout clamps like the advertising window: 0 is "never
-    /// configured" and reads back as the default, so there is no way to
-    /// store a timeout nothing could fire.
+    /// The idle timeout is off by default and 0 is how it is turned off
+    /// again; a non-zero value clamps like every other interval.
     #[test]
-    fn the_idle_timeout_clamps_and_defaults() {
+    fn the_idle_timeout_is_off_by_default_and_clamps_when_set() {
         let mut s = Stored::new();
         assert_eq!(s.idle_timeout_s, 0);
-        assert_eq!(s.idle_timeout(), ble::IDLE_TIMEOUT_DEFAULT_S);
+        assert_eq!(s.idle_timeout(), 0);
 
         let o = apply(&mut s, &u32_write(ble::CFG_IDLE_TIMEOUT_S, 900));
         assert_eq!(o.action, Action::IdleTimeout(900));
@@ -1510,14 +1615,89 @@ mod tests {
         assert_eq!(s.idle_timeout(), 900);
 
         for (asked, applied) in [
-            (0, ble::IDLE_TIMEOUT_MIN_S),
             (1, ble::IDLE_TIMEOUT_MIN_S),
             (u32::MAX, ble::IDLE_TIMEOUT_MAX_S),
+            (0, 0),
         ] {
             let o = apply(&mut s, &u32_write(ble::CFG_IDLE_TIMEOUT_S, asked));
             assert_eq!(ack_u32(&o), applied);
             assert_eq!(s.idle_timeout_s, applied);
         }
+
+        // Off means off: an idle board with a cadence to sleep on still
+        // keeps advertising however long it has been idle.
+        let idle = Stored {
+            mode: Mode::Idle,
+            sleep_interval_s: 120,
+            ..s
+        };
+        assert_eq!(idle.at_expiry(), Next::Advertise);
+        assert_eq!(
+            Window::new(0, idle.budget_s()).next(3_600_000, &idle),
+            Next::Advertise
+        );
+    }
+
+    /// The tracker's on period is its own setting, so a wake check and a
+    /// tracker can want different lengths of window.
+    #[test]
+    fn the_ble_on_period_is_separate_from_the_advertising_window() {
+        let mut s = Stored::new();
+        assert_eq!(s.ble_on_s, 0);
+        assert_eq!(s.ble_on(), ble::BLE_ON_DEFAULT_S);
+
+        apply(&mut s, &u32_write(ble::CFG_ESP_ADV_WINDOW_S, 5));
+        let o = apply(&mut s, &u32_write(ble::CFG_BLE_ON_S, 40));
+        assert_eq!(o.action, Action::BleOn(40));
+        assert!(o.save);
+        assert_eq!(ack_u32(&o), 40);
+        assert_eq!(s.adv_window(), 5);
+        assert_eq!(s.ble_on(), 40);
+        assert_eq!(s.settings(1_000).ble_on_s, 40);
+
+        for (asked, applied) in [
+            (0, ble::BLE_ON_MIN_S),
+            (u32::MAX, ble::BLE_ON_MAX_S),
+        ] {
+            let o = apply(&mut s, &u32_write(ble::CFG_BLE_ON_S, asked));
+            assert_eq!(ack_u32(&o), applied);
+        }
+
+        // The wake check budgets on the window, the tracker on the on
+        // period, and neither reads the other's.
+        s.ble_on_s = 40;
+        s.mode = Mode::Stored;
+        assert_eq!(s.budget_s(), 5);
+        s.mode = Mode::Tracking;
+        assert_eq!(s.budget_s(), 40);
+        // And the record carries it across a flat cell.
+        let back = Stored::decode_record(&s.encode_record()).expect("round trip");
+        assert_eq!(back.ble_on_s, 40);
+    }
+
+    /// Listening is the receiver half of a tracker for the node beside the
+    /// phone: it never duty-cycles, never stores itself, and comes back
+    /// listening after any reset.
+    #[test]
+    fn listening_never_expires_and_survives_a_reset() {
+        let s = Stored {
+            mode: Mode::Listening,
+            sleep_interval_s: 120,
+            ble_off_s: 30,
+            idle_timeout_s: 60,
+            ..Stored::new()
+        };
+        assert_eq!(s.at_expiry(), Next::Advertise);
+        let w = Window::new(0, s.budget_s());
+        assert_eq!(w.next(3_600_000, &s), Next::Advertise);
+        assert_eq!(boot_mode(Mode::Listening, false), Mode::Listening);
+        assert_eq!(boot_mode(Mode::Listening, true), Mode::Listening);
+        let back = Stored::decode_record(&s.encode_record()).expect("round trip");
+        assert_eq!(back.mode, Mode::Listening);
+
+        let o = apply(&mut Stored::new(), &write(ble::CFG_MODE, &[Mode::Listening.as_wire()]));
+        assert_eq!(o.action, Action::SetMode(Mode::Listening));
+        assert!(o.save);
     }
 
     /// Which duty cycle applies is a property of the mode, not a race
@@ -1542,9 +1722,11 @@ mod tests {
         assert_eq!(wake.at_expiry(), Next::Sleep { interval_s: 120 });
         assert_eq!(wake.budget_s(), wake.adv_window());
 
-        // Idle stores itself, on the same cadence but its own budget.
+        // Idle stores itself, on the same cadence but its own budget - once
+        // it has been given a timeout at all.
         let idle = Stored {
             mode: Mode::Idle,
+            idle_timeout_s: 600,
             ..both
         };
         assert_eq!(idle.at_expiry(), Next::Sleep { interval_s: 120 });
@@ -1557,7 +1739,7 @@ mod tests {
             ..both
         };
         assert_eq!(tracking.at_expiry(), Next::BleDown { off_s: 30 });
-        assert_eq!(tracking.budget_s(), tracking.adv_window());
+        assert_eq!(tracking.budget_s(), tracking.ble_on());
     }
 
     /// With no cadence there is nowhere for an idle timeout to send the

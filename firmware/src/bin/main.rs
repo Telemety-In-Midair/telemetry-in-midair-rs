@@ -562,6 +562,7 @@ async fn main(spawner: Spawner) -> ! {
             Mode::Stored => "wake check, nothing raised",
             Mode::Idle => "reachable, gps in backup (CFG_MODE tracking to track)",
             Mode::Tracking => "gps, radio and card up",
+            Mode::Listening => "gps, receiver and card up, nothing transmitted",
         }
     );
 
@@ -1516,9 +1517,11 @@ async fn hardware_task(
     let mut node = Node::new(lora, &cfg);
 
     // What this boot raises, which is the whole difference between the
-    // three flavors.
+    // flavors. Listening raises what tracking does - it is the receiver
+    // half of a tracker - and the beacon gate below is what keeps it off
+    // the air.
     match boot {
-        Mode::Tracking => {
+        Mode::Tracking | Mode::Listening => {
             node.radio_mut().init(&cfg).await;
             if !node.radio_mut().print_diagnostics() {
                 println!("radio did not answer - check the pin map in main");
@@ -1576,7 +1579,7 @@ async fn hardware_task(
     // The two manual overrides, which still mean what they always meant:
     // they park one subsystem where a mode parks all of them. Only a boot
     // that raised something can lower it again.
-    if boot == Mode::Tracking {
+    if boot.tracks() {
         if stored.gps_sleep() {
             gps.park().await;
         }
@@ -1584,7 +1587,7 @@ async fn hardware_task(
             node.radio_mut().standby();
         }
     }
-    let mut standby = boot != Mode::Tracking || stored.wio_sleep();
+    let mut standby = !boot.tracks() || stored.wio_sleep();
 
     match boot {
         Mode::Tracking => status_println!(
@@ -1595,19 +1598,24 @@ async fn hardware_task(
             cfg.spreading_factor,
             cfg.bandwidth_khz
         ),
-        Mode::Idle => match stored.sleep_interval_s {
-            // No cadence to sleep on, so the timeout has nowhere to send
-            // it: this board stays reachable until something says
-            // otherwise. The bench case, and the unconfigured one.
-            0 => status_println!("idle: gps in backup, radio asleep, no sleep cadence set"),
-            _ => status_println!(
+        Mode::Idle => match (stored.idle_timeout(), stored.sleep_interval_s) {
+            // No timeout, or no cadence to sleep on, so there is nowhere
+            // for idle to send the board: it stays reachable until
+            // something says otherwise. The default, and the bench case.
+            (0, _) => status_println!("idle: gps in backup, radio asleep, stays idle"),
+            (_, 0) => status_println!("idle: gps in backup, radio asleep, no sleep cadence set"),
+            (timeout, _) => status_println!(
                 "idle: gps in backup, radio asleep, {} s before it stores itself",
-                stored.idle_timeout()
+                timeout
             ),
         },
         Mode::Stored => status_println!(
             "wake check: nothing raised, {} s window then back down",
             stored.adv_window()
+        ),
+        Mode::Listening => status_println!(
+            "listening: node {} receiving, nothing transmitted, ble up throughout",
+            cfg.address
         ),
     }
 
@@ -1702,7 +1710,9 @@ async fn hardware_task(
                         node.reconfigure(&cfg);
                     }
                     match m {
-                        Mode::Tracking => {
+                        // Listening raises the same things: the beacon
+                        // gate is what keeps it off the air.
+                        Mode::Tracking | Mode::Listening => {
                             gps.wake().await;
                             // `wake` marks the module unconfigured: backup
                             // mode loses the RAM layer the settings live in.
@@ -1712,9 +1722,11 @@ async fn hardware_task(
                             node.radio_mut().init(&cfg).await;
                             standby = false;
                             status_println!(
-                                "tracking: node {} ({}), gps and radio up",
+                                "{}: node {} ({}), gps and radio up{}",
+                                m.as_str(),
                                 cfg.address,
-                                cfg.role.as_str()
+                                cfg.role.as_str(),
+                                if m.transmits() { "" } else { ", nothing transmitted" }
                             );
                         }
                         // Idle, or the lowering half of a store - the sleep
@@ -1968,7 +1980,11 @@ async fn hardware_task(
             } else {
                 u32::from(cfg.ping_interval_s) * 1_000
             };
+            // The mode gate is what makes listening a mode rather than a
+            // role: a listening node has the radio up and the receiver
+            // running, and this is the one place it differs from a tracker.
             let beacon_owed = cfg.role.transmits()
+                && live.transmits()
                 && interval_ms != 0
                 && now_ms >= first_beacon_at
                 && node.radio().beacon_due(last_beacon, interval_ms, now_ms)
@@ -2091,8 +2107,11 @@ async fn hardware_task(
 
             // ---- Repeat forwarding --------------------------------------------
             // Only a node configured as a repeater ever has one of these
-            // queued; a leaf-only network never enters this branch.
+            // queued; a leaf-only network never enters this branch. A
+            // listening repeater hears them and drops them: nothing goes
+            // out on the air in that mode.
             if node.repeat_due(now)
+                && live.transmits()
                 && !state::transfer_active()
                 && !node.radio().rx_in_progress(now_ms)
             {
@@ -2397,10 +2416,12 @@ async fn adopt_power(cfg: &RadioConfig, cold: bool) {
     }
     let now = settings::get();
     status_println!(
-        "config: [power] adopted - ble off {} s, adv window {} s, sleep interval {} s",
+        "config: [power] adopted - ble off {} s, ble on {} s, adv window {} s, sleep interval {} s, idle timeout {} s",
         now.ble_off_s,
+        now.ble_on(),
         now.adv_window(),
-        now.sleep_interval_s
+        now.sleep_interval_s,
+        now.idle_timeout()
     );
     // Mirrored to flash for the same reason a BLE write to any of these is:
     // they decide whether the board is reachable at all, and a board that

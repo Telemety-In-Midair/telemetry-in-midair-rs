@@ -479,6 +479,7 @@ would sit at awake current with nobody coming.
 stateDiagram-v2
     [*] --> ColdBoot
     ColdBoot --> Tracking : nvs says tracking
+    ColdBoot --> Listening : nvs says listening
     ColdBoot --> Idle : otherwise - the rescue window
 
     Stored --> WakeCheck : RTC timer
@@ -487,13 +488,15 @@ stateDiagram-v2
 
     Idle --> Connected : central accepts
     Connected --> Idle : disconnect<br/>(the whole timeout again)
-    Idle --> Park : idle timeout, nobody connected
+    Idle --> Park : idle timeout (when set),<br/>nobody connected
 
     Connected --> Tracking : CFG_MODE tracking
+    Connected --> Listening : CFG_MODE listening
+    Listening --> Connected : central accepts<br/>(receiving continues under it)
     Tracking --> Connected : central accepts<br/>(tracking continues under it)
     Connected --> Park : CFG_MODE stored / CFG_SLEEP_NOW<br/>(after the ack has left)
 
-    Tracking --> BleDown : window spent, ble_off_s set
+    Tracking --> BleDown : ble_on_s spent, ble_off_s set
     BleDown --> Tracking : ble_off_s elapses
 
     Park --> Stored : card flushed, GPS in backup,<br/>radio cold, NSS and TX pads held
@@ -513,16 +516,27 @@ stateDiagram-v2
         in backup and the radio stays down:
         reading a stored object's config
         should not cost an acquisition.
-        Transient - it always ends, by the
-        timeout or by a command.
+        Ends by a command, or by the idle
+        timeout when one has been set.
+    end note
+
+    note right of Listening
+        The node beside the phone. GPS and
+        receiver up, card logging, BLE up
+        the whole time - and nothing goes
+        out on the air. Persisted, like
+        tracking.
     end note
 ```
 
 Each duty-cycle knob belongs to exactly one mode, which is what stops them
-competing: `sleep_interval_s` is Stored's cadence, `idle_timeout_s` is how
-long Idle lasts, and `ble_off_s` is Tracking's modem cycle. Before the modes
-existed both were tested in one place, deep sleep always won, and `ble_off_s`
-was dead config on any board that had a wake-check cadence.
+competing: `sleep_interval_s` is Stored's cadence and `adv_window_s` its
+window, `idle_timeout_s` is how long Idle lasts (off by default), and
+`ble_off_s` with `ble_on_s` is Tracking's modem cycle. Listening reads none
+of them. Before the modes existed both cycles were tested in one place, deep
+sleep always won, and `ble_off_s` was dead config on any board that had a
+wake-check cadence; and until the on period had a knob of its own the
+tracker's window was the wake check's, which suited neither.
 
 `sleep_interval_s = 0` is therefore also "never store this board *on its
 own*": with no cadence to sleep on the idle timeout has nowhere to send it,
@@ -593,7 +607,7 @@ plausible session rather than a recorded one.
 
 ### Tracking: the awake duty cycle
 
-`mode = tracking`, `adv_window_s = 15`, `ble_off_s = 30`. The modem goes
+`mode = tracking`, `ble_on_s = 15`, `ble_off_s = 30`. The modem goes
 down; the tracker does not. `sleep_interval_s` is ignored here whatever it
 is set to - a tracker that deep-sleeps is not tracking.
 
@@ -824,8 +838,9 @@ one board, one supply, one USB FIFO:
 | **Advertise** | boot, or a spent BLE-down period | yes | beacon + RX in tracking, else down | per mode | per mode | yes | a central connects, the budget expires, or `SLEEP_NOW` | ~90-130 mA |
 | **Connected** | a central accepts | in session | as above | per mode | per mode | yes | disconnect, `CFG_MODE stored` or `CFG_SLEEP_NOW` | ~90-130 mA |
 | **Linger** | disconnect while tracking | yes | beacon + RX | tracking | yes | yes | 5 s, or the phone returns | ~126-130 mA |
-| **Idle** | a cold boot, or a wake-check promotion | yes | cold sleep | backup | mounted, idle | yes | `idle_timeout_s`, or `CFG_MODE tracking` | ~90 mA (unmeasured) |
-| **BLE down** | window spent while tracking with `ble_off_s` set | **no** | beacon + RX | tracking | yes | yes | `ble_off_s` elapses, or USB `SLEEP` | **60 mA** |
+| **Idle** | a cold boot, or a wake-check promotion | yes | cold sleep | backup | mounted, idle | yes | `idle_timeout_s` when set, or a mode command | ~90 mA (unmeasured) |
+| **Listening** | `CFG_MODE listening`, or a boot with nvs `listening` | yes | RX only, never keys up | tracking | mounted, logging | yes | a mode command | ~126 mA less the PA (unmeasured) |
+| **BLE down** | `ble_on_s` spent while tracking with `ble_off_s` set | **no** | beacon + RX | tracking | yes | yes | `ble_off_s` elapses, or USB `SLEEP` | **60 mA** |
 | **Park** | any path into deep sleep | no | going to cold sleep | going to backup | **flushed and unmounted** | yes | everything parked, or the TX budget expires | ~126 mA |
 | **Deep sleep** | a spent budget in stored/idle, or a commanded sleep | no | cold sleep, NSS held | backup, TX pad held | unmounted | **no** | the timer fires - a full reset | **unmeasured** |
 

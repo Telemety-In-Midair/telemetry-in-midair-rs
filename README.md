@@ -447,12 +447,13 @@ Config command ids (config characteristic, `[id, len, value]`):
 | `0x11` | u8 0/1 | radio to standby / back to receive |
 | `0x12` | u8 0/1 | GPS backup mode (UBX-RXM-PMREQ / UART wake) |
 | `0x13` | u32 s | deep-sleep wake-check interval, 5 s..5 min, 0 = off (the default) |
-| `0x14` | u32 s | advertising window per wake check, 1 s..60 s (default 15 s) |
+| `0x14` | u32 s | advertising window per wake check, 1 s..60 s (default 15 s). Stored's alone |
 | `0x15` | u32 s | deep sleep **now** for this long, 5 s..5 min; 0 = use `0x13`. A command, not a setting |
 | `0x16` | u32 s | BLE controller down between windows while tracking, 5 s..5 min, 0 = off |
-| `0x17` | u8 | mode: 0 stored, 1 idle, 2 tracking. The one an app actually means |
-| `0x18` | u32 s | how long idle lasts before the board stores itself, 10 s..1 h (default 10 min) |
+| `0x17` | u8 | mode: 0 stored, 1 idle, 2 tracking, 3 listening. The one an app actually means |
+| `0x18` | u32 s | how long idle lasts before the board stores itself, 10 s..1 h, 0 = never (the default) |
 | `0x19` | ASCII | board name label, up to 15 bytes; empty clears it |
+| `0x1A` | u32 s | BLE up between off periods while tracking, 1 s..60 s (default 15 s). Tracking's alone |
 
 ### Board names
 
@@ -569,19 +570,21 @@ for the whole sleep.
 
 ### Modes
 
-The board is in one of three, and `0x17` is how it moves between them.
+The board is in one of four, and `0x17` is how it moves between them.
 
 | Mode | What is up | Its knob | Persisted |
 |-|-|-|-|
 | **stored** | nothing, bar a wake check on a cadence: chip asleep, GPS in backup, radio in cold sleep, card unmounted, panel dark | `0x13` cadence, `0x14` window | yes |
-| **idle** | BLE only - connectable, but the GPS stays in backup and the radio stays down | `0x18` timeout | no, deliberately |
-| **tracking** | everything: GPS acquiring, beacons out, receiver listening, card logging | `0x16` modem duty cycle | yes |
+| **idle** | BLE only - connectable, but the GPS stays in backup and the radio stays down | `0x18` timeout, off by default | no, deliberately |
+| **tracking** | everything: GPS acquiring, beacons out, receiver listening, card logging | `0x16` modem off, `0x1A` modem on | yes |
+| **listening** | the node beside the phone: GPS acquiring, receiver listening, card logging, BLE up throughout - and nothing transmitted | none | yes |
 
-A cold boot lands in **idle** unless nvs says tracking. That is the rescue
-window: a board recovered from a flat cell, or one just flashed, is
-reachable for `0x18` before it stores itself, and only an explicit stored
-`tracking` puts a board back on the air by itself. Tracking is the mode that
-survives a brownout on the object, which is the one time it must.
+A cold boot lands in **idle** unless nvs says tracking or listening. That is
+the rescue window: a board recovered from a flat cell, or one just flashed,
+is reachable - and stays reachable, unless `0x18` has been set - and only an
+explicit stored `tracking` puts a board back on the air by itself. Tracking
+and listening are the modes that survive a brownout on the object, which is
+the one time they must.
 
 Idle never reaches flash - a board that came back from a reset still
 believing it was idle would sit at awake current with nobody coming - so
@@ -591,20 +594,25 @@ it says stored.
 **A connect during a wake check is a doorbell, not a leash.** The connect
 *attempt* promotes the board to idle with the timeout armed, so the app can
 take its time instead of having to catch the window, connect, and hold on.
-A misfire costs one idle timeout of awake current.
+A misfire costs one idle timeout of awake current - or, with the timeout
+off, a board that stays idle until it is told to store itself again.
 
 Each duty-cycle knob belongs to exactly one mode, which is what stops them
 competing: before the modes existed, `0x16` was dead config on any board
 that had a wake-check cadence, because deep sleep was tested first and
-always won.
+always won. The tracker's on period (`0x1A`) and the wake check's window
+(`0x14`) were one number until they were separated: a wake check wants the
+shortest window a phone can still catch, a tracker one long enough to
+connect, read the roster and let go.
 
 ### Low power
 
 Sleep is off by default (`0x13` = 0), which is what an unconfigured board
-does: land in idle at boot and stay there, advertising continuously. With no
-cadence to sleep on, the idle timeout has nowhere to send the board - so
-`0x13 = 0` is also "never store this board *on its own*", and it is the
-bench setting. Being told `0x17 = 0` still stores it: somebody asked for
+does: land in idle at boot and stay there, advertising continuously. So is
+the idle timeout (`0x18` = 0), and storing out of idle needs both: with no
+timeout nothing fires, and with no cadence to sleep on the timeout has
+nowhere to send the board. `0x13 = 0` is therefore also "never store this
+board *on its own*", and it is the bench setting. Being told `0x17 = 0` still stores it: somebody asked for
 that one, so it borrows the 5 min ceiling rather than reading the missing
 cadence as a refusal.
 Two board facts shape everything below - there is no rail to cut, and what

@@ -244,6 +244,15 @@ pub enum Mode {
     /// no battery sense on this board, and a timeout that silently stopped
     /// tracking a flying object would be worse than a flat cell.
     Tracking,
+    /// Listening: the node held next to the phone. GPS acquiring and the
+    /// receiver up, so everything heard over LoRa is relayed and the phone
+    /// can use this node's fix as its own - but nothing goes out on the
+    /// air, and BLE stays up continuously so the phone connects at once.
+    ///
+    /// Entered and left by command, like tracking, and persisted the same
+    /// way: a node that browns out in a pocket should come back listening,
+    /// not go dark on the phone that was using it.
+    Listening,
 }
 
 impl Mode {
@@ -254,6 +263,7 @@ impl Mode {
             0 => Some(Self::Stored),
             1 => Some(Self::Idle),
             2 => Some(Self::Tracking),
+            3 => Some(Self::Listening),
             _ => None,
         }
     }
@@ -263,6 +273,7 @@ impl Mode {
             Self::Stored => 0,
             Self::Idle => 1,
             Self::Tracking => 2,
+            Self::Listening => 3,
         }
     }
 
@@ -271,14 +282,16 @@ impl Mode {
             Self::Stored => "stored",
             Self::Idle => "idle",
             Self::Tracking => "tracking",
+            Self::Listening => "listening",
         }
     }
 
     /// What this mode becomes on its way to flash.
     ///
-    /// Only two modes are worth surviving a power cycle: a board that was
-    /// tracking must come back tracking, and everything else must come back
-    /// reachable and then store itself. Idle is neither - it is "awake
+    /// Only the commanded working modes are worth surviving a power cycle:
+    /// a board that was tracking must come back tracking, one that was
+    /// listening beside a phone must come back listening, and everything
+    /// else must come back reachable. Idle is neither - it is "awake
     /// because someone might want me", and a reboot is exactly the moment
     /// nobody does - so it persists as [`Mode::Stored`] and the cold-boot
     /// rescue window brings it back to Idle anyway.
@@ -291,20 +304,27 @@ impl Mode {
 
     /// Whether the GPS, the radio and the card come up with the board.
     pub fn tracks(self) -> bool {
+        matches!(self, Self::Tracking | Self::Listening)
+    }
+
+    /// Whether the node puts anything on the air: beacons, pings and
+    /// repeats. Listening is the mode that raises the radio and still says
+    /// no here.
+    pub fn transmits(self) -> bool {
         matches!(self, Self::Tracking)
     }
 }
 
 /// Wire length of [`Settings`].
-pub const SETTINGS_LEN: usize = 24;
+pub const SETTINGS_LEN: usize = 28;
 /// Layout version in byte 0, so an app meeting a newer firmware can
 /// reject the blob rather than misread it.
 ///
 /// Version 2 dropped the separate stow interval: one wake-check interval
 /// now covers every sleep the board does. Version 3 appended the
-/// advertising window, version 4 the BLE off period, and version 5 the
-/// [`Mode`] and its idle timeout.
-pub const SETTINGS_VERSION: u8 = 5;
+/// advertising window, version 4 the BLE off period, version 5 the
+/// [`Mode`] and its idle timeout, and version 6 the BLE on period.
+pub const SETTINGS_VERSION: u8 = 6;
 
 pub const SFLAG_PWR_EN: u8 = 1 << 0;
 pub const SFLAG_WIO_SLEEP: u8 = 1 << 1;
@@ -337,8 +357,11 @@ pub struct Settings {
     /// is not a state a reboot may come back into.
     pub mode: Mode,
     /// Seconds [`Mode::Idle`] lasts before the board stores itself
-    /// ([`CFG_IDLE_TIMEOUT_S`]). Always the effective value, never 0.
+    /// ([`CFG_IDLE_TIMEOUT_S`]), 0 = it never does.
     pub idle_timeout_s: u32,
+    /// Seconds BLE stays up between off periods while tracking
+    /// ([`CFG_BLE_ON_S`]). Always the effective value, never 0.
+    pub ble_on_s: u32,
 }
 
 impl Settings {
@@ -365,6 +388,7 @@ impl Settings {
         b[12..16].copy_from_slice(&self.adv_window_s.to_le_bytes());
         b[16..20].copy_from_slice(&self.ble_off_s.to_le_bytes());
         b[20..24].copy_from_slice(&self.idle_timeout_s.to_le_bytes());
+        b[24..28].copy_from_slice(&self.ble_on_s.to_le_bytes());
         b
     }
 
@@ -388,6 +412,7 @@ impl Settings {
             // blob, which would take every other field with it.
             mode: Mode::from_wire(b[2]).unwrap_or_default(),
             idle_timeout_s: word(20),
+            ble_on_s: word(24),
         })
     }
 }
@@ -442,11 +467,17 @@ pub const ESP_SLEEP_MAX_S: u32 = 5 * 60;
 /// going back to deep sleep. Only meaningful while [`CFG_ESP_SLEEP_S`] is
 /// set; a board that never sleeps advertises continuously regardless.
 ///
-/// This is the knob that sets the duty cycle, and so the average current:
-/// advertising costs roughly two orders of magnitude more than deep sleep,
-/// so at a fixed interval the window is what the draw is proportional to.
-/// Shortening it buys battery life directly, at the cost of asking more of
-/// whoever is trying to connect - the window has to overlap a phone's scan.
+/// A [`Mode::Stored`] knob and nothing else's: the on-half of a tracker's
+/// modem duty cycle is [`CFG_BLE_ON_S`], which used to share this value
+/// and no longer does - a wake check and a tracker want different lengths
+/// of window, and one number was always wrong for one of them.
+///
+/// This is the knob that sets the stored duty cycle, and so the average
+/// current: advertising costs roughly two orders of magnitude more than
+/// deep sleep, so at a fixed interval the window is what the draw is
+/// proportional to. Shortening it buys battery life directly, at the cost
+/// of asking more of whoever is trying to connect - the window has to
+/// overlap a phone's scan.
 pub const CFG_ESP_ADV_WINDOW_S: u8 = 0x14;
 
 /// Clamp range and default for [`CFG_ESP_ADV_WINDOW_S`].
@@ -527,7 +558,7 @@ pub const BLE_OFF_MAX_S: u32 = 5 * 60;
 /// disconnect is the command working, not a failure.
 pub const CFG_SLEEP_NOW: u8 = 0x15;
 
-/// `u8`: the board's [`Mode`] - 0 stored, 1 idle, 2 tracking.
+/// `u8`: the board's [`Mode`] - 0 stored, 1 idle, 2 tracking, 3 listening.
 ///
 /// The write an app makes when it means "this is a tracker now" or "this is
 /// going in a bag". Each value is a whole posture rather than one
@@ -541,27 +572,31 @@ pub const CFG_SLEEP_NOW: u8 = 0x15;
 /// - **0, stored.** The board acks and then deep-sleeps on its wake-check
 ///   cadence, exactly as [`CFG_SLEEP_NOW`] does. The link drops; that
 ///   disconnect is the command working.
+/// - **3, listening.** GPS up and the receiver up, nothing transmitted,
+///   BLE up continuously. The node held next to the phone. Persisted.
 ///
-/// A value outside 0..=2 is rejected rather than rounded, because every one
+/// A value outside 0..=3 is rejected rather than rounded, because every one
 /// of them is a different amount of the board switched off.
 pub const CFG_MODE: u8 = 0x17;
 
 /// `u32` seconds: how long [`Mode::Idle`] lasts before the board stores
-/// itself. 0 means never configured and resolves to
-/// [`IDLE_TIMEOUT_DEFAULT_S`].
+/// itself. 0 turns that off, and 0 is the default: an idle board stays
+/// idle until something tells it otherwise.
 ///
 /// Idle is the expensive state - BLE dominates it at around 90 mA, a figure
 /// from before the vendored esp-radio learned the controller's modem sleep
-/// and not re-taken since - and this timeout is the whole reason it is
-/// affordable: minutes of it, not days.
+/// and not re-taken since - so a board left idle by accident runs its cell
+/// down. The timeout is the guard against that, for whoever wants one; it
+/// is off by default because a board that stored itself while its owner
+/// was still setting it up was the more common surprise.
 ///
-/// There is no "never" value here, and it would be redundant if there were:
-/// a board leaves Idle by deep-sleeping, so [`CFG_ESP_SLEEP_S`] at 0
-/// already means "stay awake and reachable indefinitely". That is the bench
-/// setting, and it is what an unconfigured board does.
+/// Storing needs a cadence to wake on as well: with [`CFG_ESP_SLEEP_S`] at
+/// 0 there is nowhere for the timeout to send the board, and it stays
+/// awake and reachable whatever this says.
 pub const CFG_IDLE_TIMEOUT_S: u8 = 0x18;
 
-/// Clamp range and default for [`CFG_IDLE_TIMEOUT_S`].
+/// Clamp range for a non-zero [`CFG_IDLE_TIMEOUT_S`], and the value an app
+/// offers when the timeout is switched on.
 ///
 /// The floor is short enough to watch a whole promote/timeout/store cycle
 /// go by on a bench and long enough that a phone which has just woken the
@@ -571,6 +606,23 @@ pub const CFG_IDLE_TIMEOUT_S: u8 = 0x18;
 pub const IDLE_TIMEOUT_MIN_S: u32 = 10;
 pub const IDLE_TIMEOUT_MAX_S: u32 = 60 * 60;
 pub const IDLE_TIMEOUT_DEFAULT_S: u32 = 10 * 60;
+
+/// `u32` seconds: how long BLE stays up between off periods while
+/// tracking - the on-half of the [`CFG_BLE_OFF_S`] duty cycle. 0 means
+/// never configured and resolves to [`BLE_ON_DEFAULT_S`].
+///
+/// A [`Mode::Tracking`] knob and nothing else's. It was the advertising
+/// window until the two were separated: a wake check wants the shortest
+/// window a phone can still catch, and a tracker wants one long enough for
+/// the phone to connect, read the roster and let go, and no single number
+/// served both.
+pub const CFG_BLE_ON_S: u8 = 0x1A;
+
+/// Clamp range and default for [`CFG_BLE_ON_S`], the same bounds as the
+/// advertising window and for the same reasons.
+pub const BLE_ON_MIN_S: u32 = 1;
+pub const BLE_ON_MAX_S: u32 = 60;
+pub const BLE_ON_DEFAULT_S: u32 = 15;
 
 /// ASCII label up to [`NAME_LABEL_MAX`] bytes: what this board is called.
 ///
@@ -732,6 +784,7 @@ mod tests {
             ble_off_s: 60,
             mode: super::Mode::Tracking,
             idle_timeout_s: 600,
+            ble_on_s: 20,
         };
         let bytes = s.encode();
         assert_eq!(bytes.len(), super::SETTINGS_LEN);
@@ -757,7 +810,12 @@ mod tests {
     /// that used to be padding - so nothing else moved.
     #[test]
     fn settings_carry_the_mode() {
-        for mode in [super::Mode::Stored, super::Mode::Idle, super::Mode::Tracking] {
+        for mode in [
+            super::Mode::Stored,
+            super::Mode::Idle,
+            super::Mode::Tracking,
+            super::Mode::Listening,
+        ] {
             let s = super::Settings {
                 mode,
                 ..Default::default()
@@ -776,20 +834,41 @@ mod tests {
         assert_eq!(super::Mode::Stored.as_wire(), 0);
         assert_eq!(super::Mode::Idle.as_wire(), 1);
         assert_eq!(super::Mode::Tracking.as_wire(), 2);
-        for m in [super::Mode::Stored, super::Mode::Idle, super::Mode::Tracking] {
+        assert_eq!(super::Mode::Listening.as_wire(), 3);
+        for m in [
+            super::Mode::Stored,
+            super::Mode::Idle,
+            super::Mode::Tracking,
+            super::Mode::Listening,
+        ] {
             assert_eq!(super::Mode::from_wire(m.as_wire()), Some(m));
         }
-        assert_eq!(super::Mode::from_wire(3), None);
+        assert_eq!(super::Mode::from_wire(4), None);
         assert_eq!(super::Mode::default(), super::Mode::Stored);
     }
 
     /// Idle never reaches flash: a board that came back from a reset still
     /// believing it was idle would sit at awake current with nobody coming.
+    /// The two commanded working modes do, so a brownout costs neither.
     #[test]
     fn idle_persists_as_stored() {
         assert_eq!(super::Mode::Idle.persisted(), super::Mode::Stored);
         assert_eq!(super::Mode::Stored.persisted(), super::Mode::Stored);
         assert_eq!(super::Mode::Tracking.persisted(), super::Mode::Tracking);
+        assert_eq!(super::Mode::Listening.persisted(), super::Mode::Listening);
+    }
+
+    /// Listening raises what tracking raises and keys nothing up: it is
+    /// the receiver half of a tracker, for the node beside the phone.
+    #[test]
+    fn listening_raises_the_radio_but_never_transmits() {
+        assert!(super::Mode::Tracking.tracks());
+        assert!(super::Mode::Listening.tracks());
+        assert!(!super::Mode::Idle.tracks());
+        assert!(!super::Mode::Stored.tracks());
+        assert!(super::Mode::Tracking.transmits());
+        assert!(!super::Mode::Listening.transmits());
+        assert!(!super::Mode::Idle.transmits());
     }
 
     /// A named board is its label, an unnamed one is its address - and

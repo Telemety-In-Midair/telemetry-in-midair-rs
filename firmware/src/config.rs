@@ -52,6 +52,11 @@ pub async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
         Action::AdvWindow(secs) => {
             qprintln!("config: advertising window {} s", secs);
         }
+        // Like the window: sampled when a window starts, so this one lands
+        // at the next.
+        Action::BleOn(secs) => {
+            qprintln!("config: BLE up {} s between off periods", secs);
+        }
         // Read by the duty-cycle loop in `main` at the end of the current
         // window, so a central that sets this keeps the connection it set
         // it over.
@@ -79,9 +84,10 @@ pub async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
                 status_println!("mode: {}", other.as_str());
             }
         },
-        Action::IdleTimeout(secs) => {
-            qprintln!("config: idle timeout {} s", secs);
-        }
+        Action::IdleTimeout(secs) => match secs {
+            0 => qprintln!("config: idle never stores itself"),
+            s => qprintln!("config: idle timeout {} s", s),
+        },
         // Nothing to drive: the serve loop rebuilds the scan response from
         // the stored name before every advertisement, so the new name goes
         // out with the next window - the one on the air now was handed to

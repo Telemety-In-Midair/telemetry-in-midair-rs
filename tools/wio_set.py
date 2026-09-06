@@ -4,20 +4,23 @@
     pixi run wio-set mode tracking   # gps up, beacons out, card logging
     pixi run wio-set mode idle       # reachable, gps in backup, radio down
     pixi run wio-set mode stored     # ack, then deep sleep on the cadence
+    pixi run wio-set mode listening  # gps and receiver up, nothing sent, ble up
     pixi run wio-set ble-off 30      # BLE modem down 30 s between windows
     pixi run wio-set ble-off 0       # never take it down (the default)
-    pixi run wio-set adv-window 10
+    pixi run wio-set ble-on 20       # BLE up 20 s between those, while tracking
+    pixi run wio-set adv-window 10   # each wake check advertises 10 s
     pixi run wio-set sleep 60
     pixi run wio-set idle-timeout 600
+    pixi run wio-set idle-timeout 0  # idle never stores itself (the default)
     pixi run wio-set gps-sleep 1
     pixi run wio-set name sky-1      # advertises as ws3gps-sky-1
     pixi run wio-set name ""         # back to the address-derived name
 
 `mode` is the one that means something on its own; the rest are knobs it
-scopes. Tracking is the only mode that survives a power cycle, so a board
-put down in it comes back tracking - which is the point, since a brownout on
-the object is exactly when it must. Everything else comes back reachable for
-one idle timeout and then stores itself.
+scopes. Tracking and listening survive a power cycle, so a board put down in
+either comes back in it - which is the point, since a brownout on the object
+is exactly when it must. Everything else comes back reachable, and stays so
+unless an idle timeout has been set.
 
 `mode stored` drops the USB port, exactly as `wio-sleep` does. That is the
 command working.
@@ -57,6 +60,7 @@ SETTINGS = {
     "mode": (0x17, 1),
     "idle-timeout": (0x18, 4),
     "name": (0x19, 0),
+    "ble-on": (0x1A, 4),
 }
 
 # `midair_proto::ble::NAME_LABEL_MAX` and the charset `valid_label` takes.
@@ -71,7 +75,7 @@ NAME_PREFIX = "ws3gps"
 # The wire values of `midair_proto::ble::Mode`. Named rather than numbered
 # on the command line because "2" is not a thing anyone should have to
 # remember about their tracker.
-MODES = {"stored": 0, "idle": 1, "tracking": 2}
+MODES = {"stored": 0, "idle": 1, "tracking": 2, "listening": 3}
 
 
 def main() -> int:

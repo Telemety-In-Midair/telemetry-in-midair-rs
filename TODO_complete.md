@@ -73,6 +73,23 @@ edge cannot wake the receiver out of it. Wake checks no longer run
 `wio-set mode` and `wio-set idle-timeout` on the USB console; `idle_timeout_s`
 in the card's `[power]` section.
 
+## Listening, the tracker's own on period, and idle that stays idle
+
+A fourth mode, `listening` (`CFG_MODE` = 3): the node held beside the
+phone. GPS acquiring and the receiver up, so everything heard is relayed and
+the phone can take this node's fix as its own; nothing transmitted - the
+beacon, the ping and the repeater path are all gated on `Mode::transmits`;
+BLE up throughout, so the phone connects at once. Persisted like tracking.
+
+The tracker's modem on period is its own setting, `ble_on_s` (`0x1A`,
+record version 7, settings blob version 6). It was the advertising window,
+and a wake check and a tracker never wanted the same window.
+
+The idle timeout is off by default: `0x18 = 0` means an idle board stays
+idle until told otherwise, rather than storing itself ten minutes after a
+connect. A version 6 record's 0 now reads as off, which is the change
+wanted.
+
 ## Board names
 
 Boards advertise as `ws3gps-<label>`, set by config id `0x19` over BLE or

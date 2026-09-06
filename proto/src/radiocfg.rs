@@ -357,9 +357,12 @@ pub struct PowerConfig {
     /// `Mode::Stored` runs on; 0 never deep-sleeps, which also means the
     /// board never stores itself and stays reachable.
     pub sleep_interval_s: Option<u32>,
-    /// Seconds `Mode::Idle` lasts before the board stores itself; 0 means
-    /// the firmware default.
+    /// Seconds `Mode::Idle` lasts before the board stores itself; 0 turns
+    /// that off, which is the default.
     pub idle_timeout_s: Option<u32>,
+    /// Seconds BLE stays up between off periods while tracking; 0 means
+    /// the firmware default.
+    pub ble_on_s: Option<u32>,
 }
 
 /// Parsed and validated radio configuration.
@@ -1180,11 +1183,20 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                 }
                 cfg.power.sleep_interval_s = Some(v as u32);
             }
+            "ble_on_s" => {
+                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
+                // 0 means "the firmware default", as with the advertising
+                // window it was split from.
+                if v != 0 && !(ble::BLE_ON_MIN_S as u64..=ble::BLE_ON_MAX_S as u64).contains(&v) {
+                    return Err(ConfigError::OutOfRange(lineno));
+                }
+                cfg.power.ble_on_s = Some(v as u32);
+            }
             "idle_timeout_s" => {
                 let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                // 0 is legal and means "the firmware default", as with the
-                // advertising window: there is no "never" here, because a
-                // `sleep_interval_s` of 0 already is one.
+                // 0 is legal and means "off": the board never stores
+                // itself out of idle, which is also what an absent key
+                // leaves a fresh board doing.
                 if v != 0
                     && !(ble::IDLE_TIMEOUT_MIN_S as u64..=ble::IDLE_TIMEOUT_MAX_S as u64)
                         .contains(&v)
@@ -1953,13 +1965,14 @@ mod tests {
     #[test]
     fn power_values_parse_and_range_check() {
         let cfg = parse(
-            "[power]\nble_off_s = 30\nadv_window_s = 10\nsleep_interval_s = 120\nidle_timeout_s = 900",
+            "[power]\nble_off_s = 30\nadv_window_s = 10\nsleep_interval_s = 120\nidle_timeout_s = 900\nble_on_s = 20",
         )
         .unwrap();
         assert_eq!(cfg.power.ble_off_s, Some(30));
         assert_eq!(cfg.power.adv_window_s, Some(10));
         assert_eq!(cfg.power.sleep_interval_s, Some(120));
         assert_eq!(cfg.power.idle_timeout_s, Some(900));
+        assert_eq!(cfg.power.ble_on_s, Some(20));
 
         // Below the floor but not zero, and above the ceiling, on each key.
         for bad in [
@@ -1970,6 +1983,7 @@ mod tests {
             "sleep_interval_s = 301",
             "idle_timeout_s = 9",
             "idle_timeout_s = 3601",
+            "ble_on_s = 61",
         ] {
             assert_eq!(
                 parse(bad),

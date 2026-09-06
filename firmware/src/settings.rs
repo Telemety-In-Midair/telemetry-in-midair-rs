@@ -40,6 +40,8 @@ static BLE_OFF: AtomicU32 = AtomicU32::new(0);
 static MODE: AtomicU32 = AtomicU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static IDLE_TIMEOUT: AtomicU32 = AtomicU32::new(0);
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static BLE_ON: AtomicU32 = AtomicU32::new(0);
 /// The board's name, zero-padded, a byte per cell.
 ///
 /// Kept here for the reason the advertising window is: a wake check
@@ -80,6 +82,7 @@ pub fn get() -> Stored {
             // safe reading of it is the mode a board can be woken out of.
             mode: Mode::from_wire(MODE.load(Ordering::Relaxed) as u8).unwrap_or_default(),
             idle_timeout_s: IDLE_TIMEOUT.load(Ordering::Relaxed),
+            ble_on_s: BLE_ON.load(Ordering::Relaxed),
             name: core::array::from_fn(|i| NAME[i].load(Ordering::Relaxed)),
         }
     } else {
@@ -107,6 +110,7 @@ pub fn set(s: Stored) {
     BLE_OFF.store(s.ble_off_s, Ordering::Relaxed);
     MODE.store(u32::from(s.mode.as_wire()), Ordering::Relaxed);
     IDLE_TIMEOUT.store(s.idle_timeout_s, Ordering::Relaxed);
+    BLE_ON.store(s.ble_on_s, Ordering::Relaxed);
     for (cell, b) in NAME.iter().zip(s.name) {
         cell.store(b, Ordering::Relaxed);
     }
