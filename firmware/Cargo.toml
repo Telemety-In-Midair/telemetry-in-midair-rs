@@ -9,7 +9,15 @@ name = "wio-s3-gps"
 path = "./src/bin/main.rs"
 
 [features]
-default = []
+default = ["dual-core"]
+
+# Run the hardware loop - radio, GPS, card, panel - on the S3's second
+# core, with the BLE host, the USB console and the GPS byte pump on the
+# first. The loop's blocking work (a card flush, a receive poll's SPI, a
+# UART flush) then never holds the BLE host, and the host's work never
+# delays the loop's 10 ms pass. Turn it off to run everything on one core,
+# as the firmware did before the feature existed.
+dual-core = []
 
 # Power isolation builds. Each one removes a load so that its contribution
 # to the board's current can be had by subtraction rather than estimated;

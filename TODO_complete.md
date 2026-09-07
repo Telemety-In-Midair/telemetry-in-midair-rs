@@ -113,3 +113,32 @@ backup from it. The record is `midair_proto::cfgstore`, host-tested: a length
 and a crc in front of the config text, so an interrupted write reads as
 nothing stored rather than as a config half of which is the previous one. This restores what the two-MCU board kept in
 the WIO-E5's flash page 122 and the S3 port had dropped.
+
+## The radio audit (2026-09-07)
+
+A full read of the hop, receive, GPS and BLE paths, rebuilt in a
+discrete-event simulator (`tools/radio_sim.py`, self-tested against
+`proto`'s hop clock) and written up in `docs/RADIO-AUDIT.md`. The clock
+message suspected of colliding with beacons does not exist - the sync word
+rides inside every frame - and the causes were elsewhere:
+
+- Nodes now take turns inside a slot by address (two at the default
+  modulation), and the slot of a multi-slot interval by address too, so
+  `2 x interval_s` consecutive addresses never overlap; the firmware warns
+  when it hears a node in its own turn, and the app's Radio page shows the
+  capacity.
+- The BLE position notifier waits out a transmit instead of skipping its
+  tick, which was dropping 23% of updates at a 1 s beacon.
+- GPS bytes go through an async pump task into a pipe, so a transmit or a
+  card flush no longer overflows the 128-byte UART FIFO.
+- A late pass no longer disciplines a set clock; the sync word is stamped
+  for the RF start; listening nodes keep the TCXO running between modes; a
+  preamble with no header behind it holds the receiver for the header time
+  rather than a whole frame; a beacon whose window passed is re-planned
+  rather than waited for.
+- The hardware loop runs on the S3's second core with its own executor
+  (`dual-core`, default on).
+
+Two-node delivery in the model went from 76% to 99.6-100% with zero
+overlaps, GPS sentence loss from 11% to 0%, and phone position updates
+from 208 to 300 per 300 s.

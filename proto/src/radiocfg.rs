@@ -725,6 +725,25 @@ impl RadioConfig {
     pub fn ping_airtime_us(&self) -> u32 {
         self.time_on_air_us(self.frame_overhead() + crate::lora::PING_MSG_LEN)
     }
+
+    /// Time-on-air of the lean beacon - header, sync word and position only
+    /// - in microseconds: the unit a hop slot is cut into turns by. Taken
+    /// from the modulation alone rather than from this node's own
+    /// [`beacon_fields`](Self::beacon_fields), so every node on a network
+    /// cuts the slot the same way whatever each of them chooses to send.
+    pub fn hop_unit_airtime_us(&self) -> u32 {
+        self.time_on_air_us(
+            self.frame_overhead() + crate::lora::position_msg_len(crate::lora::FIELDS_DEFAULT),
+        )
+    }
+
+    /// Time a receiver needs from the start of a preamble to the end of the
+    /// explicit header, in microseconds: the preamble plus the eight
+    /// symbols the header occupies. A preamble detection that has not
+    /// become a valid header by then was noise.
+    pub fn header_time_us(&self) -> u32 {
+        self.time_on_air_us(0)
+    }
 }
 
 /// Ceiling on [`RadioConfig::hop_dwell_ms`]. Past ten seconds a slot is no

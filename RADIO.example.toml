@@ -49,7 +49,7 @@ hop_step_khz = 500
 hop_step_khz_description = "Spacing between hop channels in kHz, 25-5000. At least the bandwidth, or adjacent channels overlap. 500 kHz for 50 channels spans 902.75-927.25 MHz around the 915 MHz center."
 
 hop_dwell_ms = 1000
-hop_dwell_ms_description = "How long every node stays on each channel, 100-10000 ms. One transmission per node per slot, which has to fit the slot with a 100 ms guard at each end, so at 1000 ms a beacon may be up to 800 ms on air. The band caps one visit at 400 ms; the default beacon is 289 ms."
+hop_dwell_ms_description = "How long every node stays on each channel, 100-10000 ms. One transmission per node per slot, which has to fit the slot with a 100 ms guard at each end, so at 1000 ms a beacon may be up to 800 ms on air. The band caps one visit at 400 ms; the default beacon is 289 ms. The 800 ms window is cut into as many default beacons as fit - two - and nodes take those turns by address, so two nodes may beacon every second without overlapping."
 
 spreading_factor = 12
 spreading_factor_description = "LoRa spreading factor, 5-12. Higher gives longer range at a lower data rate."
@@ -99,7 +99,7 @@ rx_boost_description = "Boosted receiver gain: roughly +2 dB of sensitivity for 
 # deployment where the reporting only ever runs one way.
 [network]
 address = 1
-address_description = "This node's address, 1-255. Must be unique among the nodes that transmit: two senders sharing an address are mutually deaf, each dropping the other's broadcasts as an echo of its own, so neither ever sees the other. An rx_only node never puts its address on the air, so it can keep the default."
+address_description = "This node's address, 1-255. Must be unique among the nodes that transmit: two senders sharing an address are mutually deaf, each dropping the other's broadcasts as an echo of its own, so neither ever sees the other. An rx_only node never puts its address on the air, so it can keep the default. With hopping on, the address also picks the node's turn inside a slot: number a fleet 1, 2, 3... and the first 2 x interval_s of them never overlap on the air."
 
 role = "leaf"
 role_description = "leaf transmits its own position and receives everyone else's. Repeater also retransmits other nodes' broadcasts, extending range past one radio horizon at the cost of doubling the traffic it forwards. tx_only beacons without ever switching the receiver on, which is the largest power saving available to a node nobody needs to track from. rx_only listens without ever transmitting, for a base station that only collects."
@@ -114,7 +114,7 @@ dedup_ttl_s_description = "How long a broadcast is remembered so a repeat of it 
 # -- Beacon -------------------------------------------------------------
 [beacon]
 interval_s = 1
-interval_s_description = "Position broadcast period in seconds while the node has a fix, 0-3600. With hopping on a node transmits at most once per hop slot, so 1 is every slot at the default dwell. 0 silences the node's own transmissions altogether, pings included, as does a role of rx_only."
+interval_s_description = "Position broadcast period in seconds while the node has a fix, 0-3600. With hopping on a node transmits at most once per hop slot, so 1 is every slot at the default dwell. It also sets how many nodes fit: a slot holds two default beacons, so 2 x interval_s addresses beacon without overlapping - two every second, four every two seconds, ten every five. 0 silences the node's own transmissions altogether, pings included, as does a role of rx_only."
 
 ping_interval_s = 5
 ping_interval_s_description = "How often a node with no fix says so, 0-3600 s: a small ping goes out in place of the position, so a node that cannot see the sky is still heard. Slower than the beacon by default, since a searching receiver has nothing new to report every second. 0 sends no pings."

@@ -61,6 +61,8 @@ use midair_proto::radiocfg::{self, RadioConfig};
 use midair_proto::roster::{Report, Value};
 use midair_proto::ble::{self, Mode};
 use midair_proto::{link, lora, session};
+#[cfg(feature = "dual-core")]
+use static_cell::StaticCell;
 use trouble_host::prelude::*;
 use wio_s3_gps::gps::{Gps, BAUD as GPS_BAUD};
 use wio_s3_gps::node::Node;
@@ -449,6 +451,11 @@ async fn main(spawner: Spawner) -> ! {
 
     // GPS on UART1: GPIO1 is RX (module TX), GPIO2 is TX. 9600 8N1 is the
     // u-blox M10 factory default.
+    //
+    // The two halves go different ways. The receive half is an async
+    // byte pump on this executor, which keeps draining the 128-byte FIFO
+    // while the hardware loop is inside a transmit or a card flush; the
+    // transmit half stays with the driver for the UBX commands.
     let gps_uart = Uart::new(
         peripherals.UART1,
         UartConfig::default().with_baudrate(GPS_BAUD),
@@ -456,7 +463,11 @@ async fn main(spawner: Spawner) -> ! {
     .expect("gps uart")
     .with_rx(peripherals.GPIO1)
     .with_tx(peripherals.GPIO2);
-    let gps = Gps::new(gps_uart);
+    let (gps_rx, gps_tx) = gps_uart.split();
+    let gps = Gps::new(gps_tx);
+    spawner
+        .spawn(wio_s3_gps::gps::pump(gps_rx.into_async()))
+        .expect("spawn gps pump");
 
     // Release the TX pad hold that `enter_deep_sleep` set, in the same
     // order and for the same reason as NSS above: reconfigure first, then
@@ -509,6 +520,52 @@ async fn main(spawner: Spawner) -> ! {
         None => println!("j5: nothing on the bus"),
     }
 
+    // The hardware loop on the second core, with an executor of its own.
+    //
+    // Everything else - the BLE host, the USB console, the GPS byte pump
+    // - stays on this one, beside the BLE controller's own thread. The
+    // loop's blocking work is what this separates from the host: a card
+    // flush is tens of milliseconds of SPI at 400 kHz, and occasionally
+    // hundreds while the card wear-levels, and on one core every
+    // millisecond of it was a millisecond the host could not answer the
+    // phone or move a notification. The other way round, the host's work
+    // no longer lands inside the loop's 10 ms pass, which is what times a
+    // received packet for the hop clock.
+    //
+    // What crosses between the cores is what crossed between the tasks
+    // before: the `state` snapshot and its signals, all behind
+    // critical sections, which on this chip are spinlocks that both cores
+    // honor. Flash writes park the other core for their duration
+    // (`FlashStorage::multicore_auto_park`), which is why the settings
+    // and config saves are the rare events they are.
+    #[cfg(feature = "dual-core")]
+    {
+        use esp_hal::interrupt::software::SoftwareInterruptControl;
+        use esp_hal::system::Stack;
+
+        static APP_STACK: StaticCell<Stack<APP_CORE_STACK>> = StaticCell::new();
+        static APP_EXECUTOR: StaticCell<esp_rtos::embassy::Executor> = StaticCell::new();
+
+        let sw = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
+        let cold = !woke_from_sleep;
+        let carried = ToAppCore((lora, gps, sdlog, j5, d5, d2));
+        esp_rtos::start_second_core(
+            peripherals.CPU_CTRL,
+            sw.software_interrupt0,
+            sw.software_interrupt1,
+            APP_STACK.init(Stack::new()),
+            move || {
+                let (lora, gps, sdlog, j5, d5, d2) = carried.into_inner();
+                let executor = APP_EXECUTOR.init(esp_rtos::embassy::Executor::new());
+                executor.run(|app| {
+                    app.spawn(hardware_task(lora, gps, sdlog, j5, d5, d2, boot, cold))
+                        .expect("spawn hardware task");
+                })
+            },
+        );
+        println!("hardware loop on the second core");
+    }
+    #[cfg(not(feature = "dual-core"))]
     spawner
         .spawn(hardware_task(
             lora,
@@ -1326,8 +1383,15 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
             // transmit at 22 dBm beside a 2.4 GHz radio is a supply
             // problem; on the two-MCU board this was a `RADIO_BUSY` link
             // message, here it is a bool.
-            if state::radio_busy() {
-                continue;
+            //
+            // Held, not skipped. This used to `continue` to the next
+            // interval, which with a beacon every second and 289 ms on
+            // air dropped up to half the position notifications - which
+            // ones depended on where the tick fell in the slot, so the
+            // phone saw a board that reported every second, or every
+            // other second, or every third, for no visible reason.
+            while state::radio_busy() {
+                Timer::after(Duration::from_millis(5)).await;
             }
 
             // `set` before each notify, so both of these answer a plain read
@@ -1471,6 +1535,47 @@ impl Blinker {
 
 /// How many times a settings push is retried before the loop stops asking.
 const GPS_CFG_TRIES: u8 = 5;
+
+/// The longest gap between two passes of the hardware loop after which a
+/// GPS time mark parsed on the second is not used to set the hop clock,
+/// ms. The sentence arrived somewhere in that gap and was parsed at its
+/// end; with a beacon or a card flush in between, that is hundreds of
+/// milliseconds of error handed to every node that follows this one.
+const LATE_PASS_MS: u64 = 40;
+
+/// Stack for the second core's executor thread. The hardware task's own
+/// state lives in the task arena; this is what polling it uses - the card
+/// driver's frames and the console formatting are the deep parts.
+#[cfg(feature = "dual-core")]
+const APP_CORE_STACK: usize = 32 * 1024;
+
+/// A value handed to the second core's start function, which has to be
+/// `Send`.
+///
+/// The I2C driver behind the J5 panel is not, because it keeps a raw
+/// pointer to its peripheral's state - a fact about the driver's shape,
+/// not about which core may use it. Every peripheral moved this way is
+/// used by exactly one task for the rest of the boot, on whichever core
+/// that task runs, which is the condition `Send` is there to express.
+#[cfg(feature = "dual-core")]
+struct ToAppCore<T>(T);
+
+#[cfg(feature = "dual-core")]
+// SAFETY: see the type's doc: the value is moved once, to the one task
+// that uses it, and never shared between cores.
+unsafe impl<T> Send for ToAppCore<T> {}
+
+#[cfg(feature = "dual-core")]
+impl<T> ToAppCore<T> {
+    /// Take the value back, on the core it was sent to.
+    ///
+    /// A method rather than a pattern on purpose: a closure that
+    /// destructures the wrapper captures its fields one by one, and the
+    /// wrapper's `Send` then covers none of them.
+    fn into_inner(self) -> T {
+        self.0
+    }
+}
 
 /// Everything that is not BLE: the radio, the GPS and the card.
 ///
@@ -1663,10 +1768,19 @@ async fn hardware_task(
     let mut gps_nmea_seen = false;
     let mut gps_checked = false;
     let gps_grace_until = boot.wrapping_add(5_000);
+    // When the previous pass began, so a pass that comes late - after a
+    // transmit, a flush, a config apply - knows not to trust the arrival
+    // times it is about to assign.
+    let mut prev_pass_ms = Instant::now().as_millis();
+    // Nodes already reported for sharing this node's turn, one bit each,
+    // so the console says it once per node rather than once per frame.
+    let mut turn_warned = [0u8; 32];
 
     loop {
         let now_ms = Instant::now().as_millis();
         let now = now_ms as u32;
+        let late_pass = now_ms.saturating_sub(prev_pass_ms) > LATE_PASS_MS;
+        prev_pass_ms = now_ms;
         rx_led.update(now);
         tx_led.update(now);
 
@@ -1889,9 +2003,13 @@ async fn hardware_task(
             }
             // The hop clock's best reference. Taken whether or not there is
             // a fix, so a stale mark cannot be handed over later as if it
-            // were fresh; used only with one.
+            // were fresh; used only with one, and only from a pass that
+            // followed the previous one promptly - the mark's local time
+            // is when the sentence was parsed, and after a long gap that
+            // is not when it arrived. The next second brings another.
             if let Some((tod_ms, at_ms)) = gps.take_time_mark()
                 && gps.has_fix()
+                && !late_pass
                 && node.radio_mut().hop_discipline_gps(tod_ms, at_ms)
             {
                 status_println!("hop: clock on gps time");
@@ -1990,24 +2108,44 @@ async fn hardware_task(
                 && node.radio().beacon_due(last_beacon, interval_ms, now_ms)
                 && !state::transfer_active()
                 && !state::sleep_now_pending();
-            if beacon_owed && beacon_at.is_none() {
-                let len = node.frame_overhead()
-                    + if gps.has_fix() {
-                        lora::position_msg_len(cfg.beacon_fields)
-                    } else {
-                        lora::PING_MSG_LEN
-                    };
+            let beacon_len = node.frame_overhead()
+                + if gps.has_fix() {
+                    lora::position_msg_len(cfg.beacon_fields)
+                } else {
+                    lora::PING_MSG_LEN
+                };
+            if !beacon_owed {
+                // A turn that passed while something held the transmit is
+                // gone; the next one is planned afresh when it comes.
+                beacon_at = None;
+            } else if beacon_at.is_none() {
                 // Single channel: jitter on top of the interval so two nodes
                 // that happened to line up do not stay lined up. Hopping,
-                // the random start inside the slot window is that jitter,
+                // the random start inside the node's turn is that jitter,
                 // and a delay here would only push a beacon out of its slot.
                 let jitter = if node.radio().hopping() {
                     0
                 } else {
                     node.random((interval_ms / 2).min(2_000))
                 };
-                beacon_at =
-                    Some(node.radio_mut().tx_window_start(now_ms + u64::from(jitter), len));
+                beacon_at = Some(node.radio_mut().tx_window_start(
+                    now_ms + u64::from(jitter),
+                    beacon_len,
+                    interval_ms,
+                ));
+            }
+            // The plan can be stale by the time its instant arrives: the
+            // clock re-anchored on a frame heard since, or a frame arriving
+            // held the transmit past its turn. The transmit would wait for
+            // the next turn inside `send`, holding this loop - and so the
+            // receiver, the UART and the card - for most of a slot; a fresh
+            // plan costs nothing.
+            if beacon_owed
+                && beacon_at.is_some_and(|at| now_ms >= at)
+                && !node.radio().rx_in_progress(now_ms)
+                && node.radio().tx_wait_ms(now_ms, beacon_len, interval_ms) > 0
+            {
+                beacon_at = Some(node.radio_mut().tx_window_start(now_ms, beacon_len, interval_ms));
             }
             if beacon_owed
                 && beacon_at.is_some_and(|at| now_ms >= at)
@@ -2029,7 +2167,7 @@ async fn hardware_task(
                 tx_led.pulse(now);
                 let sent = if payload_is_fix {
                     let (pos, n) = lora::encode_position(&gps.packet(), cfg.beacon_fields);
-                    node.broadcast(&pos[..n]).await
+                    node.broadcast(&pos[..n], interval_ms).await
                 } else {
                     node.broadcast(
                         &lora::Ping {
@@ -2038,6 +2176,7 @@ async fn hardware_task(
                             had_fix: ever_had_fix,
                         }
                         .encode(),
+                        interval_ms,
                     )
                     .await
                 };
@@ -2066,9 +2205,11 @@ async fn hardware_task(
             if let Some((src, stratum)) = node.take_sync_note() {
                 status_println!("hop: clock from node {} (stratum {})", src, stratum);
             }
+            let mut heard_from = None;
             if let Some(rx) = node.poll(now) {
                 rx_count = rx_count.saturating_add(1);
                 rx_led.pulse(now);
+                heard_from = Some(rx.src);
                 if let Some(p) = lora::decode_position(rx.payload) {
                     vprintln!("position from node {} rssi {}", rx.src, rx.rssi);
                     let mut v = [0u8; ble::REMOTE_LEN];
@@ -2101,6 +2242,25 @@ async fn hardware_task(
                         "node {} sent {} bytes this build does not decode",
                         rx.src,
                         rx.payload.len()
+                    );
+                }
+            }
+            // Two nodes in one turn overlap on the air every time they both
+            // have something to say, and neither can hear the other to
+            // notice - so it is reported from here, by a node that hears
+            // both. The cure is an address that maps to a free turn, or an
+            // interval long enough to have one.
+            if let Some(src) = heard_from {
+                let beacon_ms = u32::from(cfg.beacon_interval_s) * 1_000;
+                let (byte, bit) = (usize::from(src / 8), 1u8 << (src % 8));
+                if turn_warned[byte] & bit == 0
+                    && cfg.role.transmits()
+                    && node.radio().shares_turn(src, beacon_ms)
+                {
+                    turn_warned[byte] |= bit;
+                    status_println!(
+                        "hop: node {} shares this node's turn - renumber, or lengthen interval_s",
+                        src
                     );
                 }
             }

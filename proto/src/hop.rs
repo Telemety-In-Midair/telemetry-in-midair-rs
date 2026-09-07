@@ -33,6 +33,15 @@
 //! nodes at the same stratum settle on the lower address as the reference,
 //! and a node that gets a fix back outranks everyone again at once.
 //!
+//! Inside a slot, nodes take turns rather than chances. The window is cut
+//! into as many sub-slots as fit the network's lean beacon back to back,
+//! and a node's address picks its sub-slot; when the beacon interval is
+//! several slots long the address also picks which slot of the interval.
+//! Two nodes with consecutive addresses therefore never overlap, however
+//! often they transmit, and a larger fleet overlaps only where addresses
+//! collide modulo the turn count - which is a number the operator can
+//! read off the plan and assign around.
+//!
 //! Everything here is integer arithmetic on caller-supplied millisecond
 //! timestamps, so it is `no_std` and tests on the host.
 
@@ -75,17 +84,36 @@ pub struct Plan {
     pub center_hz: u32,
     /// Slot length, ms.
     pub dwell_ms: u16,
+    /// Turns per slot: how many of the network's lean beacons fit the
+    /// window back to back, at least 1. Cut from the modulation and the
+    /// dwell, which every node on a network shares, so every node cuts the
+    /// slot the same way.
+    pub sub_slots: u8,
 }
 
 impl Plan {
     /// The plan `cfg` describes, or `None` when hopping is off.
     pub fn from_config(cfg: &RadioConfig) -> Option<Self> {
-        (cfg.hop_channels > 0).then_some(Self {
-            channels: cfg.hop_channels,
-            step_khz: cfg.hop_step_khz,
-            center_hz: cfg.frequency_hz,
-            dwell_ms: cfg.hop_dwell_ms,
-        })
+        (cfg.hop_channels > 0).then_some(Self::new(
+            cfg.hop_channels,
+            cfg.hop_step_khz,
+            cfg.frequency_hz,
+            cfg.hop_dwell_ms,
+            cfg.hop_unit_airtime_us().div_ceil(1000),
+        ))
+    }
+
+    /// A plan cut into turns for a lean beacon of `unit_ms` on air.
+    pub fn new(channels: u8, step_khz: u16, center_hz: u32, dwell_ms: u16, unit_ms: u32) -> Self {
+        let mut plan = Self {
+            channels,
+            step_khz,
+            center_hz,
+            dwell_ms,
+            sub_slots: 1,
+        };
+        plan.sub_slots = (plan.window_ms() / unit_ms.max(1)).clamp(1, 255) as u8;
+        plan
     }
 
     /// Carrier of channel `index`, Hz. Channels are spread evenly about the
@@ -156,6 +184,65 @@ impl Plan {
             .saturating_sub(guard + airtime_ms)
             .max(guard);
         (guard, latest)
+    }
+
+    /// Length of one turn, ms: the window split evenly between the turns.
+    pub fn sub_slot_ms(&self) -> u32 {
+        self.window_ms() / u32::from(self.sub_slots.max(1))
+    }
+
+    /// Which slot of an interval of `interval_slots` node `address`
+    /// transmits in. Addresses are spread across the slots of the interval
+    /// first and only then across the turns of one slot, so a fleet that
+    /// beacons every fifth slot has a transmission in as many of the five
+    /// as it has nodes - which is what an unsynced node listening for its
+    /// first frame needs, since one coincidence with a busy slot is a join
+    /// and a coincidence with an empty one is not.
+    pub fn turn_slot(&self, address: u8, interval_slots: u32) -> u32 {
+        // Addresses start at 1, so 1 takes the first turn.
+        u32::from(address.saturating_sub(1)) % interval_slots.max(1)
+    }
+
+    /// Which turn of its slot node `address` transmits in, on an interval
+    /// of `interval_slots`. Together with [`turn_slot`](Self::turn_slot)
+    /// this gives `sub_slots * interval_slots` consecutive addresses a turn
+    /// of their own; the next address shares the first one's.
+    pub fn sub_slot_of(&self, address: u8, interval_slots: u32) -> u8 {
+        let n = interval_slots.max(1);
+        ((u32::from(address.saturating_sub(1)) / n) % u32::from(self.sub_slots.max(1))) as u8
+    }
+
+    /// Addresses that get a turn of their own on an interval of
+    /// `interval_slots`: the fleet size the plan carries without overlap.
+    pub fn turns(&self, interval_slots: u32) -> u32 {
+        u32::from(self.sub_slots.max(1)) * interval_slots.max(1)
+    }
+
+    /// The range of slot phases node `address` may start a transmission of
+    /// `airtime_ms` at, `(earliest, latest)` ms from the slot's start:
+    /// [`start_range_ms`](Self::start_range_ms) narrowed to the node's turn
+    /// on an interval of `interval_slots`.
+    ///
+    /// Only the first half of the turn's slack is offered as a start. The
+    /// second half stays empty as a guard between one turn and the next,
+    /// for two clocks that disagree: two boards on their own GPS differ by
+    /// the spread in their receivers' sentence latency, tens of
+    /// milliseconds, and a follower adds its poll latency on top.
+    ///
+    /// A frame longer than a turn starts at the turn's beginning and runs
+    /// into the next turn, which is then the one overlap this plan allows.
+    /// A plan with a single turn offers the whole window, since the only
+    /// neighbor is the next slot and the slot guard already covers that.
+    pub fn start_range_for(&self, address: u8, interval_slots: u32, airtime_ms: u32) -> (u32, u32) {
+        let (lo, hi) = self.start_range_ms(airtime_ms);
+        if self.sub_slots <= 1 {
+            return (lo, hi);
+        }
+        let width = self.sub_slot_ms();
+        let turn_lo = lo + u32::from(self.sub_slot_of(address, interval_slots)) * width;
+        let slack = width.saturating_sub(airtime_ms);
+        let turn_hi = turn_lo + slack / 2;
+        (turn_lo.min(hi), turn_hi.min(hi).max(turn_lo.min(hi)))
     }
 }
 
@@ -399,13 +486,43 @@ impl Clock {
         }
     }
 
-    /// The local time a transmission of `airtime_ms` should start, at or
-    /// after `now_ms`: a random point inside the slot's window, in this
+    /// Whether node `address` has a turn to transmit in the slot `now_ms`
+    /// falls in, given its last transmission began at `last_ms` and it
+    /// transmits every `interval_ms`. An interval is a count of slots, and
+    /// the node's slot of that count is picked by its address; one
+    /// transmission per slot, so the slot of the last one is never due
+    /// again. No last transmission means the next turn is due.
+    pub fn turn_due(
+        &self,
+        plan: &Plan,
+        address: u8,
+        last_ms: Option<u64>,
+        interval_ms: u32,
+        now_ms: u64,
+    ) -> bool {
+        let n = self.slots_for(interval_ms);
+        let slot = self.slot(now_ms);
+        if slot % n != plan.turn_slot(address, n) {
+            return false;
+        }
+        last_ms.is_none_or(|last| self.slot(last) != slot)
+    }
+
+    /// The local time node `address`, transmitting every `interval_ms`,
+    /// should start a transmission of `airtime_ms`, at or after `now_ms`: a
+    /// random point inside the node's turn of the slot's window, in this
     /// slot if that point is still ahead and otherwise in the next. The
-    /// randomness is what keeps two nodes that beacon on the same interval
-    /// from colliding every slot.
-    pub fn tx_start(&mut self, plan: &Plan, now_ms: u64, airtime_ms: u32) -> u64 {
-        let (lo, hi) = plan.start_range_ms(airtime_ms);
+    /// turn is what keeps two nodes apart; the randomness inside it is for
+    /// two nodes that share a turn.
+    pub fn tx_start(
+        &mut self,
+        plan: &Plan,
+        address: u8,
+        interval_ms: u32,
+        now_ms: u64,
+        airtime_ms: u32,
+    ) -> u64 {
+        let (lo, hi) = plan.start_range_for(address, self.slots_for(interval_ms), airtime_ms);
         self.rng = xorshift(self.rng);
         let target = lo + self.rng % (hi - lo + 1);
         let phase = self.phase_ms(now_ms);
@@ -416,12 +533,19 @@ impl Clock {
         }
     }
 
-    /// How long a transmission of `airtime_ms` that wants to start at
-    /// `now_ms` has to wait to be inside a window, or 0 if it already is.
-    /// The check a sender makes at the last moment, in case its clock moved
-    /// between planning the transmission and making it.
-    pub fn wait_for_window_ms(&self, plan: &Plan, now_ms: u64, airtime_ms: u32) -> u32 {
-        let (lo, hi) = plan.start_range_ms(airtime_ms);
+    /// How long a transmission of `airtime_ms` by node `address` that wants
+    /// to start at `now_ms` has to wait to be inside its turn, or 0 if it
+    /// already is. The check a sender makes at the last moment, in case its
+    /// clock moved between planning the transmission and making it.
+    pub fn wait_for_window_ms(
+        &self,
+        plan: &Plan,
+        address: u8,
+        interval_ms: u32,
+        now_ms: u64,
+        airtime_ms: u32,
+    ) -> u32 {
+        let (lo, hi) = plan.start_range_for(address, self.slots_for(interval_ms), airtime_ms);
         let phase = self.phase_ms(now_ms);
         if phase < lo {
             lo - phase
@@ -546,6 +670,91 @@ mod tests {
         assert_eq!(p.start_range_ms(900), (100, 100));
     }
 
+    /// The default slot holds two lean beacons back to back, so it has two
+    /// turns of 400 ms; consecutive addresses take different ones, and the
+    /// ranges they may start in cannot produce overlapping frames.
+    #[test]
+    fn turns_keep_consecutive_addresses_apart() {
+        let p = plan();
+        assert_eq!(p.sub_slots, 2);
+        assert_eq!(p.sub_slot_ms(), 400);
+        assert_eq!((p.sub_slot_of(1, 1), p.sub_slot_of(2, 1), p.sub_slot_of(3, 1)), (0, 1, 0));
+        assert_eq!(p.turns(1), 2);
+        assert_eq!(p.start_range_for(1, 1, 289), (100, 155));
+        assert_eq!(p.start_range_for(2, 1, 289), (500, 555));
+        // The latest a first-turn frame ends leaves half the slack as a
+        // guard before the second turn begins.
+        let (_, hi) = p.start_range_for(1, 1, 289);
+        assert!(hi + 289 + 55 <= 500);
+        // A ping is shorter and gets more room inside the same turn.
+        assert_eq!(p.start_range_for(1, 1, 240), (100, 180));
+        // A frame longer than a turn starts at the turn and is allowed to
+        // run over, but never past the far guard.
+        assert_eq!(p.start_range_for(1, 1, 450), (100, 100));
+        assert_eq!(p.start_range_for(2, 1, 450), (450, 450));
+        // A frame too long for the window collapses to the guard whatever
+        // the address.
+        assert_eq!(p.start_range_for(2, 1, 900), (100, 100));
+        // A plan cut for a frame that fills the window has one turn, and
+        // then every address shares it.
+        let one = Plan::new(50, 500, 915_000_000, 1000, 700);
+        assert_eq!(one.sub_slots, 1);
+        assert_eq!(one.start_range_for(7, 1, 289), one.start_range_ms(289));
+        // A short dwell can only ever hold one.
+        let short = Plan::new(50, 500, 915_000_000, 200, 289);
+        assert_eq!(short.sub_slots, 1);
+    }
+
+    /// With the interval several slots long, the addresses take turns
+    /// across the slots too: two turns a slot and five slots an interval
+    /// give ten addresses a turn each, and the eleventh shares the first's.
+    /// The slots fill first, so five nodes on a five-slot interval each
+    /// have a slot of their own rather than sharing three.
+    #[test]
+    fn turns_cycle_through_the_slots_of_an_interval() {
+        let p = plan();
+        assert_eq!(p.turns(5), 10);
+        let turns: std::vec::Vec<(u32, u8)> =
+            (1..=11).map(|a| (p.turn_slot(a, 5), p.sub_slot_of(a, 5))).collect();
+        assert_eq!(turns[0], (0, 0));
+        assert_eq!(turns[1], (1, 0));
+        assert_eq!(turns[4], (4, 0));
+        assert_eq!(turns[5], (0, 1));
+        assert_eq!(turns[9], (4, 1));
+        assert_eq!(turns[10], (0, 0));
+        // Every one of the first ten is distinct.
+        let mut seen = turns[..10].to_vec();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 10);
+        // With a one-slot interval the slot is always the node's.
+        assert_eq!(p.turn_slot(200, 1), 0);
+        // The ranges follow: node 6 shares node 1's slot in the second turn.
+        assert_eq!(p.start_range_for(6, 5, 289), (500, 555));
+        assert_eq!(p.start_range_for(2, 5, 289), (100, 155));
+    }
+
+    /// A node's turn comes up once per interval, in its own slot of it,
+    /// and never twice in one slot.
+    #[test]
+    fn turn_due_follows_the_address() {
+        let p = plan();
+        let mut c = Clock::new(1000, 0, 1);
+        c.discipline_gps(0, 0);
+        // Every slot at a one-second interval, whatever the address...
+        assert!(c.turn_due(&p, 1, None, 1000, 10_300));
+        assert!(c.turn_due(&p, 2, None, 1000, 10_300));
+        // ...but not twice in the slot of the last transmission.
+        assert!(!c.turn_due(&p, 1, Some(10_100), 1000, 10_300));
+        assert!(c.turn_due(&p, 1, Some(10_100), 1000, 11_000));
+        // Five-second interval: node 1 owns slots 0 mod 5, node 2 owns 1 mod 5.
+        assert!(c.turn_due(&p, 1, None, 5000, 10_500));
+        assert!(!c.turn_due(&p, 1, None, 5000, 11_500));
+        assert!(!c.turn_due(&p, 2, None, 5000, 10_500));
+        assert!(c.turn_due(&p, 2, None, 5000, 11_500));
+        assert!(c.turn_due(&p, 2, None, 5000, 16_500));
+    }
+
     /// GPS time maps straight onto slots: seconds into the day at the
     /// default dwell, with the phase taken from the fraction.
     #[test]
@@ -636,31 +845,36 @@ mod tests {
         assert_eq!(c.slot(later), 5);
     }
 
-    /// Planned transmissions land inside the window of a slot, spread
+    /// Planned transmissions land inside the node's turn of a slot, spread
     /// across it, and never before the guard.
     #[test]
-    fn tx_start_lands_in_the_window() {
+    fn tx_start_lands_in_the_turn() {
         let p = plan();
         let mut c = Clock::new(1000, 0, 4);
         c.discipline_gps(0, 0);
-        let mut phases = std::vec::Vec::new();
-        for i in 0..200u64 {
-            let now = 10_000 + i * 37;
-            let start = c.tx_start(&p, now, 289);
-            assert!(start >= now);
-            let phase = c.phase_ms(start);
-            assert!((100..=611).contains(&phase), "phase {phase}");
-            phases.push(phase);
+        for (address, lo, hi) in [(1u8, 100u32, 155u32), (2, 500, 555)] {
+            let mut phases = std::vec::Vec::new();
+            for i in 0..200u64 {
+                let now = 10_000 + i * 37;
+                let start = c.tx_start(&p, address, 1000, now, 289);
+                assert!(start >= now);
+                let phase = c.phase_ms(start);
+                assert!((lo..=hi).contains(&phase), "node {address} phase {phase}");
+                phases.push(phase);
+            }
+            let min = *phases.iter().min().unwrap();
+            let max = *phases.iter().max().unwrap();
+            assert!(max - min > 30, "no spread: {min}..{max}");
         }
-        let min = *phases.iter().min().unwrap();
-        let max = *phases.iter().max().unwrap();
-        assert!(max - min > 300, "no spread: {min}..{max}");
-        // Already inside the window, ready to go: no wait.
-        assert_eq!(c.wait_for_window_ms(&p, 10_300, 289), 0);
-        // Before the guard: wait for it.
-        assert_eq!(c.wait_for_window_ms(&p, 10_020, 289), 80);
-        // Too late for the frame to end in this slot: wait for the next.
-        assert_eq!(c.wait_for_window_ms(&p, 10_700, 289), 400);
+        // Already inside the turn, ready to go: no wait.
+        assert_eq!(c.wait_for_window_ms(&p, 1, 1000, 10_150, 289), 0);
+        assert_eq!(c.wait_for_window_ms(&p, 2, 1000, 10_550, 289), 0);
+        // Before the turn: wait for it.
+        assert_eq!(c.wait_for_window_ms(&p, 1, 1000, 10_020, 289), 80);
+        assert_eq!(c.wait_for_window_ms(&p, 2, 1000, 10_300, 289), 200);
+        // Past the turn: wait for the same turn of the next slot.
+        assert_eq!(c.wait_for_window_ms(&p, 1, 1000, 10_300, 289), 800);
+        assert_eq!(c.wait_for_window_ms(&p, 2, 1000, 10_700, 289), 800);
     }
 
     /// An interval is a count of slots: one second at the default dwell is

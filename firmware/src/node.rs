@@ -234,11 +234,13 @@ impl<'d> Node<'d> {
         self.radio.hopping().then_some(SyncWord::default())
     }
 
-    /// Broadcast a payload as a new frame from this node.
+    /// Broadcast a payload as a new frame from this node, one sent every
+    /// `interval_ms` - which on a hopping network is what picks the turn
+    /// it goes out in.
     ///
     /// Fails with [`TxError::Muted`] on a receive-only node rather than
     /// reporting a success nothing heard.
-    pub async fn broadcast(&mut self, payload: &[u8]) -> Result<(), TxError> {
+    pub async fn broadcast(&mut self, payload: &[u8], interval_ms: u32) -> Result<(), TxError> {
         if !self.role.transmits() {
             return Err(TxError::Muted);
         }
@@ -255,7 +257,7 @@ impl<'d> Node<'d> {
         // frame rather than one receivers have already discarded.
         self.next_id = self.next_id.wrapping_add(1);
         self.radio
-            .send(&mut buf[..n], frame.sync_offset())
+            .send(&mut buf[..n], frame.sync_offset(), interval_ms)
             .await
             .map_err(TxError::Radio)
     }
@@ -328,7 +330,7 @@ impl<'d> Node<'d> {
             // is then moved into a slot's window, which the same clock the
             // poll runs on decides. Kept in the caller's 32-bit domain.
             let wanted = Instant::now().as_millis() + u64::from(jitter);
-            let start = self.radio.tx_window_start(wanted, onward.encoded_len());
+            let start = self.radio.tx_window_start(wanted, onward.encoded_len(), 0);
             let due = now.wrapping_add((start - Instant::now().as_millis().min(start)) as u32);
             if !queue_repeat(&mut self.repeats, &onward, due) {
                 self.drops.repeat_full = self.drops.repeat_full.saturating_add(1);
@@ -369,7 +371,7 @@ impl<'d> Node<'d> {
         // The queued copy carries the flag that says where the sync word
         // sits, which is all the radio needs to stamp it afresh.
         let sync_at = (buf[2] & FLAG_SYNC != 0).then_some(HEADER_LEN);
-        self.radio.send(&mut buf[..len], sync_at).await.is_ok()
+        self.radio.send(&mut buf[..len], sync_at, 0).await.is_ok()
     }
 
     /// Record a `(src, id)` pair, returning whether it had already been

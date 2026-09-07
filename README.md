@@ -12,7 +12,7 @@ intent and `ARCHITECTURE.md` for the UML views.
 |-|-|-|
 | `proto/` | Shared no_std protocol crate: LoRa payloads, BLE extensions, `RADIO.CFG` parser, USB bulk framing. Host-testable (`cargo test`). | any |
 | `firmware/` | Wio-S3 firmware (embassy + trouble BLE): radio, GPS, SD and the GATT service. | `xtensa-esp32s3-none-elf` (`esp` channel) |
-| `tools/` | Host tools (Python/pixi): push a radio config, push a firmware image, read a board's BLE address. | host |
+| `tools/` | Host tools (Python/pixi): push a radio config, push a firmware image, read a board's BLE address, simulate the radio network. | host |
 | `docs/` | Deep dives and history: the power investigation and its audit, the port record, the module datasheet, the V1 board's issues. | - |
 
 Depends on the sibling repo `../gps-proto` for the BLE position protocol
@@ -244,15 +244,28 @@ synced through fix loss, a config push, a standby and a brownout of the
 radio. The base station on a desk is the case to know about: give it a
 fix, or a short interval on the nodes it is waiting for.
 
-On the air, a transmission is planned for a random point in the slot's
-window (the slot less a 100 ms guard at each end, less the frame), which
-also spreads two nodes beaconing on the same interval. A receiver that has
-seen a preamble holds its hop until the frame lands, bounded by the longest
-frame the modulation allows, and a node holds a transmit for the same
-reason. The console reports `hop: clock on gps time` and `hop: clock from
-node N (stratum K)` as the clock changes hands, the periodic status line
-carries the channel and stratum, and the telemetry characteristic reports
-both to the app's Status page.
+On the air, nodes take turns inside a slot. The window (the slot less a
+100 ms guard at each end) is cut into as many lean beacons as fit back to
+back - two at the default modulation - and a node's address picks its
+turn; with `interval_s` longer than a slot the address picks the slot of
+the interval first. So addresses `1` and `2` may both beacon every second
+without ever overlapping, and `2 x interval_s` consecutive addresses
+never overlap at any interval. Past that, two nodes share a turn and
+overlap on every transmission; they cannot hear each other to notice, so
+a node that hears both says `hop: node N shares this node's turn`, and the
+app's Radio page shows how many addresses a plan carries. A transmission
+is planned for a random point inside the turn and made when that instant
+arrives. A receiver that has seen a preamble holds its hop until the frame
+lands - for the header time until a header follows, since the detector
+fires on noise, then for the longest frame the modulation allows - and a
+node holds a transmit for the same reason. The console reports `hop: clock
+on gps time` and `hop: clock from node N (stratum K)` as the clock changes
+hands, the periodic status line carries the channel and stratum, and the
+telemetry characteristic reports both to the app's Status page.
+
+`tools/radio_sim.py` simulates a few boards on this plan - the hop clock,
+the receiver, the GPS UART, the card and the BLE notifier - and
+`docs/RADIO-AUDIT.md` is what it found; `pixi run radio-sim` runs it.
 
 None of this is a certification. The plan follows the shape of the band's
 hopping rule - fifty channels, each used equally on average, receivers in

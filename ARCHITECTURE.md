@@ -59,10 +59,15 @@ classDiagram
         PING INFO BULK
     }
     class HardwareTask {
+        <<second core, own executor>>
         owns radio, gps, card and panel
         beacon() poll() repeat() log()
         applies a pushed config
         blanks the panel for sleep
+    }
+    class GpsPump {
+        <<first core>>
+        UART FIFO to a pipe
     }
     class StatusOled {
         <<optional, SSD1306 on J5>>
@@ -123,6 +128,7 @@ classDiagram
     class HopPlan {
         channels, step, dwell
         frequency_for_slot()
+        turns by address
     }
     class RadioConfig {
         parse_bytes() encode()
@@ -197,7 +203,9 @@ classDiagram
     GattSession --> SessionPolicy
     State --> Roster
     HardwareTask --> Node
-    HardwareTask --> MaxM10
+    GpsPump --> HardwareTask : bytes
+    GpsPump --> MaxM10
+    HardwareTask --> MaxM10 : UBX commands
     HardwareTask --> SdCardHw
     Node --> Sx1262Driver
     Node ..> LoraCodec
@@ -394,30 +402,53 @@ milliseconds off against a 100 ms guard. It exists so that a network cut
 off from GPS settles on one reference (the lowest address among equals)
 instead of every node holding to its own.
 
-Inside a slot, the transmit is planned by the hardware task for a random
-point in the window and made only when that instant arrives, so the wait
-never holds the receiver. The receiver retunes at the slot boundary unless
-a frame is arriving, in which case it stays for the frame - bounded by the
-longest frame the modulation allows.
+Two things keep a clock honest that the diagram does not show. A pass of
+the hardware loop that comes late - after a transmit, after a card flush
+- stamps what it reads with a time that could be anywhere in the gap, so
+it never disciplines a clock that is already set; the next second's GPS
+sentence, or the next frame from the same sender, does. And the sync word
+is stamped for the instant the preamble leaves the antenna, which on a
+listening node is a millisecond after the command because the oscillator
+is kept running between modes.
+
+Inside a slot, nodes take turns. The window is cut into as many lean
+beacons as fit back to back - two at the default modulation - and a
+node's address picks its turn; with a beacon interval of several slots the
+address picks the slot of the interval first, so `turns x interval`
+consecutive addresses never overlap. Half of each turn's slack is left
+empty as a guard against two clocks that disagree. The transmit is planned
+by the hardware task for a random point in the turn and made only when
+that instant arrives, so the wait never holds the receiver; a plan the
+clock has moved out from under is made again rather than waited for. The
+receiver retunes at the slot boundary unless a frame is arriving, in which
+case it stays for the frame - for the header time while only a preamble
+has been seen, since the detector fires on noise, and for the longest
+frame the modulation allows once a header has.
 
 ```mermaid
 gantt
-    title One hop slot at the default dwell - a beacon, and the receiver following it
+    title One hop slot at the default dwell - two nodes taking turns, and a receiver following them
     dateFormat x
     axisFormat %L ms
 
-    section Sender
-    guard                       :done,    g1, 0, 100ms
-    window - start planned here :active,  w1, 100, 511ms
-    beacon 289 ms on air        :crit,    b1, 350, 289ms
-    guard                       :done,    g2, 900, 100ms
+    section Node 1
+    guard                        :done,    g1, 0, 100ms
+    turn 1 start range           :active,  w1, 100, 56ms
+    beacon 289 ms on air         :crit,    b1, 130, 289ms
+    guard between turns          :done,    t1, 445, 55ms
+
+    section Node 2
+    turn 2 start range           :active,  w2, 500, 56ms
+    beacon 289 ms on air         :crit,    b2, 540, 289ms
+    guard                        :done,    g2, 900, 100ms
 
     section Receiver
-    on channel of slot s        :active,  r1, 0, 1000ms
-    preamble seen, hop held     :milestone, m1, 400, 0ms
-    frame lands, clock offered  :milestone, m2, 639, 0ms
-    retune to slot s+1          :crit,     r2, 1000, 3ms
-    on channel of slot s+1      :active,  r3, 1003, 300ms
+    on channel of slot s         :active,  r1, 0, 1000ms
+    preamble seen, hop held      :milestone, m1, 180, 0ms
+    frame lands, clock offered   :milestone, m2, 419, 0ms
+    second frame lands           :milestone, m3, 829, 0ms
+    retune to slot s+1           :crit,     r2, 1000, 2ms
+    on channel of slot s+1       :active,  r3, 1002, 300ms
 ```
 
 The window is the slot less a guard at each end and less the frame, so a
@@ -425,7 +456,16 @@ planned beacon always ends before the far guard. A frame the window cannot
 hold - the default beacon at BW125 is 1.15 s - starts at the near guard and
 runs into the next slot; the hold on the receiver is what still gets it
 through, at the cost of that node occupying one channel longer than a hop
-should.
+should. A frame longer than a turn but shorter than the window is sent
+too, and overlaps the next address's turn every slot; the app's Radio page
+says so before it is pushed.
+
+The plan's capacity is a number the operator has to respect: at the
+default modulation two addresses may beacon every second, ten every five
+seconds. Two nodes that share a turn overlap on every transmission and
+cannot hear each other to notice, so a third node that hears both reports
+it (`hop: node N shares this node's turn`). `docs/RADIO-AUDIT.md` has the
+simulation this schedule was chosen from.
 
 ## Where the config and the firmware live
 
@@ -818,7 +858,10 @@ Three interlocks show up here, and all three exist for the same reason -
 one board, one supply, one USB FIFO:
 
 - A beacon in flight holds BLE notifications (`state::radio_busy`), because
-  22 dBm of LoRa PA beside a 2.4 GHz radio is a supply problem.
+  22 dBm of LoRa PA beside a 2.4 GHz radio is a supply problem. Holds, not
+  skips: the notifier waits for TxDone and then sends, so a beacon every
+  second costs the phone a few hundred milliseconds of latency rather
+  than every other update.
 - A bulk transfer holds the beacon *and* silences the console
   (`state::transfer_active`), because the console and the transfer's ack
   frames share the USB Serial/JTAG IN FIFO with no arbitration. Only the

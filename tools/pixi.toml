@@ -48,6 +48,16 @@ wio-set = "python wio_set.py"
 # port disappears while it sleeps; that is the command working.
 wio-sleep = "python wio_sleep.py"
 
+# Simulate a few boards on the hop plan - the clock, the receiver, the GPS
+# UART, the card and the BLE notifier - and report what a receiver and a
+# phone see, before and after the fixes in docs/RADIO-AUDIT.md:
+#   pixi run radio-sim
+#   pixi run radio-sim --scenario B --seeds 6
+#   pixi run radio-sim --gantt B --variant legacy
+#   pixi run radio-sim --selftest    # after editing proto/src/hop.rs, with
+#                                    # cargo run --example hop_vectors > hop_vectors.json
+radio-sim = "python radio_sim.py"
+
 # Generate a random BLE static-random address in the display format the
 # firmware expects:
 #   pixi run gen-ble-address

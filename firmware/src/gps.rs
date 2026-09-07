@@ -12,11 +12,24 @@
 //! and carry over unchanged; what moved is the UART and the waits, which
 //! are now `.await` rather than spins. EXTINT is optional here because the
 //! wio-s3-max-gps board does not route it - see [`Gps::sleep`].
+//!
+//! The receive side is split from the loop that parses it. The S3's UART
+//! FIFO holds 128 bytes, 133 ms at 9600 baud, and the hardware loop that
+//! used to drain it is held longer than that on every transmit (the
+//! default beacon is 289 ms on air) and on a card flush - so with a
+//! beacon every second, a sentence a second overflowed the FIFO about
+//! one time in seven, and each one was a position not reported and a
+//! time mark not taken. [`pump`] is a task of its own that moves bytes
+//! from the FIFO into a pipe as they arrive, and runs whenever its
+//! executor does; [`Gps::poll`] drains the pipe.
 
+use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::pipe::Pipe;
 use embassy_time::{Duration, Instant, Timer};
-use esp_hal::uart::Uart;
-use esp_hal::Blocking;
+use esp_hal::uart::{UartRx, UartTx};
+use esp_hal::{Async, Blocking};
 use esp_println::println;
+use portable_atomic::{AtomicBool, Ordering};
 use gps_proto::nmea::{self, Sentence};
 use gps_proto::packet::{PositionPacket, FLAG_FIX};
 use midair_proto::radiocfg::GpsConfig;
@@ -64,8 +77,47 @@ const CFG_MSGOUT_VTG: u32 = 0x2091_00B1;
 /// How long [`Gps::configure`] waits for the module to acknowledge.
 const ACK_TIMEOUT_MS: u64 = 250;
 
+/// Bytes the pipe between [`pump`] and [`Gps::poll`] holds: half a second
+/// of the module's full output rate, and three seconds of the two
+/// sentences this firmware leaves enabled. What the parser can fall
+/// behind by before a byte is lost.
+const RX_PIPE: usize = 512;
+
+/// Bytes from the receiver, in arrival order. Written by [`pump`], read by
+/// [`Gps::poll`] and [`Gps::wait_ack`].
+static RX: Pipe<CriticalSectionRawMutex, RX_PIPE> = Pipe::new();
+
+/// Set by [`pump`] when bytes were lost - the FIFO overflowed before the
+/// pump ran, or the pipe was full when it did. The parser drops the line
+/// it is in and resyncs on the next `$`.
+static RX_OVERRUN: AtomicBool = AtomicBool::new(false);
+
+/// Move bytes from the UART into the pipe as they arrive.
+///
+/// Spawned once, on the executor that is never held by the hardware loop
+/// - the BLE core's, on a two-core build - so the FIFO is drained through
+/// a transmit and a card flush alike. A full pipe drops what does not fit
+/// rather than waiting for room: waiting here would only move the loss
+/// into the FIFO, and a flagged loss is one the parser can recover from.
+#[embassy_executor::task]
+pub async fn pump(mut rx: UartRx<'static, Async>) {
+    let mut chunk = [0u8; 64];
+    loop {
+        match rx.read_async(&mut chunk).await {
+            Ok(n) => {
+                if RX.try_write(&chunk[..n]).unwrap_or(0) < n {
+                    RX_OVERRUN.store(true, Ordering::Relaxed);
+                }
+            }
+            Err(_) => RX_OVERRUN.store(true, Ordering::Relaxed),
+        }
+    }
+}
+
 pub struct Gps<'d> {
-    uart: Uart<'d, Blocking>,
+    /// The transmit half: UBX configuration and power commands. The
+    /// receive half belongs to [`pump`].
+    uart: UartTx<'d, Blocking>,
     line: [u8; NMEA_MAX],
     len: usize,
     in_line: bool,
@@ -91,7 +143,9 @@ pub struct Gps<'d> {
 }
 
 impl<'d> Gps<'d> {
-    pub fn new(uart: Uart<'d, Blocking>) -> Self {
+    /// Wrap the transmit half of the module's UART. The receive half goes
+    /// to [`pump`], which has to be spawned for anything to arrive.
+    pub fn new(uart: UartTx<'d, Blocking>) -> Self {
         Self {
             uart,
             line: [0; NMEA_MAX],
@@ -138,23 +192,20 @@ impl<'d> Gps<'d> {
         self.packet.flags & FLAG_FIX != 0
     }
 
-    /// Drain whatever the UART has buffered and fold complete sentences
+    /// Drain whatever the pump has buffered and fold complete sentences
     /// into the position state. Call often; it never blocks.
     pub fn poll(&mut self) {
+        // Lost bytes: drop the partial line and resync on the next `$`.
+        if RX_OVERRUN.swap(false, Ordering::Relaxed) {
+            self.in_line = false;
+            self.len = 0;
+        }
         let mut chunk = [0u8; 64];
         let mut drained = 0usize;
         while drained < DRAIN_BUDGET {
-            let n = match self.uart.read_buffered(&mut chunk) {
-                Ok(0) => return,
+            let n = match RX.try_read(&mut chunk) {
                 Ok(n) => n,
-                // Lost bytes (overrun is routine - other work in the loop
-                // can block longer than one character time). Drop the
-                // partial line and resync.
-                Err(_) => {
-                    self.in_line = false;
-                    self.len = 0;
-                    return;
-                }
+                Err(_) => return,
             };
             drained += n;
             for &byte in &chunk[..n] {
@@ -369,13 +420,10 @@ impl<'d> Gps<'d> {
         let deadline = Duration::from_millis(ACK_TIMEOUT_MS);
         let mut chunk = [0u8; 64];
         while Instant::now() - start < deadline {
-            let n = match self.uart.read_buffered(&mut chunk) {
-                Ok(n) => n,
-                Err(_) => {
-                    matched = 0;
-                    0
-                }
-            };
+            if RX_OVERRUN.swap(false, Ordering::Relaxed) {
+                matched = 0;
+            }
+            let n = RX.try_read(&mut chunk).unwrap_or(0);
             if n == 0 {
                 Timer::after(Duration::from_millis(1)).await;
                 continue;
