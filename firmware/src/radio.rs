@@ -20,16 +20,17 @@
 //!   slow beacon instead of being locked out for up to 10 s.
 //!
 //! Frequency hopping lives here too, because it is a property of where the
-//! radio is tuned rather than of what the node says. With a hop plan in the
-//! config the receiver retunes at every slot boundary of the network's
-//! clock ([`midair_proto::hop`]), a transmit is held to this node's turn of
-//! the slot's window and stamped with that clock on its way out, and every
-//! frame heard is offered to the clock as a reference. Without a plan at
-//! all, none of that runs and nothing here moves off `frequency_hz`.
+//! radio is tuned rather than of what the node says. Every config has a
+//! hop plan ([`midair_proto::hop`]): the receiver retunes at every slot
+//! boundary of the network's clock, a transmit is held to this node's turn
+//! of the slot's window and stamped with that clock on its way out, and
+//! every frame heard is offered to the clock as a reference.
 //!
 //! The default plan is one channel wide, so by default the retune is a
 //! no-op and everything else - the clock, the turns, the sync word - is
-//! what the plan is there for.
+//! what the plan is there for. When to transmit is decided above this
+//! layer, by [`midair_proto::beacon`], against the clock and plan this
+//! exposes through [`Sx1262Driver::schedule`].
 //!
 //! Two timing details the clock leans on. The sync word describes the
 //! instant the preamble leaves the antenna, not the instant the command
@@ -107,7 +108,7 @@ fn image_band(freq_hz: u32) -> (u8, u8) {
     }
 }
 
-/// What frequency hopping keeps between polls.
+/// What the schedule keeps between polls.
 struct Hop {
     plan: hop::Plan,
     clock: hop::Clock,
@@ -125,7 +126,10 @@ pub struct Sx1262Driver<'d> {
     /// The config the radio was last initialized from. Hopping needs the
     /// modulation to turn a frame length into a time on air.
     cfg: RadioConfig,
-    hop: Option<Hop>,
+    hop: Hop,
+    /// Whether [`init`](Self::init) has run: what decides whether the hop
+    /// clock it finds is one worth keeping.
+    configured: bool,
     /// What the receiver has seen of a frame that is arriving, and how
     /// long a hop or a transmit has to wait for it. Host-tested, and
     /// walked exhaustively by the state space tests.
@@ -167,10 +171,18 @@ pub struct Sx1262Driver<'d> {
 impl<'d> Sx1262Driver<'d> {
     /// Wrap the radio. Call [`init`](Self::init) before use.
     pub fn new(radio: Sx1262<'d>) -> Self {
+        let cfg = RadioConfig::default();
+        let plan = hop::Plan::from_config(&cfg);
         Self {
             radio,
-            cfg: RadioConfig::default(),
-            hop: None,
+            hop: Hop {
+                plan,
+                clock: hop::Clock::new(plan.dwell_ms, 0, 0),
+                rx_slot: None,
+                carrier_hz: 0,
+            },
+            configured: false,
+            cfg,
             gate: RxGate::new(0, 0),
             address: 0,
             xosc: false,
@@ -223,19 +235,19 @@ impl<'d> Sx1262Driver<'d> {
         // - none of them is a reason to forget what time the network keeps,
         // and forgetting it costs a rejoin of up to a cycle per node heard.
         let now = Instant::now().as_millis();
-        let old = self.hop.take();
-        self.hop = hop::Plan::from_config(cfg).map(|plan| {
-            let clock = match old {
-                Some(h) if h.clock.dwell_ms() == u32::from(plan.dwell_ms) => h.clock,
-                _ => hop::Clock::new(plan.dwell_ms, now, u32::from(cfg.address)),
-            };
-            Hop {
-                plan,
-                clock,
-                rx_slot: None,
-                carrier_hz: 0,
-            }
-        });
+        let plan = hop::Plan::from_config(cfg);
+        let clock = if self.configured && self.hop.clock.dwell_ms() == u32::from(plan.dwell_ms) {
+            self.hop.clock
+        } else {
+            hop::Clock::new(plan.dwell_ms, now, u32::from(cfg.address))
+        };
+        self.hop = Hop {
+            plan,
+            clock,
+            rx_slot: None,
+            carrier_hz: 0,
+        };
+        self.configured = true;
 
         // A discrete radio does not reset with the MCU, so a re-init after
         // a wedge has to say so explicitly.
@@ -304,19 +316,14 @@ impl<'d> Sx1262Driver<'d> {
         self.radio.calibrate_image(f1, f2);
 
         self.radio.set_packet_type_lora();
-        // On a hopping network the carrier is the current slot's; the poll
-        // moves it from there. Tuned once here so a transmit-only node,
-        // which never polls, still starts somewhere in the plan.
-        let carrier = match &mut self.hop {
-            Some(h) => {
-                let slot = h.clock.slot(now);
-                h.rx_slot = Some(slot);
-                h.carrier_hz = h.plan.frequency_for_slot(slot);
-                h.carrier_hz
-            }
-            None => cfg.frequency_hz,
-        };
-        self.radio.set_rf_frequency(carrier);
+        // The carrier is the current slot's; the poll moves it from there.
+        // Tuned once here so a transmit-only node, which never polls,
+        // still starts somewhere in the plan. On a one-channel plan every
+        // slot's carrier is `frequency_hz`.
+        let slot = self.hop.clock.slot(now);
+        self.hop.rx_slot = Some(slot);
+        self.hop.carrier_hz = self.hop.plan.frequency_for_slot(slot);
+        self.radio.set_rf_frequency(self.hop.carrier_hz);
 
         // High-power PA, duty/hp_max per the +22 dBm datasheet preset; the
         // actual output level is set via the TX params below.
@@ -443,7 +450,8 @@ impl<'d> Sx1262Driver<'d> {
             cfg.coding_rate,
             cfg.power_dbm
         );
-        if let Some(h) = &self.hop {
+        {
+            let h = &self.hop;
             let (lo, hi) = h.plan.span_hz();
             println!(
                 "radio hop: {} ch x {} kHz, {}-{} Hz, {} ms dwell, {} turns a slot (mine {}), stratum {}",
@@ -472,20 +480,17 @@ impl<'d> Sx1262Driver<'d> {
         }
     }
 
-    /// Whether the node is on the network's schedule: a hop plan, and so a
-    /// slot clock, turns by address and a sync word on every frame. True on
-    /// the default one-channel plan, where nothing ever retunes - the
-    /// schedule is the part that is always worth having, and the hopping is
-    /// what `hop_channels` above 1 adds to it.
-    pub fn scheduled(&self) -> bool {
-        self.hop.is_some()
+    /// The hop clock's stratum and the channel the radio is on. What the
+    /// telemetry and the status line report.
+    pub fn hop_status(&self, now_ms: u64) -> (u8, u8) {
+        let h = &self.hop;
+        (h.clock.stratum(now_ms), h.plan.index_for_slot(h.clock.slot(now_ms)))
     }
 
-    /// The hop clock's stratum and the channel the radio is on, or `None`
-    /// when not hopping. What the telemetry and the status line report.
-    pub fn hop_status(&self, now_ms: u64) -> Option<(u8, u8)> {
-        let h = self.hop.as_ref()?;
-        Some((h.clock.stratum(now_ms), h.plan.index_for_slot(h.clock.slot(now_ms))))
+    /// The schedule a transmit is planned against: the node's clock and
+    /// the network's plan. What [`midair_proto::beacon::Planner`] takes.
+    pub fn schedule(&mut self) -> (&mut hop::Clock, &hop::Plan) {
+        (&mut self.hop.clock, &self.hop.plan)
     }
 
     /// Whether the receiver is mid-frame: a preamble or header has been
@@ -498,87 +503,42 @@ impl<'d> Sx1262Driver<'d> {
         self.gate.in_progress(now_ms)
     }
 
-    /// The local time a frame of `frame_len` bytes, sent every
-    /// `interval_ms`, should be sent, at or after `now_ms`: a random point
-    /// in this node's turn of the current or next hop slot's window, or
-    /// `now_ms` itself on a single channel. `interval_ms` of 0 is a
-    /// one-off - a repeat - which takes the node's turn of every slot.
-    ///
-    /// One transmission per slot, whatever it carries: a beacon and a
-    /// repeat in the same slot would be two visits' worth of air on one
-    /// channel, which is the thing the band's hopping rule caps. A slot
-    /// that already had one plans for the next.
-    ///
-    /// Planning the instant here and having the caller come back for it
-    /// keeps the wait out of [`send`](Self::send), where it would hold the
-    /// whole hardware loop - and so the receiver - for up to a slot.
-    pub fn tx_window_start(&mut self, now_ms: u64, frame_len: usize, interval_ms: u32) -> u64 {
+    /// The local time a one-off frame of `frame_len` bytes - a repeat -
+    /// should be sent, at or after `now_ms`: a random point in this node's
+    /// turn of the current or next slot's window. One transmission per
+    /// slot, whatever it carries: a beacon and a repeat in the same slot
+    /// would be two visits' worth of air on one channel, which is the
+    /// thing the band's hopping rule caps, so a slot that already had one
+    /// plans for the next. Beacons are planned by
+    /// [`midair_proto::beacon::Planner`] against [`schedule`](Self::schedule)
+    /// by the same rule.
+    pub fn repeat_start(&mut self, now_ms: u64, frame_len: usize) -> u64 {
         let airtime_ms = self.cfg.time_on_air_us(frame_len).div_ceil(1000);
-        match &mut self.hop {
-            Some(h) => {
-                let from = match self.last_tx {
-                    Some((start, _)) if h.clock.slot(start) == h.clock.slot(now_ms) => {
-                        h.clock.next_slot_start_ms(now_ms)
-                    }
-                    _ => now_ms,
-                };
-                h.clock.tx_start(&h.plan, self.address, interval_ms, from, airtime_ms)
+        let h = &mut self.hop;
+        let from = match self.last_tx {
+            Some((start, _)) if h.clock.slot(start) == h.clock.slot(now_ms) => {
+                h.clock.next_slot_start_ms(now_ms)
             }
-            None => now_ms,
-        }
-    }
-
-    /// How long a frame of `frame_len` bytes, sent every `interval_ms`,
-    /// would have to wait from `now_ms` to start inside this node's turn,
-    /// or 0 if it can go now. What a caller checks before committing to a
-    /// transmit: a planned instant can fall outside the turn when the
-    /// clock re-anchored on a frame heard since it was planned, or when a
-    /// frame arriving held the transmit past its turn, and then the right
-    /// answer is a new plan rather than a wait that holds the loop.
-    pub fn tx_wait_ms(&self, now_ms: u64, frame_len: usize, interval_ms: u32) -> u32 {
-        let airtime_ms = self.cfg.time_on_air_us(frame_len).div_ceil(1000);
-        match &self.hop {
-            Some(h) => h.clock.wait_for_window_ms(&h.plan, self.address, interval_ms, now_ms, airtime_ms),
-            None => 0,
-        }
-    }
-
-    /// Whether a beacon every `interval_ms` is due, given the transmission
-    /// `last`, a `(start, end)` pair from
-    /// [`last_tx_span`](Self::last_tx_span). Hopping, the interval is a
-    /// count of slots and this node's address picks its slot of that
-    /// count, so "every second" is every slot and "every five" is the
-    /// node's own one in five; one transmission per slot. On a single
-    /// channel it is time from the end of the last transmission, so a
-    /// slow frame does not eat its own interval. No last transmission
-    /// means the next turn is due.
-    pub fn beacon_due(&self, last: Option<(u64, u64)>, interval_ms: u32, now_ms: u64) -> bool {
-        match &self.hop {
-            Some(h) => {
-                h.clock
-                    .turn_due(&h.plan, self.address, last.map(|(start, _)| start), interval_ms, now_ms)
-            }
-            None => last.is_none_or(|(_, end)| now_ms >= end + u64::from(interval_ms)),
-        }
+            _ => now_ms,
+        };
+        h.clock.tx_start(&h.plan, self.address, 0, from, airtime_ms)
     }
 
     /// Whether node `other`, beaconing every `interval_ms`, takes the same
     /// turn as this node: the fleet has outgrown the plan's turns, or two
     /// addresses were chosen `turns` apart, and the two overlap on the air
-    /// every time. Never on a single channel, where there are no turns.
+    /// every time.
     pub fn shares_turn(&self, other: u8, interval_ms: u32) -> bool {
-        let Some(h) = &self.hop else {
-            return false;
-        };
+        let h = &self.hop;
         let n = h.clock.slots_for(interval_ms);
         other != self.address
             && h.plan.turn_slot(other, n) == h.plan.turn_slot(self.address, n)
             && h.plan.sub_slot_of(other, n) == h.plan.sub_slot_of(self.address, n)
     }
 
-    /// The hop plan, or `None` on a single channel.
-    pub fn hop_plan(&self) -> Option<hop::Plan> {
-        self.hop.as_ref().map(|h| h.plan)
+    /// The hop plan.
+    pub fn hop_plan(&self) -> hop::Plan {
+        self.hop.plan
     }
 
     /// Local `(start, end)` of the last transmission, if any.
@@ -590,9 +550,7 @@ impl<'d> Sx1262Driver<'d> {
     /// day a fix reported, `at_ms` when that report was parsed. Returns
     /// whether the clock was not already on GPS time, for the log.
     pub fn hop_discipline_gps(&mut self, tod_ms: u32, at_ms: u64) -> bool {
-        let Some(h) = &mut self.hop else {
-            return false;
-        };
+        let h = &mut self.hop;
         let was_gps = h.clock.from_gps(at_ms);
         h.clock.discipline_gps(tod_ms, at_ms);
         !was_gps
@@ -604,9 +562,7 @@ impl<'d> Sx1262Driver<'d> {
     /// start of the transmission at a known instant before the packet end
     /// the poll timestamped.
     pub fn hop_heard(&mut self, word: SyncWord, src: u8, my_addr: u8, frame_len: usize) -> Offer {
-        let Some(h) = &mut self.hop else {
-            return Offer::Kept;
-        };
+        let h = &mut self.hop;
         // The packet end this poll timestamped could be anywhere in the
         // gap since the last poll, so it is not a reference for a clock
         // that already has one - the next frame from the same sender
@@ -643,9 +599,7 @@ impl<'d> Sx1262Driver<'d> {
         // channels, computed once here and compared against the carrier
         // the radio is on.
         let (slot, carrier, same, dwell_ms) = {
-            let Some(h) = &self.hop else {
-                return;
-            };
+            let h = &self.hop;
             let slot = h.clock.slot(now_ms);
             if h.rx_slot == Some(slot) {
                 return;
@@ -656,9 +610,7 @@ impl<'d> Sx1262Driver<'d> {
         if !same && !self.gate.may_leave(now_ms, dwell_ms) {
             return;
         }
-        let Some(h) = &mut self.hop else {
-            return;
-        };
+        let h = &mut self.hop;
         h.rx_slot = Some(slot);
         if same {
             return;
@@ -887,15 +839,14 @@ impl<'d> Sx1262Driver<'d> {
 
     /// Transmit one packet, returning once the radio reports it sent.
     ///
-    /// On a hopping network the packet goes out on the current slot's
-    /// channel, inside this node's turn of it for a frame sent every
-    /// `interval_ms` (0 for a one-off), and if `sync_at` names where the
-    /// frame keeps its sync word the clock's reading at the instant the
-    /// preamble leaves the antenna is written there - which is why the
-    /// buffer is mutable. The caller is expected to have planned the
-    /// instant with [`tx_window_start`](Self::tx_window_start) and checked
-    /// it with [`tx_wait_ms`](Self::tx_wait_ms); the wait here is the last
-    /// resort for a clock that moved in between, bounded by one slot.
+    /// The packet goes out on the current slot's channel, inside this
+    /// node's turn of it for a frame sent every `interval_ms` (0 for a
+    /// one-off), and if `sync_at` names where the frame keeps its sync
+    /// word the clock's reading at the instant the preamble leaves the
+    /// antenna is written there - which is why the buffer is mutable. The
+    /// caller is expected to have planned the instant - the beacon planner
+    /// or [`repeat_start`](Self::repeat_start) - and the wait here is the
+    /// last resort for a clock that moved in between, bounded by one slot.
     pub async fn send(
         &mut self,
         data: &mut [u8],
@@ -908,7 +859,8 @@ impl<'d> Sx1262Driver<'d> {
         self.gate.clear();
 
         let airtime_ms = self.cfg.time_on_air_us(data.len()).div_ceil(1000);
-        if let Some(h) = &self.hop {
+        {
+            let h = &self.hop;
             let now_ms = Instant::now().as_millis();
             let wait =
                 h.clock
@@ -924,7 +876,8 @@ impl<'d> Sx1262Driver<'d> {
         // starts, which is the command instant plus the lead the chip
         // takes to get there.
         let tx_start_ms = Instant::now().as_millis() + u64::from(self.tx_lead_ms());
-        if let Some(h) = &mut self.hop {
+        {
+            let h = &mut self.hop;
             let slot = h.clock.slot(tx_start_ms);
             h.carrier_hz = h.plan.frequency_for_slot(slot);
             self.radio.set_rf_frequency(h.carrier_hz);

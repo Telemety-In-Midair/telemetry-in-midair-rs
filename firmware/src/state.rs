@@ -18,6 +18,8 @@ use critical_section::Mutex;
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
+use midair_proto::session::ServeCommand;
+use portable_atomic::{AtomicBool, Ordering};
 use gps_proto::packet::PositionPacket;
 use midair_proto::link::{Telemetry, LOG_MAX};
 use midair_proto::radiocfg::RADIO_CONFIG_LEN;
@@ -56,11 +58,6 @@ struct Shared {
     /// here because the USB info query answers from a different task than
     /// the one that worked it out.
     ble_address: Cell<[u8; 6]>,
-    /// Seconds a `CFG_SLEEP_NOW` asked the board to deep sleep for, until
-    /// the serve loop picks it up. A cell rather than the signal's payload
-    /// because two places wait on the signal - the advertising accept and
-    /// the connected session - and only one of them is the one that sleeps.
-    sleep_now_s: Cell<Option<u32>>,
     /// Longest a single LoRa transmit can hold the hardware loop, from the
     /// running config. Published so the sleep path can wait out a beacon
     /// already in flight instead of guessing a constant that the slowest
@@ -88,7 +85,6 @@ static SHARED: Mutex<Shared> = Mutex::new(Shared {
     radio_config_known: Cell::new(false),
     roster: RefCell::new(Roster::new()),
     ble_address: Cell::new([0; 6]),
-    sleep_now_s: Cell::new(None),
     // The default config's SF12/BW500 beacon, until one is adopted.
     tx_worst_case_ms: Cell::new(1_000),
 });
@@ -290,27 +286,47 @@ pub fn drain_log() {
 pub use midair_proto::posture::Request;
 
 // ---------------------------------------------------------------------------
-// Sleep on command
+// Commands for the serve loop
 // ---------------------------------------------------------------------------
 
-/// Raised when something has asked the board to deep sleep right now - a
-/// `CFG_SLEEP_NOW` write over BLE, or the USB console's `SLEEP`.
+/// Commands for the serve loop from a config write on either transport:
+/// a nap, or a moved mode. One channel, one consumer - whichever wait the
+/// loop is in takes the next one.
 ///
-/// Separate from [`Request`], which goes to the hardware loop: this one is
-/// for the serve loop, because deep sleep is entered from the side that
-/// owns the `Rtc` and the advertising. Two places wait on it and they are
-/// never concurrent - a board is either advertising or in a session.
-pub static SLEEP_NOW_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// This replaced a single-slot signal per command, a cell beside one of
+/// them and four helpers keeping the pair coherent. A queue of four is
+/// plenty: the loop drains it inside a millisecond of any wait ending,
+/// and a queue that is full means the loop is inside a deep sleep's park
+/// and about to lose its RAM anyway.
+static COMMANDS: Channel<CriticalSectionRawMutex, ServeCommand, 4> = Channel::new();
 
-/// Raised when the board's mode changes, so the serve loop stops waiting
-/// on a budget that belongs to the mode it was in.
-///
-/// Without it a `CFG_MODE` written over USB with nobody connected would sit
-/// unnoticed until the current budget ran out, which in idle is ten
-/// minutes. Like [`SLEEP_NOW_SIGNAL`] this goes to the serve loop rather
-/// than the hardware loop: the hardware half of a mode change is a
-/// [`Request::Mode`], and the two halves are answered by different tasks.
-pub static MODE_SIGNAL: Signal<CriticalSectionRawMutex, ()> = Signal::new();
+/// A sleep has been asked for and the chip has not gone down. Read by
+/// the hardware loop, which declines to start a beacon it would then make
+/// the sleep wait out - at the slowest settings the config accepts a
+/// transmit runs to nearly ten seconds.
+static SLEEP_ASKED: AtomicBool = AtomicBool::new(false);
+
+/// Send the serve loop a command.
+pub fn command(c: ServeCommand) {
+    if let ServeCommand::SleepNow(_) = c {
+        SLEEP_ASKED.store(true, Ordering::Relaxed);
+    }
+    if COMMANDS.try_send(c).is_err() {
+        crate::qprintln!("serve: command queue full, {:?} dropped", c);
+    }
+}
+
+/// The next command, when there is one.
+pub async fn next_command() -> ServeCommand {
+    COMMANDS.receive().await
+}
+
+/// Whether a sleep has been asked for and not yet entered. Never cleared:
+/// every ask ends in a deep sleep, which is a reset, and a beacon that
+/// started in between would only make the sleep wait it out.
+pub fn sleep_asked() -> bool {
+    SLEEP_ASKED.load(Ordering::Relaxed)
+}
 
 /// The node the compass should point at: `(src, position, age_s, rssi)`.
 ///
@@ -337,39 +353,6 @@ pub fn set_tx_worst_case_ms(ms: u32) {
 /// answering a request.
 pub fn tx_worst_case_ms() -> u32 {
     critical_section::with(|cs| SHARED.borrow(cs).tx_worst_case_ms.get())
-}
-
-/// Ask the serve loop to deep sleep for `secs`, already resolved and
-/// clamped by [`midair_proto::ble::resolve_sleep_now`].
-pub fn request_sleep_now(secs: u32) {
-    critical_section::with(|cs| SHARED.borrow(cs).sleep_now_s.set(Some(secs)));
-    SLEEP_NOW_SIGNAL.signal(());
-}
-
-/// Take the pending sleep request, if any. The serve loop calls this at the
-/// points where it can actually act on one.
-pub fn take_sleep_now() -> Option<u32> {
-    critical_section::with(|cs| SHARED.borrow(cs).sleep_now_s.take())
-}
-
-/// Whether a sleep has been asked for and not yet acted on.
-///
-/// Read by the hardware loop, which uses it to decline to start a beacon it
-/// would then make the sleep wait out - at the slowest settings the config
-/// accepts a transmit runs to nearly ten seconds.
-pub fn sleep_now_pending() -> bool {
-    critical_section::with(|cs| SHARED.borrow(cs).sleep_now_s.get().is_some())
-}
-
-/// Drop a pending sleep request without acting on it.
-///
-/// The serve loop does this when it is about to sleep for a *different*
-/// reason (a wake-check window that expired first), so a command that was
-/// overtaken by the cadence cannot fire again on the far side of the sleep
-/// it was already satisfied by.
-pub fn clear_sleep_now() {
-    critical_section::with(|cs| SHARED.borrow(cs).sleep_now_s.set(None));
-    SLEEP_NOW_SIGNAL.reset();
 }
 
 /// Raised once the hardware loop has parked the radio for a deep sleep.
@@ -403,6 +386,5 @@ pub fn take_request() -> Option<Request> {
 /// acted on and waiting for the hardware loop to park. Either way a
 /// transmit started now is one the sleep would have to wait out.
 pub fn park_pending() -> bool {
-    sleep_now_pending()
-        || critical_section::with(|cs| REQUESTS.borrow(cs).borrow().sleep_pending())
+    sleep_asked() || critical_section::with(|cs| REQUESTS.borrow(cs).borrow().sleep_pending())
 }

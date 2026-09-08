@@ -131,7 +131,7 @@ pub async fn usb_task(
                     let v = (secs.min(u32::from(u16::MAX)) as u16).to_le_bytes();
                     out.build(link::resp::ACK, &[link::usb::SLEEP, v[0], v[1]]);
                     send_frame(&mut tx, out.as_bytes()).await;
-                    state::request_sleep_now(secs);
+                    state::command(midair_proto::session::ServeCommand::SleepNow(secs));
                 }
                 link::usb::CFG => {
                     // The same path a BLE config write takes, so a setting

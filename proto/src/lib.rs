@@ -27,6 +27,8 @@
 //!   long a hop or a transmit has to wait for it.
 //! - [`dedup`]: the table of frames seen and the queue of frames waiting to
 //!   be repeated, which is what keeps a repeater from becoming a storm.
+//! - [`beacon`]: when the next beacon goes out - the planner the hardware
+//!   loop runs once a pass.
 //!
 //! The last three, with `hop` and `roster`, are the machines the state
 //! space tests in `tests/` walk exhaustively; `midair-explore` is the
@@ -99,6 +101,7 @@ pub fn wire_consts_json() -> String {
     )
 }
 
+pub mod beacon;
 pub mod ble;
 pub mod bulk;
 pub mod cfgstore;

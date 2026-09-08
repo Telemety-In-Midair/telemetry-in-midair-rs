@@ -16,7 +16,7 @@
 //! in that memory at a cold boot; only a cold boot pays for the flash read.
 
 use midair_proto::ble::Mode;
-use midair_proto::session::Stored;
+use midair_proto::session::{Stored, KNOBS};
 use portable_atomic::{AtomicU32, AtomicU8, Ordering};
 
 /// Marks the RTC RAM copy as ours ("mida").
@@ -26,22 +26,16 @@ const MAGIC: u32 = 0x6D69_6461;
 // a static per field rather than one struct.
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static MAGIC_WORD: AtomicU32 = AtomicU32::new(0);
+/// The five durations, one word each in the order of the knob table -
+/// which is the one place their set is written down.
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
-static INTERVAL: AtomicU32 = AtomicU32::new(0);
+static DURATIONS: [AtomicU32; KNOBS.len()] = [const { AtomicU32::new(0) }; KNOBS.len()];
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static FLAGS: AtomicU32 = AtomicU32::new(0);
-#[esp_hal::ram(unstable(rtc_fast, persistent))]
-static ADV_WINDOW: AtomicU32 = AtomicU32::new(0);
-#[esp_hal::ram(unstable(rtc_fast, persistent))]
-static BLE_OFF: AtomicU32 = AtomicU32::new(0);
 /// The *live* mode, which is the one difference between this copy and the
 /// flash record: RTC RAM may say idle, flash never does.
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static MODE: AtomicU32 = AtomicU32::new(0);
-#[esp_hal::ram(unstable(rtc_fast, persistent))]
-static IDLE_TIMEOUT: AtomicU32 = AtomicU32::new(0);
-#[esp_hal::ram(unstable(rtc_fast, persistent))]
-static BLE_ON: AtomicU32 = AtomicU32::new(0);
 /// The board's name, zero-padded, a byte per cell.
 ///
 /// Kept here for the reason the advertising window is: a wake check
@@ -68,23 +62,28 @@ static NAME: [AtomicU8; midair_proto::ble::NAME_FIELD_LEN] =
 static WAKE_COUNT: AtomicU32 = AtomicU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static LAST_SLEEP_S: AtomicU32 = AtomicU32::new(0);
+/// Deep sleeps entered before the hardware loop finished parking, since
+/// the last cold boot. Each one is an interval spent with the receiver or
+/// the radio still drawing, which nothing else reports.
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static PARKS_MISSED: AtomicU32 = AtomicU32::new(0);
 
 /// The current settings. An unconfigured board reads back
 /// [`Stored::new`], which is awake, powered and never sleeping.
 pub fn get() -> Stored {
     if MAGIC_WORD.load(Ordering::Relaxed) == MAGIC {
-        Stored {
-            sleep_interval_s: INTERVAL.load(Ordering::Relaxed),
+        let mut s = Stored {
             flags: FLAGS.load(Ordering::Relaxed),
-            adv_window_s: ADV_WINDOW.load(Ordering::Relaxed),
-            ble_off_s: BLE_OFF.load(Ordering::Relaxed),
             // A word that is not a mode can only be corruption, and the
             // safe reading of it is the mode a board can be woken out of.
             mode: Mode::from_wire(MODE.load(Ordering::Relaxed) as u8).unwrap_or_default(),
-            idle_timeout_s: IDLE_TIMEOUT.load(Ordering::Relaxed),
-            ble_on_s: BLE_ON.load(Ordering::Relaxed),
             name: core::array::from_fn(|i| NAME[i].load(Ordering::Relaxed)),
+            ..Stored::new()
+        };
+        for spec in &KNOBS {
+            spec.set(&mut s, DURATIONS[spec.knob as usize].load(Ordering::Relaxed));
         }
+        s
     } else {
         Stored::new()
     }
@@ -103,14 +102,13 @@ pub fn set(s: Stored) {
     if MAGIC_WORD.load(Ordering::Relaxed) != MAGIC {
         WAKE_COUNT.store(0, Ordering::Relaxed);
         LAST_SLEEP_S.store(0, Ordering::Relaxed);
+        PARKS_MISSED.store(0, Ordering::Relaxed);
     }
-    INTERVAL.store(s.sleep_interval_s, Ordering::Relaxed);
+    for spec in &KNOBS {
+        DURATIONS[spec.knob as usize].store(spec.get(&s), Ordering::Relaxed);
+    }
     FLAGS.store(s.flags, Ordering::Relaxed);
-    ADV_WINDOW.store(s.adv_window_s, Ordering::Relaxed);
-    BLE_OFF.store(s.ble_off_s, Ordering::Relaxed);
     MODE.store(u32::from(s.mode.as_wire()), Ordering::Relaxed);
-    IDLE_TIMEOUT.store(s.idle_timeout_s, Ordering::Relaxed);
-    BLE_ON.store(s.ble_on_s, Ordering::Relaxed);
     for (cell, b) in NAME.iter().zip(s.name) {
         cell.store(b, Ordering::Relaxed);
     }
@@ -177,6 +175,23 @@ pub fn note_wake() -> (u32, u32) {
 pub fn wake_count() -> u32 {
     if MAGIC_WORD.load(Ordering::Relaxed) == MAGIC {
         WAKE_COUNT.load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
+/// Count a deep sleep entered over a park that did not finish.
+pub fn note_park_missed() {
+    // Stamped alongside the settings for the reason `note_sleep` stamps
+    // them: a count in front of no magic word reads as garbage next boot.
+    set(get());
+    PARKS_MISSED.store(PARKS_MISSED.load(Ordering::Relaxed).saturating_add(1), Ordering::Relaxed);
+}
+
+/// Parks missed since the last cold boot.
+pub fn parks_missed() -> u32 {
+    if MAGIC_WORD.load(Ordering::Relaxed) == MAGIC {
+        PARKS_MISSED.load(Ordering::Relaxed)
     } else {
         0
     }

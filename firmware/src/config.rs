@@ -14,7 +14,7 @@
 
 use gps_proto::packet;
 use midair_proto::ble::Mode;
-use midair_proto::session::{apply as apply_write, dispatch, Action};
+use midair_proto::session::{apply as apply_write, dispatch, Action, ServeCommand, Zero};
 
 use crate::settings;
 use crate::state;
@@ -36,49 +36,38 @@ pub async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
     }
     // Handed to the serve loop rather than acted on here: this function
     // runs inside the GATT session, and the ack it is building has not
-    // been sent yet. The loop that owns the `Rtc` sleeps once the session
-    // has finished paying out what it owes the central.
-    if let Some(secs) = d.sleep_now {
-        state::request_sleep_now(secs);
-    }
-    // Raised after the request is queued, so a serve loop that wakes on it
-    // and re-budgets finds the hardware half already on its way.
-    if d.mode_signal {
-        state::MODE_SIGNAL.signal(());
+    // been sent yet. A nap is entered once the session has finished paying
+    // out what it owes the central; a moved mode is re-budgeted on the
+    // loop's next pass. Sent after the request is queued, so a loop that
+    // wakes on it finds the hardware half already on its way.
+    if let Some(c) = d.command {
+        state::command(c);
     }
     match outcome.action {
         Action::GpsSleep(on) => qprintln!("config: gps {}", if on { "backup" } else { "wake" }),
-        // No second MCU to put to sleep; the nearest thing is parking the
-        // radio, which is what the WIO's soft sleep actually bought.
-        Action::WioSleep(on) => qprintln!("config: radio {}", if on { "standby" } else { "up" }),
-        // No host-controlled rail on this board - the GPS and SD sit
-        // directly on +3V3. See BOARD-REVIEW.md in the board repo.
-        Action::Rail(_) => qprintln!("config: rail control has no hardware here"),
+        Action::RadioStandby(on) => qprintln!("config: radio {}", if on { "standby" } else { "up" }),
         Action::NotifyInterval(ms) => qprintln!("config: notify interval set to {} ms", ms),
-        Action::SleepInterval(secs) => qprintln!("config: sleep interval {} s", secs),
         Action::SleepNow(secs) => status_println!("config: sleep now for {} s", secs),
-        Action::AdvWindow(secs) => qprintln!("config: advertising window {} s", secs),
-        // Like the window: sampled when a window starts, so this one lands
-        // at the next.
-        Action::BleOn(secs) => qprintln!("config: BLE up {} s between off periods", secs),
-        // Read by the duty-cycle loop in `main` at the end of the current
-        // window, so a central that sets this keeps the connection it set
-        // it over.
-        Action::BleOff(secs) => match secs {
-            0 => status_println!("config: BLE stays up between windows"),
-            s => status_println!("config: BLE down {} s between windows", s),
-        },
+        // A duration, read by whichever loop owns it when it next decides:
+        // a window at the next window, an off period at the end of the
+        // one running, so a central that sets it keeps its connection.
+        Action::Knob(knob, secs) => {
+            let spec = knob.spec();
+            match (spec.zero, secs) {
+                (Zero::Off, 0) => status_println!("config: {} off", spec.name),
+                _ => status_println!("config: {} {} s", spec.name, secs),
+            }
+        }
         // A store is a command that ends with the chip gone, so it goes to
         // the serve loop by the same route a nap does.
         Action::SetMode(Mode::Stored) => status_println!(
             "mode: stored, sleeping {} s per wake check",
-            d.sleep_now.unwrap_or(0)
+            match d.command {
+                Some(ServeCommand::SleepNow(s)) => s,
+                _ => 0,
+            }
         ),
         Action::SetMode(other) => status_println!("mode: {}", other.as_str()),
-        Action::IdleTimeout(secs) => match secs {
-            0 => qprintln!("config: idle never stores itself"),
-            s => qprintln!("config: idle timeout {} s", s),
-        },
         // Nothing to drive: the serve loop rebuilds the scan response from
         // the stored name before every advertisement, so the new name goes
         // out with the next window - the one on the air now was handed to

@@ -79,9 +79,9 @@ pub fn entries() -> u64 {
 /// observable from here; it would have to come from the scheduler's context
 /// switch, which esp-rtos does not expose. A rate that answers "yes it
 /// halts" honestly beats a percentage that would have to be invented.
-pub fn rate(before: u64, after: u64, elapsed_ms: u32) -> u32 {
+pub fn rate(before: u64, after: u64, elapsed_ms: u64) -> u32 {
     if elapsed_ms == 0 {
         return 0;
     }
-    ((after.saturating_sub(before) * 1_000) / u64::from(elapsed_ms)) as u32
+    ((after.saturating_sub(before) * 1_000) / elapsed_ms) as u32
 }

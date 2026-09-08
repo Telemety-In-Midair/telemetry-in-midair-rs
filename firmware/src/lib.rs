@@ -45,16 +45,20 @@ macro_rules! vprintln {
     }};
 }
 
+pub mod ble;
 pub mod compass;
 pub mod config;
 pub mod flash;
 pub mod gps;
+pub mod gpsctl;
+pub mod hardware;
 pub mod idle;
 pub mod node;
 pub mod oled;
 pub mod radio;
 pub mod sdlog;
 pub mod settings;
+pub mod sleep;
 pub mod state;
 pub mod sx1262;
 pub mod usb;

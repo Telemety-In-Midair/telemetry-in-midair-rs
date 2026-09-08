@@ -353,7 +353,7 @@ pub enum Offer {
 
 /// This node's slot clock: a mapping from local milliseconds to slot
 /// numbers, and how much to trust it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Clock {
     dwell_ms: u32,
     /// Local time at which slot `origin_slot` began. Signed, because a

@@ -34,9 +34,9 @@ pub const CONFIG_FILE: &str = "RADIO.CFG";
 const LOG_HEADER: &str = "ms,src,lat_e7,lon_e7,alt_dm,speed_cms,course_cdeg,sats,fix,rssi\n";
 
 /// How often the pending buffer is written out.
-const FLUSH_MS: u32 = 5_000;
+const FLUSH_MS: u64 = 5_000;
 /// How often a missing or failed card is retried.
-const RETRY_MS: u32 = 60_000;
+const RETRY_MS: u64 = 60_000;
 /// RAM buffer for lines waiting on a card.
 const PENDING_LEN: usize = 1024;
 /// Largest `RADIO.CFG` this firmware will read.
@@ -81,8 +81,8 @@ pub struct SdLog<'d> {
     pending: [u8; PENDING_LEN],
     pending_len: usize,
     header_needed: bool,
-    next_flush_ms: u32,
-    next_retry_ms: u32,
+    next_flush_ms: u64,
+    next_retry_ms: u64,
     /// Cleared by [`disable`](Self::disable) to shut the card down for good.
     enabled: bool,
     /// Set by [`defer`](Self::defer) to hold the mount off until the board
@@ -118,7 +118,7 @@ impl<'d> SdLog<'d> {
 
     /// Let the card mount again, starting now rather than at the next
     /// retry deadline.
-    pub fn resume(&mut self, now_ms: u32) {
+    pub fn resume(&mut self, now_ms: u64) {
         self.deferred = false;
         self.next_retry_ms = now_ms;
     }
@@ -136,7 +136,7 @@ impl<'d> SdLog<'d> {
     /// The unmount that follows costs nothing here (there is no rail to cut
     /// on this board) but leaves the FAT directory entry closed rather than
     /// trusting a sleeping card to have finished.
-    pub fn park(&mut self, now_ms: u32) {
+    pub fn park(&mut self, now_ms: u64) {
         if !self.enabled {
             return;
         }
@@ -153,7 +153,7 @@ impl<'d> SdLog<'d> {
     /// card, so the card has to be mounted and read before the setting is
     /// even known - "disabled" therefore means "stop now", not "never
     /// started", and re-enabling it would mean a reboot anyway.
-    pub fn disable(&mut self, now_ms: u32) {
+    pub fn disable(&mut self, now_ms: u64) {
         self.unmount(now_ms);
         self.pending_len = 0;
         self.enabled = false;
@@ -165,18 +165,18 @@ impl<'d> SdLog<'d> {
     }
 
     /// Drop the mount and card state so the retry path starts over.
-    fn unmount(&mut self, now_ms: u32) {
+    fn unmount(&mut self, now_ms: u64) {
         if let Some(m) = self.mounted.take() {
             let _ = self.vm.close_dir(m.root);
             let _ = self.vm.close_volume(m.volume);
         }
         self.vm.device().mark_card_uninit();
-        self.next_retry_ms = now_ms.wrapping_add(RETRY_MS);
+        self.next_retry_ms = now_ms + RETRY_MS;
     }
 
     /// Try to init the card and mount the first FAT volume.
-    fn try_mount(&mut self, now_ms: u32) {
-        self.next_retry_ms = now_ms.wrapping_add(RETRY_MS);
+    fn try_mount(&mut self, now_ms: u64) {
+        self.next_retry_ms = now_ms + RETRY_MS;
         // Any command forces the init the upstream driver does lazily; a
         // missing card fails here rather than halfway through a mount.
         if self.vm.device().num_bytes().is_err() {
@@ -205,26 +205,26 @@ impl<'d> SdLog<'d> {
 
     /// Periodic driver: mounts/retries the card and flushes the pending
     /// buffer.
-    pub fn poll(&mut self, now_ms: u32) {
+    pub fn poll(&mut self, now_ms: u64) {
         if !self.enabled || self.deferred {
             return;
         }
         if self.mounted.is_none() {
-            if now_ms.wrapping_sub(self.next_retry_ms) < 0x8000_0000 {
+            if now_ms >= self.next_retry_ms {
                 self.try_mount(now_ms);
             }
             return;
         }
         if self.pending_len > 0
             && (self.pending_len > PENDING_LEN / 2
-                || now_ms.wrapping_sub(self.next_flush_ms) < 0x8000_0000)
+                || now_ms >= self.next_flush_ms)
         {
             self.flush(now_ms);
         }
     }
 
-    fn flush(&mut self, now_ms: u32) {
-        self.next_flush_ms = now_ms.wrapping_add(FLUSH_MS);
+    fn flush(&mut self, now_ms: u64) {
+        self.next_flush_ms = now_ms + FLUSH_MS;
         let Some(m) = &self.mounted else { return };
         let root = m.root;
 
@@ -257,7 +257,7 @@ impl<'d> SdLog<'d> {
 
     /// Queue a position line. `src` 0 = local GPS; `rssi` is the LoRa RSSI
     /// for remote positions (0 for local).
-    pub fn log_position(&mut self, now_ms: u32, src: u8, rssi: i16, p: &PositionPacket) {
+    pub fn log_position(&mut self, now_ms: u64, src: u8, rssi: i16, p: &PositionPacket) {
         if !self.enabled {
             return;
         }
@@ -329,7 +329,7 @@ impl<'d> SdLog<'d> {
     }
 
     /// Replace `RADIO.CFG` with `bytes`. Returns whether it landed.
-    pub fn write_config(&mut self, now_ms: u32, bytes: &[u8]) -> bool {
+    pub fn write_config(&mut self, now_ms: u64, bytes: &[u8]) -> bool {
         if !self.enabled || self.deferred {
             return false;
         }

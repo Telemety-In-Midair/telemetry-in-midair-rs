@@ -1,11 +1,10 @@
 //! Broadcast LoRa node: originates frames, receives everyone else's, and
 //! optionally repeats them.
 //!
-//! Ported from the WIO-E5 firmware's `node.rs`. The logic is unchanged -
-//! this is the layer the air format lives in, and the air format did not
-//! move - but the transmits are `.await` now rather than blocking spins,
-//! and the radio is owned concretely instead of through a trait: there was
-//! one implementation of that trait and there still is.
+//! This is the layer the air format lives in. The transmits are `.await`
+//! rather than blocking spins, and the radio is owned concretely instead
+//! of through a trait: there was one implementation of that trait and
+//! there still is.
 //!
 //! The network has no routing and no join procedure. Every node transmits
 //! [`midair_proto::lora::Frame`] broadcasts and listens continuously, so a
@@ -19,33 +18,26 @@
 //! receiver off and a node that only collects can stay off the air - each
 //! saving the power the unused half would cost.
 //!
-//! Two mechanisms keep repeating from turning into a broadcast storm:
+//! Two mechanisms keep repeating from turning into a broadcast storm, both
+//! in [`midair_proto::dedup`] where the state space tests can walk them:
 //!
 //! - **Deduplication.** A frame is identified by `(src, id)`. One that has
 //!   been seen recently is neither delivered again nor repeated again, so a
 //!   frame that reaches a node by two paths is handled once and a repeater
 //!   pair cannot bounce a frame between themselves.
 //! - **Jittered forwarding.** A repeat is queued with a random delay rather
-//!   than sent from inside the receive path. Two repeaters that heard the
-//!   same broadcast would otherwise transmit simultaneously and collide
-//!   every single time; the delay also keeps the radio out of a transmit
-//!   while more of the same burst is still arriving.
+//!   than sent from inside the receive path, then moved into this node's
+//!   turn of a slot. Two repeaters that heard the same broadcast would
+//!   otherwise transmit simultaneously and collide every single time; the
+//!   delay also keeps the radio out of a transmit while more of the same
+//!   burst is still arriving.
 
-use embassy_time::Instant;
+use midair_proto::dedup::{RepeatQueue, SeenTable};
 use midair_proto::hop::{Offer, SyncWord};
 use midair_proto::lora::{Frame, FLAG_SYNC, FRAME_MAX, HEADER_LEN};
 use midair_proto::radiocfg::{RadioConfig, Role};
 
 use crate::radio::{Sx1262Driver, Sx1262Error};
-
-/// Recently seen frames tracked for deduplication. Sized for more nodes
-/// than a shared 915 MHz channel can carry beacons for.
-const SEEN_SLOTS: usize = 16;
-
-/// Frames that can be waiting to be repeated at once. A burst deeper than
-/// this means the channel is already saturated, so dropping is the honest
-/// response.
-const REPEAT_SLOTS: usize = 4;
 
 /// Running totals of packets the node dropped after the radio handed them
 /// up but before delivery, for diagnostics. Each saturates and is cleared
@@ -85,22 +77,6 @@ pub enum TxError {
     Radio(Sx1262Error),
 }
 
-#[derive(Clone, Copy)]
-struct Seen {
-    src: u8,
-    id: u8,
-    at_ms: u32,
-    valid: bool,
-}
-
-#[derive(Clone, Copy)]
-struct Repeat {
-    buf: [u8; FRAME_MAX],
-    len: usize,
-    due_ms: u32,
-    valid: bool,
-}
-
 /// A node on the broadcast network, owning the radio it speaks through.
 pub struct Node<'d> {
     radio: Sx1262Driver<'d>,
@@ -108,19 +84,17 @@ pub struct Node<'d> {
     role: Role,
     max_hops: u8,
     jitter_ms: u32,
-    /// How long a `(src, id)` pair stays in `seen`, in milliseconds. From
-    /// [`RadioConfig::dedup_ttl_s`]; must stay well under the time the 8-bit
-    /// id takes to wrap at the beacon interval or a node suppresses its own
-    /// later frames as duplicates.
-    seen_ttl_ms: u32,
     /// Sequence number for the next frame this node originates.
     next_id: u8,
-    seen: [Seen; SEEN_SLOTS],
-    repeats: [Repeat; REPEAT_SLOTS],
+    /// `(src, id)` pairs heard inside [`RadioConfig::dedup_ttl_s`]. The
+    /// TTL must stay well under the time the 8-bit id takes to wrap at the
+    /// beacon interval or a node suppresses its own later frames as
+    /// duplicates; the config parser refuses one that does not.
+    seen: SeenTable,
+    repeats: RepeatQueue,
     rx_buf: [u8; FRAME_MAX],
     last_rssi: i16,
-    last_rx_ms: u32,
-    have_rx: bool,
+    last_rx_ms: Option<u64>,
     drops: RxDrops,
     rng: u32,
     /// A hop clock adopted from a heard frame since the last time anyone
@@ -137,24 +111,12 @@ impl<'d> Node<'d> {
             role: cfg.role,
             max_hops: cfg.max_hops,
             jitter_ms: cfg.repeat_jitter_ms(),
-            seen_ttl_ms: cfg.dedup_ttl_s as u32 * 1000,
             next_id: 0,
-            seen: [Seen {
-                src: 0,
-                id: 0,
-                at_ms: 0,
-                valid: false,
-            }; SEEN_SLOTS],
-            repeats: [Repeat {
-                buf: [0; FRAME_MAX],
-                len: 0,
-                due_ms: 0,
-                valid: false,
-            }; REPEAT_SLOTS],
+            seen: SeenTable::new(u64::from(cfg.dedup_ttl_s) * 1000),
+            repeats: RepeatQueue::new(),
             rx_buf: [0; FRAME_MAX],
             last_rssi: 0,
-            last_rx_ms: 0,
-            have_rx: false,
+            last_rx_ms: None,
             drops: RxDrops::default(),
             sync_note: None,
             // Seeded from the address, which is what has to differ: the
@@ -177,9 +139,8 @@ impl<'d> Node<'d> {
         self.role = cfg.role;
         self.max_hops = cfg.max_hops;
         self.jitter_ms = cfg.repeat_jitter_ms();
-        self.seen_ttl_ms = cfg.dedup_ttl_s as u32 * 1000;
-        self.seen.iter_mut().for_each(|s| s.valid = false);
-        self.repeats.iter_mut().for_each(|r| r.valid = false);
+        self.seen.reset(u64::from(cfg.dedup_ttl_s) * 1000);
+        self.repeats.clear();
     }
 
     /// This node's address.
@@ -198,7 +159,7 @@ impl<'d> Node<'d> {
         &self.radio
     }
 
-    /// The radio, mutably (re-init, standby, sleep).
+    /// The radio, mutably (re-init, standby, sleep, the schedule).
     pub fn radio_mut(&mut self) -> &mut Sx1262Driver<'d> {
         &mut self.radio
     }
@@ -210,8 +171,8 @@ impl<'d> Node<'d> {
 
     /// Millisecond timestamp of the last packet received, or `None` if
     /// nothing has been heard yet.
-    pub fn last_rx_ms(&self) -> Option<u32> {
-        self.have_rx.then_some(self.last_rx_ms)
+    pub fn last_rx_ms(&self) -> Option<u64> {
+        self.last_rx_ms
     }
 
     /// Cumulative counts of packets dropped after reaching the node, by
@@ -227,17 +188,8 @@ impl<'d> Node<'d> {
         self.sync_note.take()
     }
 
-    /// The sync word a frame this node sends carries: a placeholder the
-    /// radio overwrites at the instant of transmission on a scheduled
-    /// network, nothing otherwise. Sent on a one-channel plan too - it
-    /// carries the clock, which is needed wherever the schedule runs.
-    fn sync_placeholder(&self) -> Option<SyncWord> {
-        self.radio.scheduled().then_some(SyncWord::default())
-    }
-
     /// Broadcast a payload as a new frame from this node, one sent every
-    /// `interval_ms` - which on a scheduled network is what picks the turn
-    /// it goes out in.
+    /// `interval_ms` - which is what picks the turn it goes out in.
     ///
     /// Fails with [`TxError::Muted`] on a receive-only node rather than
     /// reporting a success nothing heard.
@@ -249,7 +201,9 @@ impl<'d> Node<'d> {
             src: self.address,
             id: self.next_id,
             hops_left: self.max_hops,
-            sync: self.sync_placeholder(),
+            // A placeholder the radio overwrites with its clock at the
+            // instant of transmission.
+            sync: Some(SyncWord::default()),
             payload,
         };
         let mut buf = [0u8; FRAME_MAX];
@@ -263,24 +217,18 @@ impl<'d> Node<'d> {
             .map_err(TxError::Radio)
     }
 
-    /// Bytes ahead of the payload in a frame this node sends.
-    pub fn frame_overhead(&self) -> usize {
-        HEADER_LEN + if self.radio.scheduled() { midair_proto::hop::SYNC_LEN } else { 0 }
-    }
-
     /// Poll the radio for one frame.
     ///
     /// Duplicates, this node's own frames echoed back by a repeater, and
     /// packets that are not frames at all return `None`. When acting as a
     /// repeater, a frame with hops remaining is queued for forwarding here;
     /// [`send_due_repeat`](Self::send_due_repeat) is what puts it on the air.
-    pub fn poll(&mut self, now: u32) -> Option<Received<'_>> {
+    pub fn poll(&mut self, now_ms: u64) -> Option<Received<'_>> {
         let (len, rssi) = self.radio.poll_recv(&mut self.rx_buf)?;
         // Record radio liveness for any packet that passed the hardware
         // CRC, whether or not it turns out to be one of ours.
         self.last_rssi = rssi;
-        self.last_rx_ms = now;
-        self.have_rx = true;
+        self.last_rx_ms = Some(now_ms);
 
         // Take the header out as values first: the bookkeeping below needs
         // `&mut self`, so the payload is borrowed back from `rx_buf` only
@@ -312,7 +260,7 @@ impl<'d> Node<'d> {
             self.drops.own_echo = self.drops.own_echo.saturating_add(1);
             return None;
         }
-        if self.mark_seen(src, id, now) {
+        if self.seen.mark(src, id, now_ms) {
             self.drops.duplicate = self.drops.duplicate.saturating_add(1);
             return None;
         }
@@ -324,16 +272,21 @@ impl<'d> Node<'d> {
                 hops_left: hops_left - 1,
                 // This node's clock, not the sender's: the radio writes it
                 // when the repeat actually goes out.
-                sync: self.sync_placeholder(),
+                sync: Some(SyncWord::default()),
                 payload: &self.rx_buf[hlen..len],
             };
-            // The jitter picks a moment; on a hopping network the moment
-            // is then moved into a slot's window, which the same clock the
-            // poll runs on decides. Kept in the caller's 32-bit domain.
-            let wanted = Instant::now().as_millis() + u64::from(jitter);
-            let start = self.radio.tx_window_start(wanted, onward.encoded_len(), 0);
-            let due = now.wrapping_add((start - Instant::now().as_millis().min(start)) as u32);
-            if !queue_repeat(&mut self.repeats, &onward, due) {
+            let mut buf = [0u8; FRAME_MAX];
+            let queued = match onward.encode(&mut buf) {
+                Some(n) => {
+                    // The jitter picks a moment; the moment is then moved
+                    // into this node's turn of a slot, which the same clock
+                    // the poll runs on decides.
+                    let due = self.radio.repeat_start(now_ms + u64::from(jitter), n);
+                    self.repeats.push(&buf[..n], due)
+                }
+                None => false,
+            };
+            if !queued {
                 self.drops.repeat_full = self.drops.repeat_full.saturating_add(1);
             }
         }
@@ -345,10 +298,8 @@ impl<'d> Node<'d> {
     }
 
     /// Whether a queued repeat is ready to transmit.
-    pub fn repeat_due(&self, now: u32) -> bool {
-        self.repeats
-            .iter()
-            .any(|r| r.valid && now.wrapping_sub(r.due_ms) < 0x8000_0000)
+    pub fn repeat_due(&self, now_ms: u64) -> bool {
+        self.repeats.due(now_ms)
     }
 
     /// Transmit one due repeat, returning whether anything went out.
@@ -357,65 +308,21 @@ impl<'d> Node<'d> {
     /// frame rather than retrying it: by the time the radio is working
     /// again the position it carries is stale, and the node that sent it
     /// has almost certainly beaconed a newer one.
-    pub async fn send_due_repeat(&mut self, now: u32) -> bool {
-        let Some(idx) = self
-            .repeats
-            .iter()
-            .position(|r| r.valid && now.wrapping_sub(r.due_ms) < 0x8000_0000)
-        else {
+    pub async fn send_due_repeat(&mut self, now_ms: u64) -> bool {
+        let Some((mut buf, len)) = self.repeats.take_due(now_ms) else {
             return false;
         };
-        self.repeats[idx].valid = false;
-        let len = self.repeats[idx].len;
-        let mut buf = [0u8; FRAME_MAX];
-        buf[..len].copy_from_slice(&self.repeats[idx].buf[..len]);
         // The queued copy carries the flag that says where the sync word
         // sits, which is all the radio needs to stamp it afresh.
         let sync_at = (buf[2] & FLAG_SYNC != 0).then_some(HEADER_LEN);
         self.radio.send(&mut buf[..len], sync_at, 0).await.is_ok()
     }
 
-    /// Record a `(src, id)` pair, returning whether it had already been
-    /// seen inside [`seen_ttl_ms`](Self::seen_ttl_ms).
-    fn mark_seen(&mut self, src: u8, id: u8, now: u32) -> bool {
-        let mut free: Option<usize> = None;
-        let mut oldest = 0usize;
-        for i in 0..SEEN_SLOTS {
-            let s = self.seen[i];
-            if s.valid && now.wrapping_sub(s.at_ms) >= self.seen_ttl_ms {
-                self.seen[i].valid = false;
-            }
-            if !self.seen[i].valid {
-                free.get_or_insert(i);
-            } else {
-                if s.src == src && s.id == id {
-                    // Refresh, so a frame arriving repeatedly by several
-                    // paths stays suppressed for a full TTL after the last
-                    // copy rather than the first.
-                    self.seen[i].at_ms = now;
-                    return true;
-                }
-                if now.wrapping_sub(s.at_ms) > now.wrapping_sub(self.seen[oldest].at_ms) {
-                    oldest = i;
-                }
-            }
-        }
-        let slot = free.unwrap_or(oldest);
-        self.seen[slot] = Seen {
-            src,
-            id,
-            at_ms: now,
-            valid: true,
-        };
-        false
-    }
-
     /// A pseudo-random value in `0..=max`.
     ///
-    /// The WIO drew this from its DWT cycle counter, which the Xtensa core
-    /// has no equivalent of. A xorshift is enough: nothing here is a
-    /// security decision, and what the jitter has to do is decorrelate two
-    /// repeaters - which the per-address seed already guarantees.
+    /// A xorshift is enough: nothing here is a security decision, and what
+    /// the jitter has to do is decorrelate two repeaters - which the
+    /// per-address seed already guarantees.
     pub fn random(&mut self, max: u32) -> u32 {
         self.rng ^= self.rng << 13;
         self.rng ^= self.rng >> 17;
@@ -425,25 +332,5 @@ impl<'d> Node<'d> {
         } else {
             self.rng % (max + 1)
         }
-    }
-}
-
-/// Queue a frame for forwarding, preferring a free slot and otherwise
-/// dropping it - overwriting one already waiting would starve whichever
-/// node's frame it belonged to. Returns whether it was queued.
-fn queue_repeat(slots: &mut [Repeat; REPEAT_SLOTS], frame: &Frame<'_>, due_ms: u32) -> bool {
-    let Some(slot) = slots.iter_mut().find(|r| !r.valid) else {
-        return false;
-    };
-    let mut buf = [0u8; FRAME_MAX];
-    match frame.encode(&mut buf) {
-        Some(n) => {
-            slot.buf = buf;
-            slot.len = n;
-            slot.due_ms = due_ms;
-            slot.valid = true;
-            true
-        }
-        None => false,
     }
 }
