@@ -22,6 +22,7 @@
 //! on top of it and a park after everything that raises.
 
 use crate::ble::Mode;
+use crate::radiocfg::Role;
 use crate::session::Stored;
 
 /// A request from the BLE session or the host tools to the hardware loop.
@@ -323,7 +324,7 @@ impl Posture {
     fn apply_overrides(&mut self, stored: &Stored, fx: &mut Effects) {
         let want_gps = if stored.gps_sleep() { Gps::Parked } else { Gps::Awake };
         self.move_gps(want_gps, fx);
-        let want_radio = if stored.wio_sleep() { Radio::Standby } else { Radio::Up };
+        let want_radio = if stored.radio_standby() { Radio::Standby } else { Radio::Up };
         self.move_radio(want_radio, fx);
     }
 
@@ -475,17 +476,50 @@ impl Posture {
         self.radio_up() || self.gps_awake()
     }
 
-    /// Whether the node may put a frame on the air right now: the mode
-    /// transmits, the role transmits, the radio is up, no transfer owns
-    /// the board and no sleep is waiting to park it.
-    pub fn may_transmit(&self, role_transmits: bool, transfer_active: bool, sleep_pending: bool) -> bool {
-        self.live.transmits()
-            && role_transmits
-            && self.radio_up()
-            && !transfer_active
-            && !sleep_pending
+    /// Whether the node may put a frame on the air right now: the mode and
+    /// the role both transmit ([`on_air`]), the radio is up, no transfer
+    /// owns the board and no sleep is waiting to park it.
+    pub fn may_transmit(&self, role: Role, transfer_active: bool, sleep_pending: bool) -> bool {
+        on_air(self.live, role).transmits && self.radio_up() && !transfer_active && !sleep_pending
     }
+}
 
+/// What a node does on the air, given both the words that describe it.
+///
+/// The role is the network's word and travels with the fleet in the radio
+/// config: a leaf, a repeater, a node that only sends or only listens. The
+/// mode is the device's word and lives in its settings: tracking or
+/// listening beside a phone. The two overlap - a listening node and an
+/// `rx_only` node both never transmit - and every combination of the four
+/// modes and four roles is answered here, once, so the beacon gate, the
+/// repeat gate and the receiver all read the same table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OnAir {
+    /// Beacons and pings go out.
+    pub transmits: bool,
+    /// The receiver is armed.
+    pub receives: bool,
+    /// Frames still carrying hops are forwarded.
+    pub repeats: bool,
+}
+
+/// The mode and the role, combined: each half of the air interface is used
+/// only when both words allow it. A listening node is an `rx_only` node
+/// for as long as it listens, whatever its role says; a stored or idle
+/// node does nothing on the air at all.
+pub fn on_air(mode: Mode, role: Role) -> OnAir {
+    let raised = mode.tracks();
+    let transmits = raised && mode.transmits() && role.transmits();
+    OnAir {
+        transmits,
+        receives: raised && role.receives(),
+        // A repeat is a transmission, so a node that may not transmit may
+        // not repeat either, whatever its role.
+        repeats: transmits && role.repeats(),
+    }
+}
+
+impl Posture {
     /// The rule every reachable posture satisfies, against the override
     /// flags in `stored`. `Err` names the way it does not.
     ///
@@ -523,7 +557,7 @@ impl Posture {
                 if self.gps != want_gps {
                     return Err("the receiver is not where the gps_sleep flag says");
                 }
-                let want_radio = if stored.wio_sleep() { Radio::Standby } else { Radio::Up };
+                let want_radio = if stored.radio_standby() { Radio::Standby } else { Radio::Up };
                 if self.radio != want_radio {
                     return Err("the radio is not where the wio_sleep flag says");
                 }
@@ -536,7 +570,7 @@ impl Posture {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{PFLAG_GPS_SLEEP, PFLAG_WIO_SLEEP};
+    use crate::session::{PFLAG_GPS_SLEEP, PFLAG_RADIO_STANDBY};
 
     fn flags(f: u32) -> Stored {
         Stored {
@@ -633,7 +667,7 @@ mod tests {
         assert_eq!(fx(e), vec![Effect::MountCard, Effect::RadioInit, Effect::GpsUp]);
         assert!(p.radio_up() && p.gps_awake());
 
-        let s = flags(PFLAG_GPS_SLEEP | PFLAG_WIO_SLEEP);
+        let s = flags(PFLAG_GPS_SLEEP | PFLAG_RADIO_STANDBY);
         let (p, e) = Posture::at_boot(Mode::Listening, &s);
         assert_eq!(
             fx(e),
@@ -735,7 +769,7 @@ mod tests {
         assert_eq!(fx(p.on(Request::ApplyConfig, &s)), vec![Effect::ApplyConfig, Effect::RadioSleep]);
         let (mut p, _) = Posture::at_boot(Mode::Tracking, &s);
         assert_eq!(fx(p.on(Request::ApplyConfig, &s)), vec![Effect::ApplyConfig]);
-        let st = flags(PFLAG_WIO_SLEEP);
+        let st = flags(PFLAG_RADIO_STANDBY);
         let (mut p, _) = Posture::at_boot(Mode::Tracking, &st);
         assert_eq!(fx(p.on(Request::ApplyConfig, &st)), vec![Effect::ApplyConfig, Effect::RadioStandby]);
         // On a wake check the card comes up first, so the file has a card
@@ -783,15 +817,15 @@ mod tests {
     fn transmit_needs_a_transmitting_mode_and_a_free_board() {
         let s = Stored::new();
         let (p, _) = Posture::at_boot(Mode::Tracking, &s);
-        assert!(p.may_transmit(true, false, false));
-        assert!(!p.may_transmit(false, false, false));
-        assert!(!p.may_transmit(true, true, false));
-        assert!(!p.may_transmit(true, false, true));
+        assert!(p.may_transmit(Role::Leaf, false, false));
+        assert!(!p.may_transmit(Role::RxOnly, false, false));
+        assert!(!p.may_transmit(Role::Leaf, true, false));
+        assert!(!p.may_transmit(Role::Leaf, false, true));
         let (p, _) = Posture::at_boot(Mode::Listening, &s);
-        assert!(!p.may_transmit(true, false, false));
+        assert!(!p.may_transmit(Role::Leaf, false, false));
         let (mut p, _) = Posture::at_boot(Mode::Tracking, &s);
         p.on(Request::RadioStandby(true), &s);
-        assert!(!p.may_transmit(true, false, false));
+        assert!(!p.may_transmit(Role::Leaf, false, false));
     }
 
     /// Once parked for a sleep, a board stays parked: a mode that arrives
@@ -813,5 +847,31 @@ mod tests {
             assert_eq!(p.consistent(&s), Ok(()), "{r:?}");
         }
         assert_eq!(p.card, Card::Parked);
+    }
+
+    /// The whole mode x role matrix, written down: each half of the air is
+    /// used only when both words allow it, and a repeat needs the right to
+    /// transmit.
+    #[test]
+    fn the_mode_and_the_role_are_anded() {
+        let roles = [Role::Leaf, Role::Repeater, Role::TxOnly, Role::RxOnly];
+        for role in roles {
+            for mode in [Mode::Stored, Mode::Idle] {
+                assert_eq!(
+                    on_air(mode, role),
+                    OnAir { transmits: false, receives: false, repeats: false },
+                    "{mode:?} {role:?}"
+                );
+            }
+            let t = on_air(Mode::Tracking, role);
+            assert_eq!(t.transmits, role.transmits(), "{role:?}");
+            assert_eq!(t.receives, role.receives(), "{role:?}");
+            assert_eq!(t.repeats, role.repeats(), "{role:?}");
+            let l = on_air(Mode::Listening, role);
+            assert!(!l.transmits && !l.repeats, "{role:?} listening");
+            assert_eq!(l.receives, role.receives(), "{role:?} listening");
+        }
+        // The two ways to say "do not transmit" agree.
+        assert_eq!(on_air(Mode::Listening, Role::Leaf), on_air(Mode::Tracking, Role::RxOnly));
     }
 }

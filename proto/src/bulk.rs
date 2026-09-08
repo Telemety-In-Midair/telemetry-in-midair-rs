@@ -303,7 +303,7 @@ impl Transfer {
                 // Reported as a board error so a host tool can say which of
                 // those it is rather than blaming the bytes it sent.
                 if !sink.begin(total) {
-                    return (Event::None, nak(ble::ACK_WIO_ERROR));
+                    return (Event::None, nak(ble::ACK_BOARD_ERROR));
                 }
             }
             _ => return (Event::None, nak(packet::ACK_BAD_VALUE)),
@@ -350,7 +350,7 @@ impl Transfer {
         if self.kind == ble::KIND_OTA {
             if !sink.write(self.received, chunk) {
                 self.cancel(sink);
-                return (Event::None, nak(ble::ACK_WIO_ERROR));
+                return (Event::None, nak(ble::ACK_BOARD_ERROR));
             }
             self.running_crc = crc32_continue(self.running_crc, chunk);
         } else {
@@ -400,7 +400,7 @@ impl Transfer {
         self.last_crc = self.want_crc;
         if self.kind == ble::KIND_OTA {
             if !sink.finish() {
-                return (Event::None, nak(ble::ACK_WIO_ERROR));
+                return (Event::None, nak(ble::ACK_BOARD_ERROR));
             }
             // Nothing left to retry: the image is installed and the next
             // boot runs it, so a repeated END answers OK.
@@ -751,7 +751,7 @@ mod tests {
     fn firmware_is_refused_where_there_is_no_sink() {
         let mut t = Transfer::new();
         let (_, a) = t.handle(Owner::Ble, 0, &begin_op(ble::KIND_OTA, b"image"), &mut NoFirmware);
-        assert_eq!(status(&a), ble::ACK_WIO_ERROR);
+        assert_eq!(status(&a), ble::ACK_BOARD_ERROR);
         assert!(!t.is_active());
         // An empty image is a bad op, which is a different answer.
         let (_, a) = t.handle(Owner::Ble, 0, &begin_op(ble::KIND_OTA, b""), &mut NoFirmware);
@@ -770,7 +770,7 @@ mod tests {
         let (_, a) = t.handle(Owner::Ble, 0, &data_op(0, &image[..192]), &mut sink);
         assert_eq!(status(&a), packet::ACK_OK);
         let (_, a) = t.handle(Owner::Ble, 0, &data_op(1, &image[192..384]), &mut sink);
-        assert_eq!(status(&a), ble::ACK_WIO_ERROR);
+        assert_eq!(status(&a), ble::ACK_BOARD_ERROR);
         assert!(!t.is_active());
         assert_eq!(sink.cancels, 1);
     }
@@ -787,7 +787,7 @@ mod tests {
         t.handle(Owner::Ble, 0, &data_op(0, &image), &mut sink);
         let (event, a) = t.handle(Owner::Ble, 0, &[ble::OP_END], &mut sink);
         assert_eq!(event, Event::None);
-        assert_eq!(status(&a), ble::ACK_WIO_ERROR);
+        assert_eq!(status(&a), ble::ACK_BOARD_ERROR);
     }
 
     /// An image whose bytes were corrupted in flight must not be activated,

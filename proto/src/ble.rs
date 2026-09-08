@@ -209,7 +209,7 @@ pub const RADIO_CONFIG_UUID_U128: u128 = 0xc3a1000a_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 ///
 /// This is the one setting an app actually means when it asks for a
 /// tracker, or for a device that is going in a bag. It replaces the pair of
-/// independent sleep flags ([`CFG_WIO_SLEEP`], [`CFG_GPS_SLEEP`]) as the
+/// independent sleep flags ([`CFG_RADIO_STANDBY`], [`CFG_GPS_SLEEP`]) as the
 /// thing an app sets: those stay, and are still the way to park one
 /// subsystem and leave the other up, but neither of them decides what a
 /// board does when it comes back from a flat cell, and this does.
@@ -326,17 +326,16 @@ pub const SETTINGS_LEN: usize = 28;
 /// [`Mode`] and its idle timeout, and version 6 the BLE on period.
 pub const SETTINGS_VERSION: u8 = 6;
 
-pub const SFLAG_PWR_EN: u8 = 1 << 0;
-pub const SFLAG_WIO_SLEEP: u8 = 1 << 1;
+// Bit 0 was the GPS/LoRa rail of the two-MCU board, which this one does
+// not have. Reserved: never set, ignored on the way in.
+pub const SFLAG_RADIO_STANDBY: u8 = 1 << 1;
 pub const SFLAG_GPS_SLEEP: u8 = 1 << 2;
 
 /// Everything the config characteristic can set, in one readable blob.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
-    /// GPS/LoRa rail enabled ([`CFG_PWR_EN`]).
-    pub pwr_en: bool,
-    /// WIO soft sleep ([`CFG_WIO_SLEEP`]).
-    pub wio_sleep: bool,
+    /// The radio is parked in standby ([`CFG_RADIO_STANDBY`]).
+    pub radio_standby: bool,
     /// GPS backup mode ([`CFG_GPS_SLEEP`]).
     pub gps_sleep: bool,
     /// Wake-check interval ([`CFG_ESP_SLEEP_S`]), 0 = sleep disabled.
@@ -369,11 +368,8 @@ impl Settings {
         let mut b = [0u8; SETTINGS_LEN];
         b[0] = SETTINGS_VERSION;
         let mut flags = 0u8;
-        if self.pwr_en {
-            flags |= SFLAG_PWR_EN;
-        }
-        if self.wio_sleep {
-            flags |= SFLAG_WIO_SLEEP;
+        if self.radio_standby {
+            flags |= SFLAG_RADIO_STANDBY;
         }
         if self.gps_sleep {
             flags |= SFLAG_GPS_SLEEP;
@@ -383,12 +379,13 @@ impl Settings {
         // word-align the u32s below, so it costs nothing and everything
         // after it keeps the offset an older reader knew.
         b[2] = self.mode.as_wire();
-        b[4..8].copy_from_slice(&self.sleep_interval_s.to_le_bytes());
         b[8..12].copy_from_slice(&self.notify_interval_ms.to_le_bytes());
-        b[12..16].copy_from_slice(&self.adv_window_s.to_le_bytes());
-        b[16..20].copy_from_slice(&self.ble_off_s.to_le_bytes());
-        b[20..24].copy_from_slice(&self.idle_timeout_s.to_le_bytes());
-        b[24..28].copy_from_slice(&self.ble_on_s.to_le_bytes());
+        // The durations sit where the knob table says, which is the one
+        // place their layout is written down.
+        for spec in &crate::session::KNOBS {
+            let at = spec.wire_at;
+            b[at..at + 4].copy_from_slice(&spec.wire_get(self).to_le_bytes());
+        }
         b
     }
 
@@ -399,32 +396,31 @@ impl Settings {
         }
         // The length check above makes the indexing infallible.
         let word = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
-        Some(Self {
-            pwr_en: b[1] & SFLAG_PWR_EN != 0,
-            wio_sleep: b[1] & SFLAG_WIO_SLEEP != 0,
+        let mut s = Self {
+            radio_standby: b[1] & SFLAG_RADIO_STANDBY != 0,
             gps_sleep: b[1] & SFLAG_GPS_SLEEP != 0,
-            sleep_interval_s: word(4),
             notify_interval_ms: word(8),
-            adv_window_s: word(12),
-            ble_off_s: word(16),
             // An unknown mode byte is a board running firmware this reader
             // predates; report the safe one rather than refusing the whole
             // blob, which would take every other field with it.
             mode: Mode::from_wire(b[2]).unwrap_or_default(),
-            idle_timeout_s: word(20),
-            ble_on_s: word(24),
-        })
+            ..Self::default()
+        };
+        for spec in &crate::session::KNOBS {
+            spec.wire_set(&mut s, word(spec.wire_at));
+        }
+        Some(s)
     }
 }
 
-/// `u8` 0/1: enable the GPS/LoRa power rail.
-///
-/// The wio-s3-max-gps board has no such rail - the GPS and SD sit directly
-/// on +3V3 - so its firmware accepts the write and logs that there is no
-/// hardware behind it. Kept because a board respin could bring it back.
-pub const CFG_PWR_EN: u8 = 0x10;
-/// `u8` 0/1: 1 puts the radio into standby, 0 brings it back.
-pub const CFG_WIO_SLEEP: u8 = 0x11;
+// 0x10 was the GPS/LoRa rail of the two-MCU board. This board has no rail
+// - the GPS and SD sit directly on +3V3 - so the id is reserved and a
+// write to it is refused as unknown, which is what it is.
+
+/// `u8` 0/1: 1 puts the radio into standby, 0 brings it back to receive.
+/// An override inside a tracking posture; outside one the mode has the
+/// radio down already and the flag waits for the next tracking command.
+pub const CFG_RADIO_STANDBY: u8 = 0x11;
 /// `u8` 0/1: GPS backup mode on/off.
 pub const CFG_GPS_SLEEP: u8 = 0x12;
 /// `u32` seconds: ESP deep-sleep wake-check interval, i.e. the cadence
@@ -702,13 +698,19 @@ pub const KIND_OTA: u8 = 3;
 pub const ACK_ID_BULK: u8 = 0x20;
 
 /// Ack statuses beyond gps-proto's ACK_OK/ACK_UNKNOWN_ID/ACK_BAD_VALUE.
-pub const ACK_WIO_ERROR: u8 = 0x10;
-pub const ACK_WIO_TIMEOUT: u8 = 0x11;
+///
+/// The board refused for a reason of its own rather than the op's: no
+/// update slots, an image too big for the one it would go in, a flash
+/// write that failed.
+pub const ACK_BOARD_ERROR: u8 = 0x10;
+// 0x11 was a timeout waiting on the two-MCU board's second chip. Reserved.
+/// The op does not fit the transfer's state: another transport owns one,
+/// or there is none for this op to act on.
 pub const ACK_BAD_STATE: u8 = 0x12;
 
 /// Max data bytes per OP_DATA write. Fits a 251-byte ATT payload after the
 /// 3-byte op header while staying under the UART link chunk size.
-pub const BULK_DATA_MAX: usize = crate::link::DATA_CHUNK;
+pub const BULK_DATA_MAX: usize = 192;
 
 /// Longest write any characteristic in this protocol takes: an `OP_DATA`
 /// frame, which is [`BULK_DATA_MAX`] behind a three-byte
@@ -775,8 +777,7 @@ mod tests {
     #[test]
     fn settings_roundtrip() {
         let s = super::Settings {
-            pwr_en: true,
-            wio_sleep: false,
+            radio_standby: false,
             gps_sleep: true,
             sleep_interval_s: 300,
             notify_interval_ms: 1000,

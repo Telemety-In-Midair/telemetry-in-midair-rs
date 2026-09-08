@@ -7,11 +7,20 @@ description = "Shared protocol for the telemetry-in-midair board: LoRa payloads,
 
 # no_std (except under test). Depends only on gps-proto (also no_std) so both
 # firmwares and host tests can use it.
+[features]
+# The host-side helpers the examples need: the wire constants as JSON. Off
+# for the firmware, which is what keeps the crate no_std there.
+std = []
+
 [dependencies]
 # Trig for the bearing/distance math in `geo`. no_std needs it; the host
 # tests use the same implementation so a result cannot differ by platform.
 libm = "0.2"
 gps-proto = { path = "../../gps-proto" }
+
+[[example]]
+name = "wire_consts"
+required-features = ["std"]
 
 [dev-dependencies]
 # The state space explorer the tests in `tests/` drive the machines with.

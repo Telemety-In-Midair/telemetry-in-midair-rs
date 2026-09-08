@@ -26,7 +26,7 @@ fn main() {
     // scenarios hop, and vectors from a plan with nowhere to hop to would
     // check the permutation against a column of zeroes.
     let cfg = RadioConfig { hop_channels: 50, ..RadioConfig::default() };
-    let plan = Plan::from_config(&cfg).expect("a plan with channels is a plan");
+    let plan = Plan::from_config(&cfg);
     let mut out = String::from("{\n");
 
     out += &format!(

@@ -66,30 +66,17 @@ pub mod usb {
     pub const CFG: u8 = 0x55;
 }
 
-/// Responses (either direction, follow a command).
+/// Responses, following a command.
+///
+/// There is one. The old link had a NAK with eight error codes beside it;
+/// on this board every failure is a gps-proto ack status inside an `ACK`
+/// frame, so a tool reads one vocabulary. The id 0x82 stays unallocated.
 pub mod resp {
-    /// `[cmd u8, value u16le]` - command accepted. `value` is command
-    /// specific (fw version for PING, next expected seq for *_DATA).
+    /// `[cmd u8, value...]` - command accepted. What follows the command
+    /// id is command specific: the firmware version for `PING`, the ack
+    /// bytes for `CFG` and `BULK`.
     pub const ACK: u8 = 0x81;
-    /// `[cmd u8, err u8]` - command failed.
-    pub const NAK: u8 = 0x82;
 }
-
-/// NAK error codes.
-pub mod err {
-    pub const BAD_FRAME: u8 = 0x01;
-    pub const BAD_SIZE: u8 = 0x02;
-    pub const BAD_SEQ: u8 = 0x03;
-    pub const CRC_MISMATCH: u8 = 0x04;
-    pub const FLASH_ERROR: u8 = 0x05;
-    pub const INVALID_STATE: u8 = 0x06;
-    pub const BAD_CONFIG: u8 = 0x07;
-    pub const SD_ERROR: u8 = 0x08;
-}
-
-/// Data bytes per bulk-data frame. Sized well below [`MAX_PAYLOAD`] so a
-/// frame plus response turnaround stays short.
-pub const DATA_CHUNK: usize = 192;
 
 /// Maximum bytes in a status/log line (and the matching BLE characteristic
 /// value). Longer lines are truncated at the source.
@@ -132,13 +119,13 @@ pub const TELEM_HOP_ON: u8 = 0x80;
 /// Mask of the stratum in [`Telemetry::hop`].
 pub const TELEM_HOP_STRATUM: u8 = 0x0F;
 
-pub const TELEMETRY_LEN: usize = 18;
+pub const TELEMETRY_LEN: usize = 19;
 
 /// Periodic radio/GPS status, served over BLE (see [`crate::ble`]).
 ///
 /// Layout (little-endian): `last_rssi: i16, last_snr_cb: i16,
 /// secs_since_rx: u16, rx_count: u32, tx_count: u32, flags: u8, sats: u8,
-/// hop: u8, hop_channel: u8`.
+/// hop: u8, hop_channel: u8, parks_missed: u8`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Telemetry {
     /// RSSI of the last received LoRa packet (dBm), 0 if none yet.
@@ -160,6 +147,11 @@ pub struct Telemetry {
     /// Index of the channel the receiver is on right now, 0 when not
     /// hopping. Watching it change is the cheapest proof the radio hops.
     pub hop_channel: u8,
+    /// Deep sleeps entered before the hardware loop finished parking,
+    /// since the last cold boot, saturating. Each one is a sleep interval
+    /// spent with the receiver, or the radio, still drawing - the one
+    /// power failure that is otherwise invisible from the far side.
+    pub parks_missed: u8,
 }
 
 impl Telemetry {
@@ -179,6 +171,7 @@ impl Telemetry {
         b[15] = self.sats;
         b[16] = self.hop;
         b[17] = self.hop_channel;
+        b[18] = self.parks_missed;
         b
     }
 
@@ -197,6 +190,7 @@ impl Telemetry {
             sats: b[15],
             hop: b[16],
             hop_channel: b[17],
+            parks_missed: b[18],
         })
     }
 }
@@ -455,6 +449,7 @@ mod tests {
             sats: 11,
             hop: TELEM_HOP_ON | 3,
             hop_channel: 27,
+                    parks_missed: 3,
         };
         let b = t.encode();
         assert_eq!(Telemetry::decode(&b), Some(t));

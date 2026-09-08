@@ -206,6 +206,35 @@ pub const fn position_msg_len(mask: u8) -> usize {
     2 + fields_len(mask)
 }
 
+/// The field names the config file uses, in bit order, as the parser
+/// reads them and the example file writes them.
+pub const FIELD_NAMES: [(u8, &str); 7] = [
+    (FIELD_LAT, "lat"),
+    (FIELD_LON, "lon"),
+    (FIELD_ALT, "altitude"),
+    (FIELD_SPEED, "speed"),
+    (FIELD_COURSE, "course"),
+    (FIELD_SATS, "sats"),
+    (FIELD_TIME, "time"),
+];
+
+/// Write `mask` as the quoted, comma-separated list the config file's
+/// `fields` key takes.
+pub fn write_fields(mask: u8, w: &mut dyn core::fmt::Write) -> core::fmt::Result {
+    w.write_str("\"")?;
+    let mut first = true;
+    for (bit, name) in FIELD_NAMES {
+        if mask & bit != 0 {
+            if !first {
+                w.write_str(",")?;
+            }
+            w.write_str(name)?;
+            first = false;
+        }
+    }
+    w.write_str("\"")
+}
+
 /// Encode a position transmission carrying the fields in `mask`, returning the
 /// buffer and the used length. Bits outside [`FIELDS_ALL`] are ignored.
 pub fn encode_position(p: &PositionPacket, mask: u8) -> ([u8; POSITION_MSG_MAX], usize) {

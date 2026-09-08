@@ -33,8 +33,10 @@
 //! ping_interval_s = 5       # no-fix ping period
 //! ```
 
-use crate::ble;
+use core::fmt::{self, Write};
+
 use crate::lora;
+use crate::session::{Knob, KNOBS};
 
 /// Which halves of the air interface a node uses.
 ///
@@ -327,42 +329,47 @@ impl Default for GpsConfig {
     }
 }
 
-/// The duty cycle: how long the board is reachable, and how long it is not.
+/// The `[power]` section: the duty cycle a file asks for, knob by knob.
 ///
-/// These are the only settings in this file that the board also keeps a copy
-/// of - in RTC RAM, so they survive a deep sleep, and in flash, so they
-/// survive a flat cell (see [`crate::session::Stored`]). An app can change
-/// them live over BLE, which nothing else here can do.
+/// Every other key in the file means "this, or the default if absent".
+/// These are the only keys the board also keeps its own copy of - in RTC
+/// RAM so they survive a deep sleep, in flash so they survive a flat cell,
+/// changed live over BLE (see [`crate::session::Stored`]) - so an absent
+/// key has to mean "leave the board's live value alone": under the usual
+/// rule a push that changed only the beacon interval would carry
+/// `ble_off_s = 0` by omission and silently kill a duty cycle set from the
+/// app. Present means adopt, absent means untouched, and an explicit `0`
+/// is still a request. A key that is present wins at the next boot,
+/// because the file is what survives a reflash and the RTC copy is not.
 ///
-/// That is why every field is an `Option`. Elsewhere in this file an absent
-/// key means "the default"; here it means "leave the board's current value
-/// alone", so that pushing an unrelated radio change does not silently undo a
-/// duty cycle somebody set from the app. A key that *is* present wins at the
-/// next boot, because the file is what survives a reflash and the RTC copy is
-/// not.
-///
-/// The ranges are the ones [`crate::ble`] clamps a live write to, but a file
-/// is edited by hand and read once, so an out-of-range value is reported as
-/// [`ConfigError::OutOfRange`] rather than quietly clamped.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The ranges are the ones [`KNOBS`] clamp a live write to, but a file is
+/// edited by hand and read once, so an out-of-range value is reported as
+/// [`ConfigError::OutOfRange`] rather than clamped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct PowerConfig {
-    /// Seconds the BLE controller stays powered down between advertising
-    /// windows; 0 never takes it down. This is the largest lever the
-    /// firmware has - the controller is most of the board's current and its
-    /// lifetime is the only thing that changes it.
-    pub ble_off_s: Option<u32>,
-    /// Seconds each advertising window lasts; 0 means the firmware default.
-    pub adv_window_s: Option<u32>,
-    /// Seconds between deep-sleep wake checks, i.e. the cadence
-    /// `Mode::Stored` runs on; 0 never deep-sleeps, which also means the
-    /// board never stores itself and stays reachable.
-    pub sleep_interval_s: Option<u32>,
-    /// Seconds `Mode::Idle` lasts before the board stores itself; 0 turns
-    /// that off, which is the default.
-    pub idle_timeout_s: Option<u32>,
-    /// Seconds BLE stays up between off periods while tracking; 0 means
-    /// the firmware default.
-    pub ble_on_s: Option<u32>,
+    asked: [Option<u32>; KNOBS.len()],
+}
+
+impl PowerConfig {
+    /// What the file asked for `knob`, if it mentioned it.
+    pub fn get(&self, knob: Knob) -> Option<u32> {
+        self.asked[knob as usize]
+    }
+
+    pub fn set(&mut self, knob: Knob, secs: u32) {
+        self.asked[knob as usize] = Some(secs);
+    }
+
+    /// The same, for building one in place.
+    pub fn with(mut self, knob: Knob, secs: u32) -> Self {
+        self.set(knob, secs);
+        self
+    }
+
+    /// Whether the file mentioned no knob at all.
+    pub fn is_empty(&self) -> bool {
+        self.asked.iter().all(Option::is_none)
+    }
 }
 
 /// Parsed and validated radio configuration.
@@ -655,12 +662,7 @@ impl RadioConfig {
     /// moved and waits for the next window. What a sleep that arrives
     /// mid-beacon has to budget for.
     pub fn tx_worst_case_ms(&self) -> u32 {
-        self.tx_poll_timeout_ms()
-            + if self.hop_channels > 0 {
-                u32::from(self.hop_dwell_ms)
-            } else {
-                0
-            }
+        self.tx_poll_timeout_ms() + u32::from(self.hop_dwell_ms)
     }
 
     /// Upper bound of the random delay a repeater waits before forwarding
@@ -723,13 +725,10 @@ impl RadioConfig {
     }
 
     /// Bytes every frame this node sends carries ahead of its payload: the
-    /// header, plus the hop sync word on a hopping network.
+    /// header and the slot clock's sync word, which every frame carries
+    /// since every node is on the schedule.
     pub fn frame_overhead(&self) -> usize {
-        if self.hop_channels > 0 {
-            crate::lora::HEADER_SYNC_LEN
-        } else {
-            crate::lora::HEADER_LEN
-        }
+        crate::lora::HEADER_SYNC_LEN
     }
 
     /// Time-on-air of one beacon transmission at the current settings, in
@@ -803,8 +802,8 @@ pub const RADIO_CONFIG_LEN: usize = 34;
 
 /// Length of the blob before the hop plan was appended. A board on that
 /// firmware sends this much, and its byte 27 - now `hop_channels` - was a
-/// reserved zero, which reads back as hopping off: exactly what that board
-/// does. [`RadioConfig::decode`] accepts any length from this one up, so a
+/// reserved zero, which reads back as a one-channel plan.
+/// [`RadioConfig::decode`] accepts any length from this one up, so a
 /// newer app can still read an older board; the ping interval, appended
 /// after the plan, reads as the beacon interval when absent, which is the
 /// period such a board pings on.
@@ -919,7 +918,10 @@ impl RadioConfig {
             coding_rate: b[11],
             power_dbm: b[12] as i8,
             rx_boost: flags & RCFG_RX_BOOST != 0,
-            hop_channels: if hopping { b[27] } else { 0 },
+            // A board from before the schedule was always on sent a zero
+            // here, and a zero has meant "one channel" since: the clock on
+            // a single carrier.
+            hop_channels: if hopping { b[27].max(1) } else { 1 },
             hop_step_khz: if hopping { u16at(28) } else { defaults.hop_step_khz },
             hop_dwell_ms: if hopping { u16at(30) } else { defaults.hop_dwell_ms },
             address: b[13],
@@ -970,13 +972,553 @@ pub enum ConfigError {
     Utf8,
 }
 
+// ---------------------------------------------------------------------------
+// The keys
+// ---------------------------------------------------------------------------
+
+/// What a key takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// An integer inside inclusive bounds.
+    Int { min: i64, max: i64 },
+    /// Zero, or an integer inside inclusive bounds: a duration whose zero
+    /// is a setting of its own.
+    IntOrZero { min: i64, max: i64 },
+    /// One of a fixed set of integers.
+    IntChoice(&'static [i64]),
+    Bool,
+    /// One of a fixed set of words, quoted in the file.
+    Choice(&'static [&'static str]),
+    /// A comma-separated list of position field names, quoted.
+    Fields,
+}
+
+/// One key of the config file: where it goes, what it takes, what it is
+/// for. This table is what the parser checks a value against, what the
+/// example file is printed from, and what the app's editor shows beside
+/// each field - the one description of each key.
+pub struct Key {
+    pub section: &'static str,
+    pub name: &'static str,
+    pub kind: Kind,
+    /// Printed into the example commented out: a fact about the board
+    /// that is not to be retuned, or a duty cycle that a push must not
+    /// undo.
+    pub commented: bool,
+    pub doc: &'static str,
+    show: fn(&RadioConfig, &mut dyn Write) -> fmt::Result,
+}
+
+impl Key {
+    /// Write the value `cfg` holds for this key, as the file spells it.
+    pub fn show(&self, cfg: &RadioConfig, w: &mut dyn Write) -> fmt::Result {
+        (self.show)(cfg, w)
+    }
+}
+
+/// A `[section]` of the file and what it groups.
+pub struct Section {
+    pub name: &'static str,
+    pub title: &'static str,
+    pub doc: &'static str,
+}
+
+pub const SECTIONS: &[Section] = &[
+    Section {
+        name: "radio",
+        title: "Radio",
+        doc: "frequency, spreading factor, bandwidth, coding rate and power are the LoRa link-budget knobs: together they set sensitivity, on-air time and radiated power - i.e. range. The three hop_* keys are the channel plan and the slot clock that runs it. The default plan is one channel: a 500 kHz signal may hold a single carrier in the 902-928 MHz band as often as it likes, so hopping buys no air time there that the default modulation does not already have. What the plan is kept for is the clock, which cuts every second into turns and gives each address one - without it two nodes beaconing at the same rate talk over each other. Raise hop_channels to hop for real; see the notes on that key. The four commented keys describe the board the firmware is running on, not a preference: the defaults are the Wio-S3's own hardware, and inside the module SX1262 DIO2 is the VCTL of an SKY13453-385LF antenna switch and DIO3 is that same switch's VDD. Turning the switch off, or supplying it below the 2.5 V its datasheet specifies, leaves the PA transmitting +22 dBm into an isolated port, so the firmware refuses both, logs that it did, and runs the board's values instead.",
+    },
+    Section {
+        name: "network",
+        title: "Network",
+        doc: "Everything is sent. Leaves hear each other directly, so a fleet of nothing but leaves is a working network and these defaults need no changing. A repeater is for covering ground no pair of leaves can reach across on their own. tx_only and rx_only split a leaf in half, for a deployment where the reporting only ever runs one way.",
+    },
+    Section {
+        name: "beacon",
+        title: "Beacon",
+        doc: "What goes out, and how often.",
+    },
+    Section {
+        name: "sd",
+        title: "SD card",
+        doc: "",
+    },
+    Section {
+        name: "debug",
+        title: "Debug",
+        doc: "",
+    },
+    Section {
+        name: "gps",
+        title: "GPS",
+        doc: "MAX-M10 receiver, applied as one UBX-CFG-VALSET to the RAM layer. An absent [gps] section leaves the module at its factory concurrent set.",
+    },
+    Section {
+        name: "power",
+        title: "Power",
+        doc: "The duty cycle: how much of the time the board is reachable. These five are the only keys in this file the board also keeps its own copy of, in RTC RAM so they survive a deep sleep and in flash so they survive a flat cell, and they are the only ones an app can change live over BLE. So they follow a different rule to every other key here: an absent one leaves the board's current value alone rather than resetting it to the default. That is why all five are commented out - a push of this file should not silently undo a duty cycle somebody set from the app. Uncomment one and it wins at the next boot, because the file is what survives a reflash and the RTC copy is not. Writing an explicit 0 is a request, not an absence: it is how a file turns a duty cycle off. What is NOT here is the mode. The board has four - stored, idle, tracking and listening - and which one it is in is a command from the app or the console, never a file: a card that said tracking would put every board it was ever copied into onto the air. Each key belongs to one mode: stored reads sleep_interval_s and adv_window_s, idle reads idle_timeout_s, tracking reads ble_off_s and ble_on_s, and listening reads none of them.",
+    },
+];
+
+/// The `role` choices, in the order [`Role::as_str`] names them.
+const ROLES: [Role; 4] = [Role::Leaf, Role::Repeater, Role::TxOnly, Role::RxOnly];
+const ROLE_NAMES: [&str; 4] = ["leaf", "repeater", "tx_only", "rx_only"];
+const TCXO: [TcxoVolts; 8] = [
+    TcxoVolts::V1_6,
+    TcxoVolts::V1_7,
+    TcxoVolts::V1_8,
+    TcxoVolts::V2_2,
+    TcxoVolts::V2_4,
+    TcxoVolts::V2_7,
+    TcxoVolts::V3_0,
+    TcxoVolts::V3_3,
+];
+const TCXO_NAMES: [&str; 8] = ["1.6", "1.7", "1.8", "2.2", "2.4", "2.7", "3.0", "3.3"];
+const POWER_MODES: [PowerMode; 3] = [PowerMode::Full, PowerMode::PsmOnOff, PowerMode::PsmCyclic];
+const POWER_MODE_NAMES: [&str; 3] = ["full", "psmoo", "psmct"];
+const DYN_MODELS: [DynModel; 8] = [
+    DynModel::Portable,
+    DynModel::Stationary,
+    DynModel::Pedestrian,
+    DynModel::Automotive,
+    DynModel::Sea,
+    DynModel::Airborne1g,
+    DynModel::Airborne2g,
+    DynModel::Airborne4g,
+];
+const DYN_MODEL_NAMES: [&str; 8] = [
+    "portable",
+    "stationary",
+    "pedestrian",
+    "automotive",
+    "sea",
+    "airborne1g",
+    "airborne2g",
+    "airborne4g",
+];
+const BANDWIDTHS: [i64; 4] = [62, 125, 250, 500];
+
+/// Every key the file takes. Aliases the parser also accepts
+/// (`beacon_interval_s`, `beacon_fields`, `dyn_model`, the old mesh's
+/// `lifetime`) are not keys of their own.
+pub const KEYS: &[Key] = &[
+    Key {
+        section: "radio",
+        name: "frequency_hz",
+        kind: Kind::Int { min: RF_MIN_HZ as i64, max: RF_MAX_HZ as i64 },
+        commented: false,
+        doc: "RF center frequency in Hz, 150000000-960000000. With more than one hop channel this is the center of the plan and the channels straddle it; with one it is simply the carrier.",
+        show: |c, w| write!(w, "{}", c.frequency_hz),
+    },
+    Key {
+        section: "radio",
+        name: "hop_channels",
+        kind: Kind::Int { min: 0, max: 255 },
+        commented: false,
+        doc: "Channels in the plan, 1-255 (0 is read as 1). 1, the default, is the slot clock on the single carrier at frequency_hz: nodes share slots and take turns inside them by address, which is what keeps two nodes beaconing at the same rate from talking over each other, and it is the right answer at 500 kHz bandwidth, where the band lets one carrier be held as often as you like. More than 1 adds channel diversity: a fade or an interferer parked on one carrier costs one beacon in hop_channels rather than every beacon, and below 500 kHz of bandwidth 50 channels is what the 902-928 MHz band requires. Hopping is not free - every node hops on one shared clock, from GPS where a node has a fix and from the frames it hears where it does not, so a node that knows nobody's clock spends roughly hop_channels times the beacon interval, divided by the number of nodes transmitting, before it hears the network at all.",
+        show: |c, w| write!(w, "{}", c.hop_channels),
+    },
+    Key {
+        section: "radio",
+        name: "hop_step_khz",
+        kind: Kind::Int { min: HOP_STEP_MIN_KHZ as i64, max: HOP_STEP_MAX_KHZ as i64 },
+        commented: false,
+        doc: "Spacing between hop channels in kHz, 25-5000. At least the bandwidth, or adjacent channels overlap. Unused with one channel, since there is nothing to space. 500 kHz for 50 channels spans 902.75-927.25 MHz around the 915 MHz center.",
+        show: |c, w| write!(w, "{}", c.hop_step_khz),
+    },
+    Key {
+        section: "radio",
+        name: "hop_dwell_ms",
+        kind: Kind::Int { min: HOP_DWELL_MIN_MS as i64, max: HOP_DWELL_MAX_MS as i64 },
+        commented: false,
+        doc: "Slot length in ms, 100-10000, and so how long every node stays on each channel. One transmission per node per slot, which has to fit the slot with a 100 ms guard at each end, so at 1000 ms a beacon may be up to 800 ms on air. The band caps one hop visit at 400 ms; the default beacon is 289 ms. The 800 ms window is cut into as many default beacons as fit - two - and nodes take those turns by address, so two nodes may beacon every second without overlapping.",
+        show: |c, w| write!(w, "{}", c.hop_dwell_ms),
+    },
+    Key {
+        section: "radio",
+        name: "spreading_factor",
+        kind: Kind::Int { min: 5, max: 12 },
+        commented: false,
+        doc: "LoRa spreading factor, 5-12. Higher gives longer range at a lower data rate.",
+        show: |c, w| write!(w, "{}", c.spreading_factor),
+    },
+    Key {
+        section: "radio",
+        name: "bandwidth_khz",
+        kind: Kind::IntChoice(&BANDWIDTHS),
+        commented: false,
+        doc: "LoRa bandwidth in kHz: 62, 125, 250 or 500 (62 means 62.5). Narrower gives longer range at a lower data rate, and a longer frame: the default beacon is 289 ms at 500 and 1150 ms at 125, past the 400 ms one hop visit may occupy a channel. In the 902-928 MHz band only 500 is wide enough to hold a single carrier; anything narrower has to hop, so it needs hop_channels raised to 50 as well.",
+        show: |c, w| write!(w, "{}", c.bandwidth_khz),
+    },
+    Key {
+        section: "radio",
+        name: "coding_rate",
+        kind: Kind::Int { min: 5, max: 8 },
+        commented: false,
+        doc: "Coding rate denominator 5-8 for 4/5..4/8. Higher adds forward error correction at a lower data rate.",
+        show: |c, w| write!(w, "{}", c.coding_rate),
+    },
+    Key {
+        section: "radio",
+        name: "power_dbm",
+        kind: Kind::Int { min: -9, max: 22 },
+        commented: false,
+        doc: "Transmit power in dBm, -9 to 22 on the high-power PA.",
+        show: |c, w| write!(w, "{}", c.power_dbm),
+    },
+    Key {
+        section: "radio",
+        name: "rx_boost",
+        kind: Kind::Bool,
+        commented: false,
+        doc: "Boosted receiver gain: roughly +2 dB of sensitivity for a few mA more current whenever the node is listening.",
+        show: |c, w| write!(w, "{}", c.rx_boost),
+    },
+    Key {
+        section: "radio",
+        name: "dcdc_enabled",
+        kind: Kind::Bool,
+        commented: true,
+        doc: "Use the internal DC-DC (SMPS). The Wio-S3 carries the inductor it needs.",
+        show: |c, w| write!(w, "{}", c.dcdc_enabled),
+    },
+    Key {
+        section: "radio",
+        name: "dio2_rf_switch",
+        kind: Kind::Bool,
+        commented: true,
+        doc: "Let the radio drive its own antenna switch from DIO2 (SetDio2AsRfSwitchCtrl). The Wio-S3 wires DIO2 to the SKY13453-385LF between the PA and the LoRa port, so this must stay on; the firmware ignores an off.",
+        show: |c, w| write!(w, "{}", c.dio2_rf_switch),
+    },
+    Key {
+        section: "radio",
+        name: "tcxo_volts",
+        kind: Kind::Choice(&TCXO_NAMES),
+        commented: true,
+        doc: "Supply the radio drives DIO3 at. Named for the TCXO, but on the Wio-S3 DIO3 is also the antenna switch's VDD, specified 2.5-3.5 V - so only 2.7, 3.0 and 3.3 are usable and the firmware raises anything lower.",
+        show: |c, w| write!(w, "\"{}\"", c.tcxo_volts.as_str()),
+    },
+    Key {
+        section: "radio",
+        name: "tcxo_startup_ms",
+        kind: Kind::Int { min: 1, max: 1_000 },
+        commented: true,
+        doc: "How long the radio waits for the TCXO to settle before using the clock, 1-1000 ms.",
+        show: |c, w| write!(w, "{}", c.tcxo_startup_ms),
+    },
+    Key {
+        section: "network",
+        name: "address",
+        kind: Kind::Int { min: 1, max: 255 },
+        commented: false,
+        doc: "This node's address, 1-255. Must be unique among the nodes that transmit: two senders sharing an address are mutually deaf, each dropping the other's broadcasts as an echo of its own, so neither ever sees the other. An rx_only node never puts its address on the air, so it can keep the default. The address also picks the node's turn inside a slot: number a fleet 1, 2, 3... and the first 2 x interval_s of them never overlap on the air.",
+        show: |c, w| write!(w, "{}", c.address),
+    },
+    Key {
+        section: "network",
+        name: "role",
+        kind: Kind::Choice(&ROLE_NAMES),
+        commented: false,
+        doc: "leaf transmits its own position and receives everyone else's. repeater also retransmits other nodes' broadcasts, extending range past one radio horizon at the cost of doubling the traffic it forwards. tx_only beacons without ever switching the receiver on, which is the largest power saving available to a node nobody needs to track from. rx_only listens without ever transmitting, for a base station that only collects.",
+        show: |c, w| write!(w, "\"{}\"", c.role.as_str()),
+    },
+    Key {
+        section: "network",
+        name: "max_hops",
+        kind: Kind::Int { min: 0, max: MAX_HOPS_LIMIT as i64 },
+        commented: false,
+        doc: "Retransmissions allowed for a broadcast this node sends, 0-8. 0 means no repeater forwards it.",
+        show: |c, w| write!(w, "{}", c.max_hops),
+    },
+    Key {
+        section: "network",
+        name: "dedup_ttl_s",
+        kind: Kind::Int { min: 1, max: 3600 },
+        commented: false,
+        doc: "How long a broadcast is remembered so a repeat of it is dropped rather than delivered or forwarded again, 1-3600 s. Must stay under 200 x interval_s: the beacon id wraps every 256 frames, and past that a node starts suppressing its own later broadcasts as duplicates. The file is refused otherwise.",
+        show: |c, w| write!(w, "{}", c.dedup_ttl_s),
+    },
+    Key {
+        section: "beacon",
+        name: "interval_s",
+        kind: Kind::Int { min: 0, max: 3600 },
+        commented: false,
+        doc: "Position broadcast period in seconds while the node has a fix, 0-3600. A node transmits at most once per slot, so 1 is every slot at the default dwell. It also sets how many nodes fit: a slot holds two default beacons, so 2 x interval_s addresses beacon without overlapping - two every second, four every two seconds, ten every five. 0 silences the node's own transmissions altogether, pings included, as does a role of rx_only.",
+        show: |c, w| write!(w, "{}", c.beacon_interval_s),
+    },
+    Key {
+        section: "beacon",
+        name: "ping_interval_s",
+        kind: Kind::Int { min: 0, max: 3600 },
+        commented: false,
+        doc: "How often a node with no fix says so, 0-3600 s: a small ping goes out in place of the position, so a node that cannot see the sky is still heard. Slower than the beacon by default, since a searching receiver has nothing new to report every second. 0 sends no pings.",
+        show: |c, w| write!(w, "{}", c.ping_interval_s),
+    },
+    Key {
+        section: "beacon",
+        name: "fields",
+        kind: Kind::Fields,
+        commented: false,
+        doc: "Which GPS fields each broadcast carries: lat, lon, altitude, speed, course, sats, time. lat and lon are required. More fields cost more air time.",
+        show: |c, w| lora::write_fields(c.beacon_fields, w),
+    },
+    Key {
+        section: "sd",
+        name: "sd_enabled",
+        kind: Kind::Bool,
+        commented: false,
+        doc: "Use the SD card. false stops position logging and the card's power draw. The config itself still persists: it is backed up to the board's internal flash either way.",
+        show: |c, w| write!(w, "{}", c.sd_enabled),
+    },
+    Key {
+        section: "debug",
+        name: "verbose",
+        kind: Kind::Bool,
+        commented: false,
+        doc: "Log every event on the USB console, on top of the events that are always logged. Costs nothing when nothing is attached; turn it off for a quiet console or when a tool is parsing it.",
+        show: |c, w| write!(w, "{}", c.verbose),
+    },
+    Key {
+        section: "gps",
+        name: "gps_enabled",
+        kind: Kind::Bool,
+        commented: false,
+        doc: "Enable the GPS (US) constellation.",
+        show: |c, w| write!(w, "{}", c.gps.gps_enabled),
+    },
+    Key {
+        section: "gps",
+        name: "glonass_enabled",
+        kind: Kind::Bool,
+        commented: false,
+        doc: "Enable the GLONASS (Russia) constellation. The M10 tracks a limited concurrent set.",
+        show: |c, w| write!(w, "{}", c.gps.glonass_enabled),
+    },
+    Key {
+        section: "gps",
+        name: "galileo_enabled",
+        kind: Kind::Bool,
+        commented: false,
+        doc: "Enable the Galileo (EU) constellation.",
+        show: |c, w| write!(w, "{}", c.gps.galileo_enabled),
+    },
+    Key {
+        section: "gps",
+        name: "beidou_enabled",
+        kind: Kind::Bool,
+        commented: false,
+        doc: "Enable the BeiDou (China) constellation.",
+        show: |c, w| write!(w, "{}", c.gps.beidou_enabled),
+    },
+    Key {
+        section: "gps",
+        name: "qzss_enabled",
+        kind: Kind::Bool,
+        commented: false,
+        doc: "Enable the QZSS (Japan) augmentation.",
+        show: |c, w| write!(w, "{}", c.gps.qzss_enabled),
+    },
+    Key {
+        section: "gps",
+        name: "sbas_enabled",
+        kind: Kind::Bool,
+        commented: false,
+        doc: "Enable SBAS augmentation (WAAS, EGNOS and similar).",
+        show: |c, w| write!(w, "{}", c.gps.sbas_enabled),
+    },
+    Key {
+        section: "gps",
+        name: "power_mode",
+        kind: Kind::Choice(&POWER_MODE_NAMES),
+        commented: false,
+        doc: "GPS power mode: full, psmoo (power-save on/off) or psmct (power-save cyclic tracking).",
+        show: |c, w| write!(w, "\"{}\"", c.gps.power_mode.as_str()),
+    },
+    Key {
+        section: "gps",
+        name: "meas_rate_ms",
+        kind: Kind::Int { min: 25, max: 10_000 },
+        commented: false,
+        doc: "GPS measurement and navigation period in ms, 25-10000.",
+        show: |c, w| write!(w, "{}", c.gps.meas_rate_ms),
+    },
+    Key {
+        section: "gps",
+        name: "dynamic_model",
+        kind: Kind::Choice(&DYN_MODEL_NAMES),
+        commented: false,
+        doc: "GPS motion model: portable, stationary, pedestrian, automotive, sea, airborne1g, airborne2g or airborne4g.",
+        show: |c, w| write!(w, "\"{}\"", c.gps.dyn_model.as_str()),
+    },
+    Key {
+        section: "power",
+        name: KNOBS[Knob::BleOff as usize].name,
+        kind: Kind::IntOrZero { min: KNOBS[Knob::BleOff as usize].min as i64, max: KNOBS[Knob::BleOff as usize].max as i64 },
+        commented: true,
+        doc: KNOBS[Knob::BleOff as usize].doc,
+        show: |_, w| write!(w, "0"),
+    },
+    Key {
+        section: "power",
+        name: KNOBS[Knob::AdvWindow as usize].name,
+        kind: Kind::IntOrZero { min: KNOBS[Knob::AdvWindow as usize].min as i64, max: KNOBS[Knob::AdvWindow as usize].max as i64 },
+        commented: true,
+        doc: KNOBS[Knob::AdvWindow as usize].doc,
+        show: |_, w| write!(w, "0"),
+    },
+    Key {
+        section: "power",
+        name: KNOBS[Knob::BleOn as usize].name,
+        kind: Kind::IntOrZero { min: KNOBS[Knob::BleOn as usize].min as i64, max: KNOBS[Knob::BleOn as usize].max as i64 },
+        commented: true,
+        doc: KNOBS[Knob::BleOn as usize].doc,
+        show: |_, w| write!(w, "0"),
+    },
+    Key {
+        section: "power",
+        name: KNOBS[Knob::SleepInterval as usize].name,
+        kind: Kind::IntOrZero { min: KNOBS[Knob::SleepInterval as usize].min as i64, max: KNOBS[Knob::SleepInterval as usize].max as i64 },
+        commented: true,
+        doc: KNOBS[Knob::SleepInterval as usize].doc,
+        show: |_, w| write!(w, "0"),
+    },
+    Key {
+        section: "power",
+        name: KNOBS[Knob::IdleTimeout as usize].name,
+        kind: Kind::IntOrZero { min: KNOBS[Knob::IdleTimeout as usize].min as i64, max: KNOBS[Knob::IdleTimeout as usize].max as i64 },
+        commented: true,
+        doc: KNOBS[Knob::IdleTimeout as usize].doc,
+        show: |_, w| write!(w, "0"),
+    },
+];
+
+/// The key called `name`, if there is one. Aliases are resolved first.
+pub fn key(name: &str) -> Option<&'static Key> {
+    let name = canonical(name);
+    KEYS.iter().find(|k| k.name == name)
+}
+
+/// The spelling the table uses for a key that has more than one.
+fn canonical(name: &str) -> &str {
+    match name {
+        "beacon_interval_s" => "interval_s",
+        "beacon_fields" => "fields",
+        "dyn_model" => "dynamic_model",
+        other => other,
+    }
+}
+
+/// The header every generated example starts with.
+const EXAMPLE_HEADER: &str = "RADIO.CFG - telemetry-in-midair radio configuration reference. Generated from the key table in the protocol crate (cargo run --example radio_example in proto/); every value below is the firmware default. The firmware reads at most 1024 bytes of config, which the comments here put this file well over, so it is a reference rather than a card file: strip the comments and what remains fits. The tools do that (cd tools && pixi run board-config --address 3 pushes it; add --dry-run --save ../RADIO.CFG for a card file). The card file goes in the SD root as RADIO.CFG (uppercase). A config pushed over USB or BLE is applied live and written to both the card and a backup record in the board's own flash, so it survives a power cycle on a board with no card. At boot the card wins over the backup, so pulling the card to edit RADIO.CFG on a computer does what it looks like it does. Every key is optional - an absent key keeps its default, and an empty file is valid. Section headers are cosmetic: keys are unique across sections, so a key works regardless of which [section] it sits under.";
+
+/// Column the example's comments wrap at.
+const EXAMPLE_WIDTH: usize = 76;
+
+/// Write the reference config file: every key at its default, with its
+/// doc as a comment, the board facts and the duty cycle commented out.
+/// What `RADIO.example.toml` is generated from.
+pub fn write_example(w: &mut dyn Write) -> fmt::Result {
+    let cfg = RadioConfig::default();
+    write_wrapped(w, "# ", EXAMPLE_HEADER, EXAMPLE_WIDTH)?;
+    for section in SECTIONS {
+        w.write_str("\n")?;
+        write!(w, "# -- {} ", section.title)?;
+        for _ in 0..EXAMPLE_WIDTH.saturating_sub(6 + section.title.len()) {
+            w.write_str("-")?;
+        }
+        w.write_str("\n")?;
+        if !section.doc.is_empty() {
+            write_wrapped(w, "# ", section.doc, EXAMPLE_WIDTH)?;
+        }
+        write!(w, "[{}]\n", section.name)?;
+        for key in KEYS.iter().filter(|k| k.section == section.name) {
+            w.write_str("\n")?;
+            write_wrapped(w, "# ", key.doc, EXAMPLE_WIDTH)?;
+            if key.commented {
+                w.write_str("# ")?;
+            }
+            write!(w, "{} = ", key.name)?;
+            key.show(&cfg, w)?;
+            w.write_str("\n")?;
+        }
+    }
+    Ok(())
+}
+
+/// Write `text` word-wrapped at `width`, every line starting with
+/// `prefix`.
+fn write_wrapped(w: &mut dyn Write, prefix: &str, text: &str, width: usize) -> fmt::Result {
+    let mut col = 0usize;
+    for word in text.split_whitespace() {
+        if col == 0 {
+            w.write_str(prefix)?;
+            col = prefix.len();
+        } else if col + 1 + word.len() > width {
+            w.write_str("\n")?;
+            w.write_str(prefix)?;
+            col = prefix.len();
+        } else {
+            w.write_str(" ")?;
+            col += 1;
+        }
+        w.write_str(word)?;
+        col += word.len();
+    }
+    if col > 0 {
+        w.write_str("\n")?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// The parser
+// ---------------------------------------------------------------------------
+
+/// The integer `name` takes, checked against its row of the table.
+fn int_of(name: &str, value: &str, lineno: u32) -> Result<i64, ConfigError> {
+    let k = key(name).ok_or(ConfigError::Syntax(lineno))?;
+    let v = parse_i64(value).ok_or(ConfigError::BadValue(lineno))?;
+    let ok = match k.kind {
+        Kind::Int { min, max } => (min..=max).contains(&v),
+        Kind::IntOrZero { min, max } => v == 0 || (min..=max).contains(&v),
+        Kind::IntChoice(list) => list.contains(&v),
+        _ => return Err(ConfigError::BadValue(lineno)),
+    };
+    if !ok {
+        return Err(ConfigError::OutOfRange(lineno));
+    }
+    Ok(v)
+}
+
+/// Which of `name`'s choices `value` is.
+fn choice_of(name: &str, value: &str, lineno: u32) -> Result<usize, ConfigError> {
+    let k = key(name).ok_or(ConfigError::Syntax(lineno))?;
+    let Kind::Choice(names) = k.kind else {
+        return Err(ConfigError::BadValue(lineno));
+    };
+    let value = unquote(value);
+    names
+        .iter()
+        .position(|n| *n == value)
+        .ok_or(ConfigError::BadValue(lineno))
+}
+
+fn bool_of(value: &str, lineno: u32) -> Result<bool, ConfigError> {
+    parse_bool(value).ok_or(ConfigError::BadValue(lineno))
+}
+
 /// Parse TOML text into a [`RadioConfig`], starting from the defaults so a
 /// partial file is fine. Unknown keys are ignored (forward compatibility).
 pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
     let mut cfg = RadioConfig::default();
     // The last line that shaped the hop plan, so a plan that does not fit
-    // the radio's range is reported against something the author wrote.
+    // the radio's range is reported against something the author wrote;
+    // likewise the lines that set the dedup window and the interval it
+    // has to fit.
     let mut hop_line = 0u32;
+    let mut ttl_line = 0u32;
+    let mut interval_line = 0u32;
     for (idx, raw_line) in text.lines().enumerate() {
         let lineno = idx as u32 + 1;
         let line = match raw_line.split_once('#') {
@@ -998,101 +1540,34 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
             return Err(ConfigError::Syntax(lineno));
         }
 
-        match key {
+        let name = canonical(key);
+        match name {
             "frequency_hz" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                // Sub-GHz ISM range the SX126x covers.
-                if !(RF_MIN_HZ..=RF_MAX_HZ).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.frequency_hz = v as u32;
+                cfg.frequency_hz = int_of(name, value, lineno)? as u32;
                 hop_line = lineno;
             }
+            // 0 was "no plan" once; the schedule is always on now, and a
+            // plan with nowhere to hop to is the one-channel plan.
             "hop_channels" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if v > 255 {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.hop_channels = v as u8;
+                cfg.hop_channels = (int_of(name, value, lineno)? as u8).max(1);
                 hop_line = lineno;
             }
             "hop_step_khz" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if !(HOP_STEP_MIN_KHZ as u64..=HOP_STEP_MAX_KHZ as u64).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.hop_step_khz = v as u16;
+                cfg.hop_step_khz = int_of(name, value, lineno)? as u16;
                 hop_line = lineno;
             }
-            "hop_dwell_ms" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if !(HOP_DWELL_MIN_MS as u64..=HOP_DWELL_MAX_MS as u64).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.hop_dwell_ms = v as u16;
-            }
-            "spreading_factor" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if !(5..=12).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.spreading_factor = v as u8;
-            }
-            "bandwidth_khz" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if !matches!(v, 62 | 125 | 250 | 500) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.bandwidth_khz = v as u16;
-            }
-            "coding_rate" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if !(5..=8).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.coding_rate = v as u8;
-            }
-            "power_dbm" => {
-                let v = parse_i64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if !(-9..=22).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.power_dbm = v as i8;
-            }
-            "rx_boost" => cfg.rx_boost = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
-            "address" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if !(1..=255).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.address = v as u8;
-            }
-            "role" => {
-                cfg.role = match unquote(value) {
-                    "leaf" => Role::Leaf,
-                    "repeater" => Role::Repeater,
-                    "tx_only" => Role::TxOnly,
-                    "rx_only" => Role::RxOnly,
-                    _ => return Err(ConfigError::BadValue(lineno)),
-                };
-            }
-            "max_hops" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if v > MAX_HOPS_LIMIT as u64 {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.max_hops = v as u8;
-            }
+            "hop_dwell_ms" => cfg.hop_dwell_ms = int_of(name, value, lineno)? as u16,
+            "spreading_factor" => cfg.spreading_factor = int_of(name, value, lineno)? as u8,
+            "bandwidth_khz" => cfg.bandwidth_khz = int_of(name, value, lineno)? as u16,
+            "coding_rate" => cfg.coding_rate = int_of(name, value, lineno)? as u8,
+            "power_dbm" => cfg.power_dbm = int_of(name, value, lineno)? as i8,
+            "rx_boost" => cfg.rx_boost = bool_of(value, lineno)?,
+            "address" => cfg.address = int_of(name, value, lineno)? as u8,
+            "role" => cfg.role = ROLES[choice_of(name, value, lineno)?],
+            "max_hops" => cfg.max_hops = int_of(name, value, lineno)? as u8,
             "dedup_ttl_s" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                // Below 1 s dedup is effectively off; above the beacon-id
-                // wrap it starts suppressing a node's own later frames. The
-                // ceiling matches beacon_interval_s so neither can be set to
-                // a value the other makes nonsensical on its own.
-                if !(1..=3600).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.dedup_ttl_s = v as u16;
+                cfg.dedup_ttl_s = int_of(name, value, lineno)? as u16;
+                ttl_line = lineno;
             }
             // Accepted so cards written for the old mesh keep the hop count
             // their author intended: it counted transmissions, where
@@ -1104,21 +1579,12 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                 }
                 cfg.max_hops = ((v - 1) as u8).min(MAX_HOPS_LIMIT);
             }
-            "interval_s" | "beacon_interval_s" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if v > 3600 {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.beacon_interval_s = v as u16;
+            "interval_s" => {
+                cfg.beacon_interval_s = int_of(name, value, lineno)? as u16;
+                interval_line = lineno;
             }
-            "ping_interval_s" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if v > 3600 {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.ping_interval_s = v as u16;
-            }
-            "fields" | "beacon_fields" => {
+            "ping_interval_s" => cfg.ping_interval_s = int_of(name, value, lineno)? as u16,
+            "fields" => {
                 cfg.beacon_fields = parse_fields(value).ok_or(ConfigError::BadValue(lineno))?;
                 // Position is the whole point of the broadcast, and a
                 // receiver has nothing to plot without it.
@@ -1126,136 +1592,58 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
                     return Err(ConfigError::OutOfRange(lineno));
                 }
             }
-            "dcdc_enabled" => {
-                cfg.dcdc_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?
-            }
-            "dio2_rf_switch" => {
-                cfg.dio2_rf_switch = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?
-            }
-            "tcxo_volts" => {
-                cfg.tcxo_volts = match unquote(value) {
-                    "1.6" => TcxoVolts::V1_6,
-                    "1.7" => TcxoVolts::V1_7,
-                    "1.8" => TcxoVolts::V1_8,
-                    "2.2" => TcxoVolts::V2_2,
-                    "2.4" => TcxoVolts::V2_4,
-                    "2.7" => TcxoVolts::V2_7,
-                    "3.0" => TcxoVolts::V3_0,
-                    "3.3" => TcxoVolts::V3_3,
-                    _ => return Err(ConfigError::BadValue(lineno)),
-                };
-            }
-            "tcxo_startup_ms" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                // The ceiling is a stuck-oscillator guard: past this the
-                // radio is not slow to start, it is not starting.
-                if !(1..=1_000).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.tcxo_startup_ms = v as u16;
-            }
-            // -- [sd] -------------------------------------------------------
-            "sd_enabled" => cfg.sd_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
-            // -- [debug] ----------------------------------------------------
-            "verbose" => cfg.verbose = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
-            // -- [gps] ------------------------------------------------------
-            "gps_enabled" => cfg.gps.gps_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
-            "glonass_enabled" => cfg.gps.glonass_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
-            "galileo_enabled" => cfg.gps.galileo_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
-            "beidou_enabled" => cfg.gps.beidou_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
-            "qzss_enabled" => cfg.gps.qzss_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
-            "sbas_enabled" => cfg.gps.sbas_enabled = parse_bool(value).ok_or(ConfigError::BadValue(lineno))?,
+            "dcdc_enabled" => cfg.dcdc_enabled = bool_of(value, lineno)?,
+            "dio2_rf_switch" => cfg.dio2_rf_switch = bool_of(value, lineno)?,
+            "tcxo_volts" => cfg.tcxo_volts = TCXO[choice_of(name, value, lineno)?],
+            "tcxo_startup_ms" => cfg.tcxo_startup_ms = int_of(name, value, lineno)? as u16,
+            "sd_enabled" => cfg.sd_enabled = bool_of(value, lineno)?,
+            "verbose" => cfg.verbose = bool_of(value, lineno)?,
+            "gps_enabled" => cfg.gps.gps_enabled = bool_of(value, lineno)?,
+            "glonass_enabled" => cfg.gps.glonass_enabled = bool_of(value, lineno)?,
+            "galileo_enabled" => cfg.gps.galileo_enabled = bool_of(value, lineno)?,
+            "beidou_enabled" => cfg.gps.beidou_enabled = bool_of(value, lineno)?,
+            "qzss_enabled" => cfg.gps.qzss_enabled = bool_of(value, lineno)?,
+            "sbas_enabled" => cfg.gps.sbas_enabled = bool_of(value, lineno)?,
             "power_mode" => {
-                cfg.gps.power_mode = match unquote(value) {
-                    "full" => PowerMode::Full,
-                    "psmoo" | "psm_onoff" => PowerMode::PsmOnOff,
-                    "psmct" | "psm_cyclic" => PowerMode::PsmCyclic,
-                    _ => return Err(ConfigError::BadValue(lineno)),
+                // The long spellings are accepted for the cards that carry
+                // them; the table names the short ones.
+                let value = match unquote(value) {
+                    "psm_onoff" => "psmoo",
+                    "psm_cyclic" => "psmct",
+                    v => v,
                 };
+                cfg.gps.power_mode = POWER_MODES[choice_of(name, value, lineno)?];
             }
-            "meas_rate_ms" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if !(25..=10_000).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
+            "meas_rate_ms" => cfg.gps.meas_rate_ms = int_of(name, value, lineno)? as u16,
+            "dynamic_model" => cfg.gps.dyn_model = DYN_MODELS[choice_of(name, value, lineno)?],
+            other => {
+                // The `[power]` knobs, each stored as asked - zero
+                // included - because what the board does with them turns
+                // on whether the key was written at all. See
+                // [`PowerConfig`].
+                if let Some(knob) = Knob::from_name(other) {
+                    let v = int_of(other, value, lineno)?;
+                    cfg.power.set(knob, v as u32);
                 }
-                cfg.gps.meas_rate_ms = v as u16;
+                // Anything else is a key this build does not know: ignored.
             }
-            "dynamic_model" | "dyn_model" => {
-                cfg.gps.dyn_model = match unquote(value) {
-                    "portable" => DynModel::Portable,
-                    "stationary" => DynModel::Stationary,
-                    "pedestrian" => DynModel::Pedestrian,
-                    "automotive" => DynModel::Automotive,
-                    "sea" => DynModel::Sea,
-                    "airborne1g" => DynModel::Airborne1g,
-                    "airborne2g" => DynModel::Airborne2g,
-                    "airborne4g" => DynModel::Airborne4g,
-                    _ => return Err(ConfigError::BadValue(lineno)),
-                };
-            }
-            // -- [power] ----------------------------------------------------
-            // Each of these is stored as `Some` even when the value equals
-            // the firmware default, because what the board does with them
-            // turns on whether the key was written at all, not on what it
-            // says. See [`PowerConfig`].
-            "ble_off_s" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if v != 0 && !(ble::BLE_OFF_MIN_S as u64..=ble::BLE_OFF_MAX_S as u64).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.power.ble_off_s = Some(v as u32);
-            }
-            "adv_window_s" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                // 0 is legal and means "the firmware default", which is why
-                // the floor is not `ESP_ADV_MIN_S`.
-                if v != 0 && !(ble::ESP_ADV_MIN_S as u64..=ble::ESP_ADV_MAX_S as u64).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.power.adv_window_s = Some(v as u32);
-            }
-            "sleep_interval_s" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                if v != 0
-                    && !(ble::ESP_SLEEP_MIN_S as u64..=ble::ESP_SLEEP_MAX_S as u64).contains(&v)
-                {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.power.sleep_interval_s = Some(v as u32);
-            }
-            "ble_on_s" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                // 0 means "the firmware default", as with the advertising
-                // window it was split from.
-                if v != 0 && !(ble::BLE_ON_MIN_S as u64..=ble::BLE_ON_MAX_S as u64).contains(&v) {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.power.ble_on_s = Some(v as u32);
-            }
-            "idle_timeout_s" => {
-                let v = parse_u64(value).ok_or(ConfigError::BadValue(lineno))?;
-                // 0 is legal and means "off": the board never stores
-                // itself out of idle, which is also what an absent key
-                // leaves a fresh board doing.
-                if v != 0
-                    && !(ble::IDLE_TIMEOUT_MIN_S as u64..=ble::IDLE_TIMEOUT_MAX_S as u64)
-                        .contains(&v)
-                {
-                    return Err(ConfigError::OutOfRange(lineno));
-                }
-                cfg.power.idle_timeout_s = Some(v as u32);
-            }
-            _ => {} // unknown key: ignore
         }
     }
     // The plan as a whole: every channel has to be somewhere the radio can
     // tune. Checked after the loop because it depends on three keys that
     // can arrive in any order.
-    if let Some(plan) = crate::hop::Plan::from_config(&cfg) {
-        let (lo, hi) = plan.span_hz();
-        if u64::from(lo) < RF_MIN_HZ || u64::from(hi) > RF_MAX_HZ || lo > hi {
-            return Err(ConfigError::OutOfRange(hop_line));
-        }
+    let plan = crate::hop::Plan::from_config(&cfg);
+    let (lo, hi) = plan.span_hz();
+    if u64::from(lo) < RF_MIN_HZ || u64::from(hi) > RF_MAX_HZ || lo > hi {
+        return Err(ConfigError::OutOfRange(hop_line));
+    }
+    // The dedup window against the id it keys on: eight bits, one per
+    // transmission, so past 256 beacons a node starts dropping its own
+    // later frames as duplicates. Refused with margin.
+    if cfg.beacon_interval_s > 0
+        && u32::from(cfg.dedup_ttl_s) > 200 * u32::from(cfg.beacon_interval_s)
+    {
+        return Err(ConfigError::OutOfRange(if ttl_line > 0 { ttl_line } else { interval_line }));
     }
     Ok(cfg)
 }
@@ -1265,41 +1653,41 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
 pub const RF_MIN_HZ: u64 = 150_000_000;
 pub const RF_MAX_HZ: u64 = 960_000_000;
 
-/// Parse raw file bytes (validates UTF-8 first).
+/// Parse from bytes, reporting non-UTF-8 as an error.
 pub fn parse_bytes(bytes: &[u8]) -> Result<RadioConfig, ConfigError> {
     parse(core::str::from_utf8(bytes).map_err(|_| ConfigError::Utf8)?)
 }
 
 fn parse_u64(s: &str) -> Option<u64> {
-    // Allow underscores as digit separators, as TOML does.
-    let mut n: u64 = 0;
+    let s = unquote(s);
+    let mut v: u64 = 0;
     let mut any = false;
-    for b in s.bytes() {
-        match b {
-            b'0'..=b'9' => {
-                n = n.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    for c in s.chars() {
+        match c {
+            '0'..='9' => {
+                v = v.checked_mul(10)?.checked_add((c as u8 - b'0') as u64)?;
                 any = true;
             }
-            b'_' if any => {}
+            '_' => {}
             _ => return None,
         }
     }
-    any.then_some(n)
+    any.then_some(v)
 }
 
 fn parse_i64(s: &str) -> Option<i64> {
+    let s = unquote(s);
     let (neg, digits) = match s.strip_prefix('-') {
         Some(rest) => (true, rest),
-        None => (false, s),
+        None => (false, s.strip_prefix('+').unwrap_or(s)),
     };
-    let v = parse_u64(digits)? as i64;
-    Some(if neg { -v } else { v })
+    let v = parse_u64(digits)?;
+    if v > i64::MAX as u64 {
+        return None;
+    }
+    Some(if neg { -(v as i64) } else { v as i64 })
 }
 
-/// Parse a comma-separated beacon field list ("lat,lon,altitude") into a
-/// [`crate::lora`] field mask. An empty list is rejected: writing `""` reads
-/// like "send nothing", which is not a thing a beacon can do, so it is a
-/// mistake worth reporting rather than silently accepting.
 fn parse_fields(value: &str) -> Option<u8> {
     let mut mask = 0u8;
     for name in unquote(value).split(',') {
@@ -1372,7 +1760,11 @@ mod tests {
     #[test]
     fn a_truncated_file_parses_as_a_shorter_one() {
         let example = include_str!("../../RADIO.example.toml");
-        let head = &example.as_bytes()[..1024];
+        // The head of the file up to its first key: comments and a section
+        // header, which is the shape a 1024-byte cut of it takes.
+        let first_key = example.find("\nfrequency_hz").expect("the example starts at the radio");
+        let head = &example.as_bytes()[..first_key + 1];
+        assert!(head.len() >= 1024, "the header is shorter than a config read");
         assert_eq!(parse_bytes(head), Ok(RadioConfig::default()));
         // Not a quirk of that one offset: a config cut after its first key
         // keeps that key and defaults the rest, silently.
@@ -1482,7 +1874,7 @@ mod tests {
     fn the_default_is_one_channel_with_a_clock() {
         let cfg = RadioConfig::default();
         assert_eq!((cfg.hop_channels, cfg.hop_step_khz, cfg.hop_dwell_ms), (1, 500, 1000));
-        let plan = crate::hop::Plan::from_config(&cfg).expect("one channel is still a plan");
+        let plan = crate::hop::Plan::from_config(&cfg);
         // Nowhere to hop to: every slot is frequency_hz itself.
         assert_eq!(plan.span_hz(), (cfg.frequency_hz, cfg.frequency_hz));
         for slot in 0..8 {
@@ -1491,9 +1883,10 @@ mod tests {
         // But the turns are there, which is the point of keeping it.
         assert!(plan.sub_slots >= 2);
 
-        let off = parse("hop_channels = 0").unwrap();
-        assert_eq!(off.hop_channels, 0);
-        assert!(crate::hop::Plan::from_config(&off).is_none());
+        // 0 was "no plan" once; the schedule is always on, so it reads as
+        // the one-channel plan it is.
+        assert_eq!(parse("hop_channels = 0").unwrap().hop_channels, 1);
+        assert_eq!(parse("hop_channels = 0").unwrap(), RadioConfig::default());
         assert_eq!(parse("hop_channels = 50").unwrap().hop_channels, 50);
 
         assert_eq!(parse("hop_channels = 64").unwrap().hop_channels, 64);
@@ -1528,26 +1921,25 @@ mod tests {
             parse("frequency_hz = 160_000_000\nhop_channels = 42"),
             Err(ConfigError::OutOfRange(2))
         );
-        // Turned off, the plan cannot fail to fit.
-        assert!(parse("hop_channels = 0\nhop_step_khz = 5000").is_ok());
+        // One channel has no span to fail with, whatever the step.
+        assert!(parse("hop_channels = 1\nhop_step_khz = 5000").is_ok());
     }
 
-    /// The sync word is four bytes on every hopped frame, so the beacon and
-    /// the ping both cost more air with hopping on than off - and the
-    /// estimate the app prints has to say so.
+    /// The sync word is four bytes on every frame - every node is on the
+    /// schedule - so the frame overhead is the header and the word, on a
+    /// one-channel plan as much as on fifty.
     #[test]
-    fn hopping_adds_the_sync_word_to_the_airtime() {
+    fn every_frame_carries_the_sync_word() {
         let on = RadioConfig::default();
-        let off = RadioConfig { hop_channels: 0, ..on };
+        let wide = RadioConfig { hop_channels: 50, ..on };
         assert_eq!(on.frame_overhead(), lora::HEADER_SYNC_LEN);
-        assert_eq!(off.frame_overhead(), lora::HEADER_LEN);
-        assert!(on.beacon_airtime_us() >= off.beacon_airtime_us());
-        assert!(on.ping_airtime_us() >= off.ping_airtime_us());
+        assert_eq!(wide.frame_overhead(), lora::HEADER_SYNC_LEN);
+        assert_eq!(on.beacon_airtime_us(), wide.beacon_airtime_us());
         assert!(on.ping_airtime_us() < on.beacon_airtime_us());
         // At SF12/BW500 the four bytes ride in the same symbol block, so the
         // default beacon stays under 300 ms and well inside a 1 s slot.
         assert!(on.beacon_airtime_us() < 300_000, "{} us", on.beacon_airtime_us());
-        let plan = crate::hop::Plan::from_config(&on).unwrap();
+        let plan = crate::hop::Plan::from_config(&on);
         assert!(plan.fits(on.beacon_airtime_us().div_ceil(1000)));
     }
 
@@ -1627,18 +2019,16 @@ mod tests {
     #[test]
     fn time_on_air_matches_hand_calc() {
         // SF7, BW125, CR 4/5, with a header (3) + position lat/lon (10) =
-        // 13-byte PHY payload: the 46.3 ms figure the docs quote. With
-        // hopping on the sync word makes it 17 bytes and one more symbol
-        // block, 5.1 ms at this modulation.
+        // 13-byte PHY payload: the 46.3 ms figure the docs quote. Every
+        // frame carries the sync word as well, which makes the beacon 17
+        // bytes and one more symbol block, 5.1 ms at this modulation.
         let mut cfg = RadioConfig {
             spreading_factor: 7,
             bandwidth_khz: 125,
-            hop_channels: 0,
             ..RadioConfig::default()
         };
         assert_eq!(cfg.time_on_air_us(13), 46_336);
-        assert_eq!(cfg.beacon_airtime_us(), 46_336);
-        cfg.hop_channels = 1;
+        assert_eq!(cfg.time_on_air_us(17), 51_456);
         assert_eq!(cfg.beacon_airtime_us(), 51_456);
 
         // The shipped default (SF12/BW500) beacon: ~289 ms. Shorter than the
@@ -1920,17 +2310,17 @@ mod tests {
     /// about that board. A blob cut anywhere inside the hop fields reads
     /// the same way rather than half a plan.
     #[test]
-    fn radio_config_blob_from_before_hopping_reads_as_hopping_off() {
+    fn radio_config_blob_from_before_hopping_reads_as_one_channel() {
         let good = RadioConfig { beacon_interval_s: 20, ..RadioConfig::default() }.encode();
         let old = RadioConfig::decode(&good[..RADIO_CONFIG_LEN_V1]).unwrap();
-        assert_eq!(old.hop_channels, 0);
+        assert_eq!(old.hop_channels, 1);
         assert_eq!(old.hop_step_khz, RadioConfig::default().hop_step_khz);
         assert_eq!(old.hop_dwell_ms, RadioConfig::default().hop_dwell_ms);
         // Such a board pinged on its beacon interval, so that is what it
         // reads back as pinging on.
         assert_eq!(old.ping_interval_s, 20);
         assert_eq!(
-            RadioConfig { hop_channels: 1, ping_interval_s: 5, ..old },
+            RadioConfig { ping_interval_s: 5, ..old },
             RadioConfig { beacon_interval_s: 20, ..RadioConfig::default() }
         );
         // A blob with the plan but not the ping interval: hopping as sent,
@@ -1941,7 +2331,7 @@ mod tests {
         // Cut inside a field, the field is absent rather than half-read.
         let cut = RadioConfig::decode(&good[..RADIO_CONFIG_LEN - 1]).unwrap();
         assert_eq!(cut.ping_interval_s, 20);
-        assert_eq!(RadioConfig::decode(&good[..RADIO_CONFIG_LEN_HOP - 1]).unwrap().hop_channels, 0);
+        assert_eq!(RadioConfig::decode(&good[..RADIO_CONFIG_LEN_HOP - 1]).unwrap().hop_channels, 1);
     }
 
     /// A longer buffer must still decode: a future layout can only grow, and
@@ -1997,7 +2387,8 @@ mod tests {
     fn a_file_with_no_power_section_asks_for_nothing() {
         let cfg = parse("frequency_hz = 915000000").unwrap();
         assert_eq!(cfg.power, PowerConfig::default());
-        assert_eq!(cfg.power.ble_off_s, None);
+        assert!(cfg.power.is_empty());
+        assert_eq!(cfg.power.get(Knob::BleOff), None);
     }
 
     /// A zero is a value, not an absence: writing `ble_off_s = 0` is how a
@@ -2006,9 +2397,10 @@ mod tests {
     #[test]
     fn an_explicit_zero_is_still_a_request() {
         let cfg = parse("ble_off_s = 0\nsleep_interval_s = 0\nadv_window_s = 0").unwrap();
-        assert_eq!(cfg.power.ble_off_s, Some(0));
-        assert_eq!(cfg.power.sleep_interval_s, Some(0));
-        assert_eq!(cfg.power.adv_window_s, Some(0));
+        assert_eq!(cfg.power.get(Knob::BleOff), Some(0));
+        assert_eq!(cfg.power.get(Knob::SleepInterval), Some(0));
+        assert_eq!(cfg.power.get(Knob::AdvWindow), Some(0));
+        assert_eq!(cfg.power.get(Knob::BleOn), None);
     }
 
     #[test]
@@ -2017,11 +2409,11 @@ mod tests {
             "[power]\nble_off_s = 30\nadv_window_s = 10\nsleep_interval_s = 120\nidle_timeout_s = 900\nble_on_s = 20",
         )
         .unwrap();
-        assert_eq!(cfg.power.ble_off_s, Some(30));
-        assert_eq!(cfg.power.adv_window_s, Some(10));
-        assert_eq!(cfg.power.sleep_interval_s, Some(120));
-        assert_eq!(cfg.power.idle_timeout_s, Some(900));
-        assert_eq!(cfg.power.ble_on_s, Some(20));
+        assert_eq!(cfg.power.get(Knob::BleOff), Some(30));
+        assert_eq!(cfg.power.get(Knob::AdvWindow), Some(10));
+        assert_eq!(cfg.power.get(Knob::SleepInterval), Some(120));
+        assert_eq!(cfg.power.get(Knob::IdleTimeout), Some(900));
+        assert_eq!(cfg.power.get(Knob::BleOn), Some(20));
 
         // Below the floor but not zero, and above the ceiling, on each key.
         for bad in [
@@ -2041,5 +2433,87 @@ mod tests {
             );
         }
     }
-}
 
+    // -- the key table -----------------------------------------------------
+
+    /// The shipped example is this crate's output, so the file, the
+    /// parser's ranges and the app's field help cannot drift apart.
+    /// Regenerate with `cargo run --example radio_example >
+    /// ../RADIO.example.toml`.
+    #[test]
+    fn the_shipped_example_is_generated() {
+        let mut out = String::new();
+        write_example(&mut out).unwrap();
+        let shipped = include_str!("../../RADIO.example.toml");
+        assert!(
+            shipped == out,
+            "RADIO.example.toml is out of date - regenerate it with cargo run --example radio_example"
+        );
+        // No line runs past the wrap, and every key's doc is there.
+        for line in out.lines() {
+            assert!(line.len() <= 80, "{line}");
+        }
+        for k in KEYS {
+            assert!(out.contains(&format!("{} = ", k.name)), "{} missing", k.name);
+        }
+    }
+
+    /// Every key in the table is one the parser accepts at its own default,
+    /// commented or not, and every section it names exists.
+    #[test]
+    fn every_key_in_the_table_parses_at_its_default() {
+        let cfg = RadioConfig::default();
+        for k in KEYS {
+            assert!(SECTIONS.iter().any(|s| s.name == k.section), "{} in no section", k.name);
+            assert_eq!(key(k.name).map(|x| x.name), Some(k.name));
+            let mut line = String::new();
+            write!(line, "{} = ", k.name).unwrap();
+            k.show(&cfg, &mut line).unwrap();
+            let parsed = parse(&line).unwrap_or_else(|e| panic!("{line}: {e:?}"));
+            // A power key at 0 is a request, so the config differs by
+            // exactly that; everything else is the default it printed.
+            match Knob::from_name(k.name) {
+                Some(knob) => assert_eq!(parsed.power.get(knob), Some(0)),
+                None => assert_eq!(parsed, cfg, "{line}"),
+            }
+            // And a value past the bounds is refused with a line number.
+            match k.kind {
+                Kind::Int { max, .. } | Kind::IntOrZero { max, .. } => {
+                    let over = format!("{} = {}", k.name, max + 1);
+                    assert_eq!(parse(&over), Err(ConfigError::OutOfRange(1)), "{over}");
+                }
+                Kind::IntChoice(_) => {
+                    assert_eq!(parse(&format!("{} = 1", k.name)), Err(ConfigError::OutOfRange(1)));
+                }
+                Kind::Choice(_) => {
+                    let bad = format!("{} = \"nonsense\"", k.name);
+                    assert_eq!(parse(&bad), Err(ConfigError::BadValue(1)), "{bad}");
+                }
+                Kind::Bool => {
+                    assert_eq!(parse(&format!("{} = maybe", k.name)), Err(ConfigError::BadValue(1)));
+                }
+                Kind::Fields => {}
+            }
+        }
+        // The aliases resolve to table keys.
+        for alias in ["beacon_interval_s", "beacon_fields", "dyn_model"] {
+            assert!(key(alias).is_some(), "{alias}");
+        }
+        assert!(key("no_such_key").is_none());
+    }
+
+    /// The dedup window has to sit inside the beacon id's wrap, and the
+    /// file is refused otherwise - against whichever line set it up.
+    #[test]
+    fn the_dedup_window_must_fit_the_id_wrap() {
+        assert!(parse("dedup_ttl_s = 200").is_ok());
+        assert_eq!(parse("dedup_ttl_s = 201"), Err(ConfigError::OutOfRange(1)));
+        assert_eq!(parse("interval_s = 1\ndedup_ttl_s = 201"), Err(ConfigError::OutOfRange(2)));
+        assert!(parse("interval_s = 2\ndedup_ttl_s = 400").is_ok());
+        // A silenced node has no ids to wrap.
+        assert!(parse("interval_s = 0\ndedup_ttl_s = 3600").is_ok());
+        // The interval line takes the blame when the window was left at
+        // its default and the interval moved under it.
+        assert!(parse("dedup_ttl_s = 3").is_ok());
+    }
+}

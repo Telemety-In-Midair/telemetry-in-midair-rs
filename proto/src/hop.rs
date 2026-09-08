@@ -17,7 +17,8 @@
 //! carrier, every slot, and the whole of the clock and the turns below
 //! still running. What that says is that the schedule and the channel
 //! diversity are separable, and only the schedule is always worth paying
-//! for. Hopping proper is a setting - see [`RadioConfig::hop_channels`].
+//! for - so there is no plan-less node any more: every config has a plan,
+//! and hopping proper is [`RadioConfig::hop_channels`] above 1.
 //!
 //! The clock itself is nothing but a local millisecond counter and the two
 //! numbers that map it onto slots - when a slot began, and which slot it
@@ -98,15 +99,17 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The plan `cfg` describes, or `None` when hopping is off.
-    pub fn from_config(cfg: &RadioConfig) -> Option<Self> {
-        (cfg.hop_channels > 0).then_some(Self::new(
-            cfg.hop_channels,
+    /// The plan `cfg` describes. There is always one: a config's
+    /// `hop_channels` is at least 1, and a one-channel plan is the slot
+    /// clock and the turns on the carrier at `frequency_hz`.
+    pub fn from_config(cfg: &RadioConfig) -> Self {
+        Self::new(
+            cfg.hop_channels.max(1),
             cfg.hop_step_khz,
             cfg.frequency_hz,
             cfg.hop_dwell_ms,
             cfg.hop_unit_airtime_us().div_ceil(1000),
-        ))
+        )
     }
 
     /// A plan cut into turns for a lean beacon of `unit_ms` on air.
@@ -597,7 +600,7 @@ mod tests {
     /// it. Every test about turns, windows and clocks runs on this, since
     /// none of them depend on the channel count.
     fn plan() -> Plan {
-        Plan::from_config(&RadioConfig::default()).expect("one channel is still a plan")
+        Plan::from_config(&RadioConfig::default())
     }
 
     /// The plan a node hopping for real is on: fifty channels of the

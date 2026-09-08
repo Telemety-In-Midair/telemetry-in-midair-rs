@@ -49,19 +49,20 @@ import sys
 
 import wio_link as link
 
-# name -> (config id, value width in bytes; 0 means an ASCII label)
+# name -> (config id, value width in bytes; 0 means an ASCII label). The
+# ids come from the protocol crate through wire_consts.json: the five
+# durations under their config-file names with the `_s` dropped and `_`
+# for `-`, the rest by their own names.
 SETTINGS = {
-    "rail": (0x10, 1),
-    "radio-standby": (0x11, 1),
-    "gps-sleep": (0x12, 1),
-    "sleep": (0x13, 4),
-    "adv-window": (0x14, 4),
-    "ble-off": (0x16, 4),
-    "mode": (0x17, 1),
-    "idle-timeout": (0x18, 4),
-    "name": (0x19, 0),
-    "ble-on": (0x1A, 4),
+    "radio-standby": (link.CFG_IDS["radio_standby"], 1),
+    "gps-sleep": (link.CFG_IDS["gps_sleep"], 1),
+    "mode": (link.CFG_IDS["mode"], 1),
+    "name": (link.CFG_IDS["name"], 0),
 }
+SETTINGS.update({
+    name.removesuffix("_s").replace("_", "-"): (knob["id"], 4)
+    for name, knob in link.KNOBS.items()
+})
 
 # `midair_proto::ble::NAME_LABEL_MAX` and the charset `valid_label` takes.
 # Checked here as well as on the board so a typo comes back as a message

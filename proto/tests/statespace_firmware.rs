@@ -39,9 +39,10 @@ use midair_explore::{explore, Machine};
 use midair_proto::ble::{self, Mode};
 use midair_proto::bulk::Owner;
 use midair_proto::posture::{Card, Effect, Gps, Posture, Radio, Request, Requests};
+use midair_proto::radiocfg::Role;
 use midair_proto::session::{
-    self, apply, boot_mode, dispatch, down_period, Accepted, Pass, Serve, Stored, Then,
-    PFLAG_GPS_SLEEP, PFLAG_WIO_SLEEP,
+    apply, boot_mode, dispatch, during_ble_down, Accepted, Next, Serve, ServeCommand, Stored,
+    Then, PFLAG_GPS_SLEEP, PFLAG_RADIO_STANDBY,
 };
 
 /// Where the BLE side is.
@@ -64,7 +65,7 @@ enum Ble {
 enum Write {
     Mode(Mode),
     GpsSleep(bool),
-    WioSleep(bool),
+    RadioStandby(bool),
     /// A nap of the configured cadence.
     SleepNow,
 }
@@ -74,7 +75,7 @@ impl Write {
         match self {
             Write::Mode(m) => vec![ble::CFG_MODE, 1, m.as_wire()],
             Write::GpsSleep(on) => vec![ble::CFG_GPS_SLEEP, 1, on as u8],
-            Write::WioSleep(on) => vec![ble::CFG_WIO_SLEEP, 1, on as u8],
+            Write::RadioStandby(on) => vec![ble::CFG_RADIO_STANDBY, 1, on as u8],
             Write::SleepNow => {
                 let mut v = vec![ble::CFG_SLEEP_NOW, 4];
                 v.extend_from_slice(&0u32.to_le_bytes());
@@ -132,16 +133,22 @@ enum Event {
 }
 
 /// The whole board.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct Board {
     stored: Stored,
     serve: Serve,
     ble: Ble,
     posture: Posture,
     requests: Requests,
-    /// The sleep-now cell: seconds a command asked the board to sleep
-    /// for, until the serve loop acts on it.
-    sleep_now: Option<u32>,
+    /// A nap a connected session has been told about and not yet ended
+    /// for: the first one wins, since the session ends on it. A moved mode
+    /// read during a session is dropped - the next pass re-budgets from
+    /// the settings in any case - so it is not kept here.
+    pending_sleep: Option<u32>,
+    /// A sleep has been asked for and the chip has not gone down: the gate
+    /// that keeps the loop from starting a transmit the sleep would wait
+    /// out.
+    sleep_asked: bool,
     /// The hardware loop finished the park.
     sleep_ready: bool,
     transfer: Option<Owner>,
@@ -160,7 +167,8 @@ impl Board {
             ble: Ble::Advertising,
             posture: Posture::at_boot(Mode::Stored, &stored).0,
             requests: Requests::new(),
-            sleep_now: None,
+            pending_sleep: None,
+            sleep_asked: false,
             sleep_ready: false,
             transfer: None,
             tx: false,
@@ -177,7 +185,8 @@ impl Board {
         self.stored.mode = mode;
         self.posture = Posture::at_boot(mode, &self.stored).0;
         self.requests = Requests::new();
-        self.sleep_now = None;
+        self.pending_sleep = None;
+        self.sleep_asked = false;
         self.sleep_ready = false;
         self.transfer = None;
         self.tx = false;
@@ -188,18 +197,20 @@ impl Board {
 
     /// The top of the serve loop.
     fn loop_top(&mut self) {
-        let (_, pass) = self.serve.pass(0, &self.stored);
-        match pass {
-            Pass::Advertise { .. } => self.ble = Ble::Advertising,
-            Pass::Sleep { interval_s } => self.begin_sleep(interval_s),
-            Pass::BleDown { .. } => self.ble = Ble::Down,
+        let (_, next) = self.serve.pass(0, &self.stored);
+        match next {
+            Next::Advertise { .. } => self.ble = Ble::Advertising,
+            Next::Sleep { interval_s } => self.begin_sleep(interval_s),
+            Next::BleDown { .. } => self.ble = Ble::Down,
         }
     }
 
-    /// `enter_deep_sleep`: clear the command that got here, ask the
-    /// hardware loop to park, wait for it.
+    /// `enter_deep_sleep`: the sleep is being acted on, ask the hardware
+    /// loop to park, wait for it. A nap still queued is overtaken by this
+    /// one and dropped with the chip's RAM.
     fn begin_sleep(&mut self, _secs: u32) {
-        self.sleep_now = None;
+        self.sleep_asked = false;
+        self.pending_sleep = None;
         self.sleep_ready = false;
         self.requests.push(Request::PrepareSleep);
         self.ble = Ble::Parking;
@@ -210,56 +221,53 @@ impl Board {
             Then::Serve => self.ble = Ble::Connected,
             Then::Retry | Then::Continue => self.loop_top(),
             Then::Sleep(secs) => self.begin_sleep(secs),
-            Then::Return => match down_period(&self.stored) {
-                Some(_) => self.ble = Ble::Down,
-                None => self.loop_top(),
-            },
+            Then::BleDown(_) => self.ble = Ble::Down,
         }
     }
 
-    /// The firmware's `apply_config`, on either transport.
+    /// The firmware's `apply_config`, on either transport: the settings
+    /// change, the hardware request is queued, the serve command is sent.
     fn write(&mut self, via: Via, w: Write) {
         let outcome = apply(&mut self.stored, &w.bytes());
         let d = dispatch(outcome.action, &self.stored);
         if let Some(r) = d.request {
             self.requests.push(r);
         }
-        if let Some(secs) = d.sleep_now {
-            self.sleep_now = Some(secs);
-        }
         let _ = via;
-        // The signals wake whichever wait is running.
+        let Some(command) = d.command else {
+            return;
+        };
+        if let ServeCommand::SleepNow(_) = command {
+            self.sleep_asked = true;
+        }
+        // Whichever wait the serve loop is in takes the command at once.
+        // A connected session takes it too, as its own event, since the
+        // ack has to leave first; parking and asleep, nobody reads the
+        // channel and the command is dropped with the chip's RAM.
         match self.ble {
             Ble::Advertising => {
-                if let Some(secs) = self.sleep_now {
-                    let step = self.serve.on_accept(0, Accepted::SleepNow(secs), &self.stored);
-                    self.after(step.then);
-                } else if d.mode_signal {
-                    let step = self.serve.on_accept(0, Accepted::ModeChanged, &self.stored);
-                    self.after(step.then);
+                let step = self.serve.on_accept(0, Accepted::Command(command), &self.stored);
+                self.after(step.then);
+            }
+            Ble::Down => self.after(during_ble_down(command)),
+            Ble::Connected => {
+                if let ServeCommand::SleepNow(secs) = command {
+                    self.pending_sleep.get_or_insert(secs);
                 }
             }
-            Ble::Down => {
-                if self.sleep_now.is_some() {
-                    let secs = self.sleep_now.unwrap();
-                    self.begin_sleep(secs);
-                } else if d.mode_signal {
-                    self.loop_top();
-                }
-            }
-            // Connected: the session's own arm ends it, as a separate
-            // event, since the ack has to leave first. Parking and asleep:
-            // nothing is waiting on either signal.
-            Ble::Connected | Ble::Parking | Ble::Asleep => {}
+            Ble::Parking | Ble::Asleep => {}
         }
     }
 
-    fn end_session(&mut self) {
+    /// The session ended: a nap it took a command for is acted on, else
+    /// the board advertises again.
+    fn end_session(&mut self, slept_for: Option<u32>) {
         // A transfer the phone was midway through does not outlive it.
         if self.transfer == Some(Owner::Ble) {
             self.transfer = None;
         }
-        let then = self.serve.on_session_end(0, self.sleep_now.take(), &self.stored);
+        self.pending_sleep = None;
+        let then = self.serve.on_session_end(0, slept_for, &self.stored);
         self.after(then);
     }
 
@@ -292,7 +300,7 @@ impl Board {
     }
 
     fn bounded(&self) -> bool {
-        self.stored.at_expiry() != session::Next::Advertise
+        !self.stored.at_expiry().advertises()
     }
 }
 
@@ -307,7 +315,7 @@ impl Machine for Firmware {
     fn initial(&self) -> Vec<Board> {
         let mut out = Vec::new();
         for mode in [Mode::Stored, Mode::Tracking, Mode::Listening] {
-            for flags in [0, PFLAG_GPS_SLEEP, PFLAG_WIO_SLEEP, PFLAG_GPS_SLEEP | PFLAG_WIO_SLEEP] {
+            for flags in [0, PFLAG_GPS_SLEEP, PFLAG_RADIO_STANDBY, PFLAG_GPS_SLEEP | PFLAG_RADIO_STANDBY] {
                 let bench = Stored {
                     mode,
                     flags,
@@ -342,7 +350,7 @@ impl Machine for Firmware {
             }
             Ble::Connected => {
                 ev.push(Event::Disconnect);
-                if b.sleep_now.is_some() {
+                if b.pending_sleep.is_some() {
                     ev.push(Event::SessionEndsForSleep);
                 }
                 for w in writes() {
@@ -375,8 +383,8 @@ impl Machine for Firmware {
             // The loop cannot take a pass while it is inside a transmit.
             if !b.tx {
                 ev.push(Event::LoopPass);
-                let sleep_pending = b.sleep_now.is_some() || b.requests.sleep_pending();
-                if b.posture.may_transmit(true, b.transfer.is_some(), sleep_pending) {
+                let sleep_pending = b.sleep_asked || b.requests.sleep_pending();
+                if b.posture.may_transmit(Role::Leaf, b.transfer.is_some(), sleep_pending) {
                     ev.push(Event::TxStart);
                 }
             } else {
@@ -387,7 +395,7 @@ impl Machine for Firmware {
     }
 
     fn step(&self, b: &Board, e: &Event) -> Board {
-        let mut b = *b;
+        let mut b = b.clone();
         b.ignored_while_parked = false;
         match *e {
             Event::Connect => {
@@ -411,7 +419,14 @@ impl Machine for Firmware {
                 let step = b.serve.on_accept(ends, Accepted::Expired, &b.stored);
                 b.after(step.then);
             }
-            Event::Disconnect | Event::SessionEndsForSleep => b.end_session(),
+            // The session's command arm: a nap it was told about ends it
+            // with the seconds in hand. A plain disconnect ends it with
+            // whatever nap was queued but not yet read - the firmware's
+            // arm reads the channel before the session returns.
+            Event::Disconnect | Event::SessionEndsForSleep => {
+                let slept_for = b.pending_sleep;
+                b.end_session(slept_for);
+            }
             Event::DownOver => b.loop_top(),
             Event::Write(via, w) => b.write(via, w),
             Event::LoopPass => b.loop_pass(),
@@ -474,7 +489,7 @@ impl Machine for Firmware {
         // settings report - except while a store is on its way to the
         // sleep that carries it out.
         if b.requests.is_empty()
-            && b.sleep_now.is_none()
+            && !b.sleep_asked
             && matches!(b.ble, Ble::Advertising | Ble::Connected | Ble::Down)
             && b.posture.live != b.stored.mode
         {
@@ -492,9 +507,7 @@ impl Machine for Firmware {
     fn check_step(&self, from: &Board, e: &Event, to: &Board) -> Result<(), String> {
         // A transmit never starts into a transfer or over a pending sleep.
         if *e == Event::TxStart
-            && (from.transfer.is_some()
-                || from.sleep_now.is_some()
-                || from.requests.sleep_pending())
+            && (from.transfer.is_some() || from.sleep_asked || from.requests.sleep_pending())
         {
             return Err("a transmit started over a transfer or a pending sleep".into());
         }
@@ -508,7 +521,7 @@ impl Machine for Firmware {
 
     fn describe(&self, b: &Board) -> String {
         format!(
-            "ble {:?} | settings {:?} flags {:#x} | hw {:?} radio {:?} gps {:?} card {:?} | queue {} sleep_now {:?} ready {} transfer {:?} tx {}",
+            "ble {:?} | settings {:?} flags {:#x} | hw {:?} radio {:?} gps {:?} card {:?} | queue {} nap {:?} asked {} ready {} transfer {:?} tx {}",
             b.ble,
             b.stored.mode,
             b.stored.flags,
@@ -517,7 +530,8 @@ impl Machine for Firmware {
             b.posture.gps,
             b.posture.card,
             if b.requests.is_empty() { "empty" } else { "pending" },
-            b.sleep_now,
+            b.pending_sleep,
+            b.sleep_asked,
             b.sleep_ready,
             b.transfer,
             b.tx
@@ -549,8 +563,8 @@ fn writes() -> [Write; 9] {
         Write::Mode(Mode::Listening),
         Write::GpsSleep(true),
         Write::GpsSleep(false),
-        Write::WioSleep(true),
-        Write::WioSleep(false),
+        Write::RadioStandby(true),
+        Write::RadioStandby(false),
         Write::SleepNow,
     ]
 }

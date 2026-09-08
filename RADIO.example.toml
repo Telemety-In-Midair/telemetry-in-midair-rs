@@ -1,226 +1,282 @@
-# RADIO.CFG - WIO-E5 configuration reference.
-#
-# This is the reference, not a drop-in card file: the firmware reads at most
-# 1024 bytes of config and the documentation below puts this file several
-# times over that. Strip the comments and the _description/_type keys and
-# what remains is about 500 bytes, which fits. The tools do that for you:
-#
-#   cd tools && pixi run wio-config --address 3                 # push it
-#   cd tools && pixi run wio-config --address 3 --dry-run \
-#                                   --save ../RADIO.CFG         # card file
-#
-# The card file goes in the SD root as RADIO.CFG (uppercase). A config
-# pushed over USB or BLE is applied live and written to both the card and a
-# backup record in the board's own flash, so it survives a power cycle on a
-# board with no card. At boot the card wins over the backup, so pulling the
-# card to edit RADIO.CFG on a computer does what it looks like it does - and
-# a boot that reads the card refreshes the backup from it.
-#
-# Every key is optional - an absent key keeps its default, and an empty
-# file is valid. Section headers are cosmetic: keys are unique across
-# sections, so a key works regardless of which [section] it sits under.
-#
-# Each setting is paired with a "<key>_description" string. The firmware
-# ignores unknown keys, so these descriptions are inert to the WIO - they
-# exist so an editor or UI that changes these values can show help text.
-# The values below are the firmware defaults.
-#
-# A setting may also carry a "<key>_type" string to tell such an editor which
-# input to show. It is optional: int/float/bool/string are inferred from the
-# value, so a type is only worth setting to constrain a string to a fixed set
-# of choices, written "enum:a,b,c" (rendered as a dropdown). Also inert to the
-# WIO.
+# RADIO.CFG - telemetry-in-midair radio configuration reference. Generated
+# from the key table in the protocol crate (cargo run --example
+# radio_example in proto/); every value below is the firmware default. The
+# firmware reads at most 1024 bytes of config, which the comments here put
+# this file well over, so it is a reference rather than a card file: strip
+# the comments and what remains fits. The tools do that (cd tools && pixi
+# run board-config --address 3 pushes it; add --dry-run --save ../RADIO.CFG
+# for a card file). The card file goes in the SD root as RADIO.CFG
+# (uppercase). A config pushed over USB or BLE is applied live and written
+# to both the card and a backup record in the board's own flash, so it
+# survives a power cycle on a board with no card. At boot the card wins over
+# the backup, so pulling the card to edit RADIO.CFG on a computer does what
+# it looks like it does. Every key is optional - an absent key keeps its
+# default, and an empty file is valid. Section headers are cosmetic: keys
+# are unique across sections, so a key works regardless of which [section]
+# it sits under.
 
-# -- Radio --------------------------------------------------------------
-# frequency, spreading factor, bandwidth, coding rate and power are the
-# LoRa link-budget knobs: together they set sensitivity, on-air time and
-# radiated power - i.e. range. The three hop_* keys are the channel plan
-# and the slot clock that runs it. The default plan is one channel: a
-# 500 kHz signal may hold a single carrier in the 902-928 MHz band as
-# often as it likes, so hopping buys no air time there that the default
-# modulation does not already have. What the plan is kept for is the
-# clock, which cuts every second into turns and gives each address one -
-# without it two nodes beaconing at the same rate talk over each other.
-# Raise hop_channels to hop for real; see the notes on that key.
+# -- Radio -----------------------------------------------------------------
+# frequency, spreading factor, bandwidth, coding rate and power are the LoRa
+# link-budget knobs: together they set sensitivity, on-air time and radiated
+# power - i.e. range. The three hop_* keys are the channel plan and the slot
+# clock that runs it. The default plan is one channel: a 500 kHz signal may
+# hold a single carrier in the 902-928 MHz band as often as it likes, so
+# hopping buys no air time there that the default modulation does not
+# already have. What the plan is kept for is the clock, which cuts every
+# second into turns and gives each address one - without it two nodes
+# beaconing at the same rate talk over each other. Raise hop_channels to hop
+# for real; see the notes on that key. The four commented keys describe the
+# board the firmware is running on, not a preference: the defaults are the
+# Wio-S3's own hardware, and inside the module SX1262 DIO2 is the VCTL of an
+# SKY13453-385LF antenna switch and DIO3 is that same switch's VDD. Turning
+# the switch off, or supplying it below the 2.5 V its datasheet specifies,
+# leaves the PA transmitting +22 dBm into an isolated port, so the firmware
+# refuses both, logs that it did, and runs the board's values instead.
 [radio]
+
+# RF center frequency in Hz, 150000000-960000000. With more than one hop
+# channel this is the center of the plan and the channels straddle it; with
+# one it is simply the carrier.
 frequency_hz = 915000000
-frequency_hz_description = "RF center frequency in Hz. Valid 150000000-960000000. With more than one hop channel this is the center of the plan and the channels straddle it; with one it is simply the carrier."
 
+# Channels in the plan, 1-255 (0 is read as 1). 1, the default, is the slot
+# clock on the single carrier at frequency_hz: nodes share slots and take
+# turns inside them by address, which is what keeps two nodes beaconing at
+# the same rate from talking over each other, and it is the right answer at
+# 500 kHz bandwidth, where the band lets one carrier be held as often as you
+# like. More than 1 adds channel diversity: a fade or an interferer parked
+# on one carrier costs one beacon in hop_channels rather than every beacon,
+# and below 500 kHz of bandwidth 50 channels is what the 902-928 MHz band
+# requires. Hopping is not free - every node hops on one shared clock, from
+# GPS where a node has a fix and from the frames it hears where it does not,
+# so a node that knows nobody's clock spends roughly hop_channels times the
+# beacon interval, divided by the number of nodes transmitting, before it
+# hears the network at all.
 hop_channels = 1
-hop_channels_description = "Channels in the plan, 0-255. This key carries two decisions, and 0 and 1 are not the same setting. 0 turns the slot clock off with the plan: nodes beacon on their own intervals with random jitter and collide whenever two starts land within a preamble of each other. 1, the default, keeps the clock on the single carrier at frequency_hz - nodes still share slots and still take turns inside them by address - and is the right answer at 500 kHz bandwidth, where the band lets one carrier be held as often as you like. More than 1 adds channel diversity: a fade or an interferer parked on one carrier costs one beacon in hop_channels rather than every beacon, and below 500 kHz of bandwidth 50 channels is what the 902-928 MHz band requires. Hopping is not free - every node hops on one shared clock, from GPS where a node has a fix and from the frames it hears where it does not, so a node that knows nobody's clock spends roughly hop_channels times the beacon interval, divided by the number of nodes transmitting, before it hears the network at all."
 
+# Spacing between hop channels in kHz, 25-5000. At least the bandwidth, or
+# adjacent channels overlap. Unused with one channel, since there is nothing
+# to space. 500 kHz for 50 channels spans 902.75-927.25 MHz around the 915
+# MHz center.
 hop_step_khz = 500
-hop_step_khz_description = "Spacing between hop channels in kHz, 25-5000. At least the bandwidth, or adjacent channels overlap. Unused with hop_channels at 0 or 1, since there is nothing to space. 500 kHz for 50 channels spans 902.75-927.25 MHz around the 915 MHz center."
 
+# Slot length in ms, 100-10000, and so how long every node stays on each
+# channel. One transmission per node per slot, which has to fit the slot
+# with a 100 ms guard at each end, so at 1000 ms a beacon may be up to 800
+# ms on air. The band caps one hop visit at 400 ms; the default beacon is
+# 289 ms. The 800 ms window is cut into as many default beacons as fit - two
+# - and nodes take those turns by address, so two nodes may beacon every
+# second without overlapping.
 hop_dwell_ms = 1000
-hop_dwell_ms_description = "Slot length in ms, 100-10000, and so how long every node stays on each channel. Read even on a one-channel plan, where it is the slot alone. One transmission per node per slot, which has to fit the slot with a 100 ms guard at each end, so at 1000 ms a beacon may be up to 800 ms on air. The band caps one visit at 400 ms; the default beacon is 289 ms. The 800 ms window is cut into as many default beacons as fit - two - and nodes take those turns by address, so two nodes may beacon every second without overlapping."
 
+# LoRa spreading factor, 5-12. Higher gives longer range at a lower data
+# rate.
 spreading_factor = 12
-spreading_factor_description = "LoRa spreading factor, 5-12. Higher gives longer range at a lower data rate."
 
+# LoRa bandwidth in kHz: 62, 125, 250 or 500 (62 means 62.5). Narrower gives
+# longer range at a lower data rate, and a longer frame: the default beacon
+# is 289 ms at 500 and 1150 ms at 125, past the 400 ms one hop visit may
+# occupy a channel. In the 902-928 MHz band only 500 is wide enough to hold
+# a single carrier; anything narrower has to hop, so it needs hop_channels
+# raised to 50 as well.
 bandwidth_khz = 500
-bandwidth_khz_description = "LoRa bandwidth in kHz: 62, 125, 250 or 500 (62 means 62.5). Narrower gives longer range at a lower data rate, and a longer frame: the default beacon is 289 ms at 500 and 1150 ms at 125, past the 400 ms one hop visit may occupy a channel. In the 902-928 MHz band only 500 is wide enough to hold a single carrier; anything narrower has to hop, so it needs hop_channels raised to 50 as well."
 
+# Coding rate denominator 5-8 for 4/5..4/8. Higher adds forward error
+# correction at a lower data rate.
 coding_rate = 5
-coding_rate_description = "Coding rate denominator 5-8 for 4/5..4/8. Higher adds forward error correction at a lower data rate."
 
+# Transmit power in dBm, -9 to 22 on the high-power PA.
 power_dbm = 22
-power_dbm_description = "Transmit power in dBm, -9 to 22 on the high-power PA."
 
+# Boosted receiver gain: roughly +2 dB of sensitivity for a few mA more
+# current whenever the node is listening.
 rx_boost = true
-rx_boost_description = "Boosted receiver gain: roughly +2 dB of sensitivity for a few mA more current whenever the node is listening."
 
-# The four keys below describe the board the firmware is running on, not a
-# preference. The defaults are the Wio-S3's own hardware; change them only
-# for a different module, where a wrong value means a radio that does not
-# start rather than one that performs badly.
-#
-# The two RF-path keys are the dangerous pair. Inside the module, SX1262
-# DIO2 is the VCTL of an SKY13453-385LF antenna switch and DIO3 is that
-# same switch's VDD. Turning the switch off, or supplying it below the
-# 2.5 V its datasheet specifies, leaves the PA transmitting +22 dBm into an
-# isolated port - which destroys the module rather than shortening its
-# range. The firmware therefore refuses both, logs that it did, and runs
-# the board's values instead; these keys are here to be read, not retuned.
+# Use the internal DC-DC (SMPS). The Wio-S3 carries the inductor it needs.
 # dcdc_enabled = true
-# dcdc_enabled_description = "Use the internal DC-DC (SMPS). The Wio-S3 carries the inductor it needs."
 
+# Let the radio drive its own antenna switch from DIO2
+# (SetDio2AsRfSwitchCtrl). The Wio-S3 wires DIO2 to the SKY13453-385LF
+# between the PA and the LoRa port, so this must stay on; the firmware
+# ignores an off.
 # dio2_rf_switch = true
-# dio2_rf_switch_description = "Let the radio drive its own antenna switch from DIO2 (SetDio2AsRfSwitchCtrl). The Wio-S3 wires DIO2 to the SKY13453-385LF between the PA and the LoRa port, so this must stay on; the firmware ignores an off."
 
+# Supply the radio drives DIO3 at. Named for the TCXO, but on the Wio-S3
+# DIO3 is also the antenna switch's VDD, specified 2.5-3.5 V - so only 2.7,
+# 3.0 and 3.3 are usable and the firmware raises anything lower.
 # tcxo_volts = "3.3"
-# tcxo_volts_description = "Supply the radio drives DIO3 at. Named for the TCXO, but on the Wio-S3 DIO3 is also the antenna switch's VDD, specified 2.5-3.5 V - so only 2.7, 3.0 and 3.3 are usable and the firmware raises anything lower."
-# tcxo_volts_type = "enum:1.6,1.7,1.8,2.2,2.4,2.7,3.0,3.3"
 
+# How long the radio waits for the TCXO to settle before using the clock,
+# 1-1000 ms.
 # tcxo_startup_ms = 10
-# tcxo_startup_ms_description = "How long the radio waits for the TCXO to settle before using the clock, 1-1000 ms."
 
-# -- Network ------------------------------------------------------------
-# Everything is sent. Leaves hear each other directly, so a fleet of
-# nothing but leaves is a working network and these defaults need no
-# changing. A repeater is for covering ground no pair of leaves can reach
-# across on their own. tx_only and rx_only split a leaf in half, for a
-# deployment where the reporting only ever runs one way.
+# -- Network ---------------------------------------------------------------
+# Everything is sent. Leaves hear each other directly, so a fleet of nothing
+# but leaves is a working network and these defaults need no changing. A
+# repeater is for covering ground no pair of leaves can reach across on
+# their own. tx_only and rx_only split a leaf in half, for a deployment
+# where the reporting only ever runs one way.
 [network]
+
+# This node's address, 1-255. Must be unique among the nodes that transmit:
+# two senders sharing an address are mutually deaf, each dropping the
+# other's broadcasts as an echo of its own, so neither ever sees the other.
+# An rx_only node never puts its address on the air, so it can keep the
+# default. The address also picks the node's turn inside a slot: number a
+# fleet 1, 2, 3... and the first 2 x interval_s of them never overlap on the
+# air.
 address = 1
-address_description = "This node's address, 1-255. Must be unique among the nodes that transmit: two senders sharing an address are mutually deaf, each dropping the other's broadcasts as an echo of its own, so neither ever sees the other. An rx_only node never puts its address on the air, so it can keep the default. With a hop plan - one channel or fifty, the default either way - the address also picks the node's turn inside a slot: number a fleet 1, 2, 3... and the first 2 x interval_s of them never overlap on the air."
 
+# leaf transmits its own position and receives everyone else's. repeater
+# also retransmits other nodes' broadcasts, extending range past one radio
+# horizon at the cost of doubling the traffic it forwards. tx_only beacons
+# without ever switching the receiver on, which is the largest power saving
+# available to a node nobody needs to track from. rx_only listens without
+# ever transmitting, for a base station that only collects.
 role = "leaf"
-role_description = "leaf transmits its own position and receives everyone else's. Repeater also retransmits other nodes' broadcasts, extending range past one radio horizon at the cost of doubling the traffic it forwards. tx_only beacons without ever switching the receiver on, which is the largest power saving available to a node nobody needs to track from. rx_only listens without ever transmitting, for a base station that only collects."
-role_type = "enum:leaf,repeater,tx_only,rx_only"
 
+# Retransmissions allowed for a broadcast this node sends, 0-8. 0 means no
+# repeater forwards it.
 max_hops = 1
-max_hops_description = "Retransmissions allowed for a broadcast this node sends, 0-8. 0 means no repeater forwards it."
 
+# How long a broadcast is remembered so a repeat of it is dropped rather
+# than delivered or forwarded again, 1-3600 s. Must stay under 200 x
+# interval_s: the beacon id wraps every 256 frames, and past that a node
+# starts suppressing its own later broadcasts as duplicates. The file is
+# refused otherwise.
 dedup_ttl_s = 3
-dedup_ttl_s_description = "How long a broadcast is remembered so a repeat of it is dropped rather than delivered or forwarded again, 1-3600 s. Keep it well under the time the beacon runs through 256 ids (about four minutes at the 1 s default), or a node starts suppressing its own later broadcasts as duplicates."
 
-# -- Beacon -------------------------------------------------------------
+# -- Beacon ----------------------------------------------------------------
+# What goes out, and how often.
 [beacon]
+
+# Position broadcast period in seconds while the node has a fix, 0-3600. A
+# node transmits at most once per slot, so 1 is every slot at the default
+# dwell. It also sets how many nodes fit: a slot holds two default beacons,
+# so 2 x interval_s addresses beacon without overlapping - two every second,
+# four every two seconds, ten every five. 0 silences the node's own
+# transmissions altogether, pings included, as does a role of rx_only.
 interval_s = 1
-interval_s_description = "Position broadcast period in seconds while the node has a fix, 0-3600. With a hop plan a node transmits at most once per slot, so 1 is every slot at the default dwell. It also sets how many nodes fit: a slot holds two default beacons, so 2 x interval_s addresses beacon without overlapping - two every second, four every two seconds, ten every five. 0 silences the node's own transmissions altogether, pings included, as does a role of rx_only."
 
+# How often a node with no fix says so, 0-3600 s: a small ping goes out in
+# place of the position, so a node that cannot see the sky is still heard.
+# Slower than the beacon by default, since a searching receiver has nothing
+# new to report every second. 0 sends no pings.
 ping_interval_s = 5
-ping_interval_s_description = "How often a node with no fix says so, 0-3600 s: a small ping goes out in place of the position, so a node that cannot see the sky is still heard. Slower than the beacon by default, since a searching receiver has nothing new to report every second. 0 sends no pings."
 
+# Which GPS fields each broadcast carries: lat, lon, altitude, speed,
+# course, sats, time. lat and lon are required. More fields cost more air
+# time.
 fields = "lat,lon"
-fields_description = "Which GPS fields each broadcast carries: lat, lon, altitude, speed, course, sats, time. lat and lon are required. More fields result in more air time."
 
-# -- SD card ------------------------------------------------------------
+# -- SD card ---------------------------------------------------------------
 [sd]
+
+# Use the SD card. false stops position logging and the card's power draw.
+# The config itself still persists: it is backed up to the board's internal
+# flash either way.
 sd_enabled = true
-sd_enabled_description = "Use the SD card. false stops position logging and the card's power draw. The config itself still persists: it is backed up to the board's internal flash either way."
 
-# -- Debug --------------------------------------------------------------
+# -- Debug -----------------------------------------------------------------
 [debug]
-verbose = true
-verbose_description = "Log every link frame and heartbeat on the ESP's USB console, on top of the events that are always logged. Costs nothing when nothing is attached; turn it off for a quiet console or when a tool is parsing it."
 
-# -- GPS ----------------------------------------------------------------
+# Log every event on the USB console, on top of the events that are always
+# logged. Costs nothing when nothing is attached; turn it off for a quiet
+# console or when a tool is parsing it.
+verbose = true
+
+# -- GPS -------------------------------------------------------------------
 # MAX-M10 receiver, applied as one UBX-CFG-VALSET to the RAM layer. An
 # absent [gps] section leaves the module at its factory concurrent set.
 [gps]
+
+# Enable the GPS (US) constellation.
 gps_enabled = true
-gps_enabled_description = "Enable the GPS (US) constellation."
 
+# Enable the GLONASS (Russia) constellation. The M10 tracks a limited
+# concurrent set.
 glonass_enabled = false
-glonass_enabled_description = "Enable the GLONASS (Russia) constellation. The M10 tracks a limited concurrent set."
 
+# Enable the Galileo (EU) constellation.
 galileo_enabled = true
-galileo_enabled_description = "Enable the Galileo (EU) constellation."
 
+# Enable the BeiDou (China) constellation.
 beidou_enabled = true
-beidou_enabled_description = "Enable the BeiDou (China) constellation."
 
+# Enable the QZSS (Japan) augmentation.
 qzss_enabled = true
-qzss_enabled_description = "Enable the QZSS (Japan) augmentation."
 
+# Enable SBAS augmentation (WAAS, EGNOS and similar).
 sbas_enabled = true
-sbas_enabled_description = "Enable SBAS augmentation (WAAS, EGNOS and similar)."
 
+# GPS power mode: full, psmoo (power-save on/off) or psmct (power-save
+# cyclic tracking).
 power_mode = "full"
-power_mode_description = "GPS power mode: full, psmoo (power-save on/off) or psmct (power-save cyclic tracking)."
-power_mode_type = "enum:full,psmoo,psmct"
 
+# GPS measurement and navigation period in ms, 25-10000.
 meas_rate_ms = 1000
-meas_rate_ms_description = "GPS measurement and navigation period in ms, 25-10000."
 
+# GPS motion model: portable, stationary, pedestrian, automotive, sea,
+# airborne1g, airborne2g or airborne4g.
 dynamic_model = "portable"
-dynamic_model_description = "GPS motion model: portable, stationary, pedestrian, automotive, sea, airborne1g, airborne2g or airborne4g."
-dynamic_model_type = "enum:portable,stationary,pedestrian,automotive,sea,airborne1g,airborne2g,airborne4g"
 
-# -- Power --------------------------------------------------------------
-# The duty cycle: how much of the time the board is reachable. These four
+# -- Power -----------------------------------------------------------------
+# The duty cycle: how much of the time the board is reachable. These five
 # are the only keys in this file the board also keeps its own copy of, in
 # RTC RAM so they survive a deep sleep and in flash so they survive a flat
-# cell, and they are the only ones an app can change live over BLE.
-#
-# So they follow a different rule to every other key here: an absent one
-# leaves the board's current value alone rather than resetting it to the
-# default. That is why all four are commented out - a push of this file
-# should not silently undo a duty cycle somebody set from the app. Uncomment
-# one and it wins at the next boot, because the file is what survives a
-# reflash and the RTC copy is not.
-#
-# Writing an explicit 0 is a request, not an absence: it is how a file turns
-# a duty cycle off. Live changes made over BLE or `wio-set` last until the
-# next cold boot, where an uncommented key here takes over again.
-#
-# What is NOT here is the mode. The board has four - stored, idle, tracking
-# and listening - and which one it is in is a command (`CFG_MODE` from the
-# app, `wio-set mode` from a bench), never a file: a card that said
-# "tracking" would put every board it was ever copied into onto the air.
-#
-# Each key below belongs to one mode, and only that mode reads it:
-#
-#   stored    sleep_interval_s   how often a stored board wakes to ask
-#                                whether anyone wants it
-#             adv_window_s       how long each of those checks advertises
-#   idle      idle_timeout_s     how long a reachable board waits before
-#                                storing itself, 0 (the default) never
-#   tracking  ble_off_s          how long the modem is down between
-#                                windows on a board that is on the air
-#             ble_on_s           how long it is up between those
-#
-# Listening reads none of them: the node beside the phone keeps BLE up the
-# whole time so the phone can always come back.
-#
-# ble_off_s is the large one: the BLE controller is about 71 mA of the
-# board's 126, and ending its lifetime is the only thing that reduces it.
-# Before the modes existed it was also dead config on any board that had a
-# wake-check cadence, because deep sleep was tested first and always won.
+# cell, and they are the only ones an app can change live over BLE. So they
+# follow a different rule to every other key here: an absent one leaves the
+# board's current value alone rather than resetting it to the default. That
+# is why all five are commented out - a push of this file should not
+# silently undo a duty cycle somebody set from the app. Uncomment one and it
+# wins at the next boot, because the file is what survives a reflash and the
+# RTC copy is not. Writing an explicit 0 is a request, not an absence: it is
+# how a file turns a duty cycle off. What is NOT here is the mode. The board
+# has four - stored, idle, tracking and listening - and which one it is in
+# is a command from the app or the console, never a file: a card that said
+# tracking would put every board it was ever copied into onto the air. Each
+# key belongs to one mode: stored reads sleep_interval_s and adv_window_s,
+# idle reads idle_timeout_s, tracking reads ble_off_s and ble_on_s, and
+# listening reads none of them.
 [power]
+
+# Seconds the BLE controller is powered down between advertising windows, 0
+# or 5-300. This is the biggest single saving the firmware has: the
+# controller is about 71 mA of the board's 126 and nothing but ending its
+# lifetime reduces it, so the board drops to about 60 mA for this long and
+# is unreachable over BLE while it does. LoRa, GPS and logging keep running
+# throughout, so it is still a working tracker. 0 keeps BLE up continuously.
+# Read while tracking only.
 # ble_off_s = 0
-# ble_off_s_description = "Seconds the BLE controller is powered down between advertising windows, 0 or 5-300. This is the biggest single saving the firmware has: the controller is about 71 mA of the board's 126 and nothing but ending its lifetime reduces it, so the board drops to ~60 mA for this long and is unreachable over BLE while it does. LoRa, GPS and logging keep running throughout, so it is still a working tracker. 0 keeps BLE up continuously."
 
+# Seconds each wake check advertises, 0 or 1-60. 0 means the firmware
+# default of 15 s. This is the whole of the time a stored board is
+# reachable, so it and sleep_interval_s together are what a phone has to
+# catch. With sleep_interval_s at 0 the board advertises forever and the
+# window never ends.
 # adv_window_s = 0
-# adv_window_s_description = "Seconds each wake check advertises, 0 or 1-60. 0 means the firmware default of 15 s. This is the whole of the time a stored board is reachable, so it and sleep_interval_s together are what a phone has to catch. With sleep_interval_s at 0 the board advertises forever and the window never ends."
 
+# Seconds BLE stays up between off periods while tracking, 0 or 1-60. 0
+# means the firmware default of 15 s. The on-half of the ble_off_s duty
+# cycle: long enough for a phone to connect, read the roster and let go.
+# Only read while tracking, and only with ble_off_s set.
 # ble_on_s = 0
-# ble_on_s_description = "Seconds BLE stays up between off periods while tracking, 0 or 1-60. 0 means the firmware default of 15 s. The on-half of the ble_off_s duty cycle: long enough for a phone to connect, read the roster and let go. Only read while tracking, and only with ble_off_s set."
 
+# Seconds between wake checks while the board is stored, 0 or 5-300. 0 means
+# the board never stores itself on its own: with no cadence to sleep on, the
+# idle timeout has nowhere to send it and it stays awake and reachable. That
+# is the bench setting. A board explicitly told to store itself still
+# sleeps, on the 300 s ceiling. Deep sleep takes the whole chip down rather
+# than just the BLE controller, so it is the larger saving and the larger
+# cost: the board stops beaconing, stops logging, and every wake is a full
+# reset. Ignored while tracking - a tracker that deep-sleeps is not
+# tracking.
 # sleep_interval_s = 0
-# sleep_interval_s_description = "Seconds between wake checks while the board is stored, 0 or 5-300. 0 means the board never stores itself on its own: with no cadence to sleep on, the idle timeout has nowhere to send it and it stays awake and reachable. That is the bench setting. A board explicitly told to store itself still sleeps, on the 300 s ceiling. Deep sleep takes the whole chip down rather than just the BLE controller, so it is the larger saving and the larger cost: the board stops beaconing, stops logging, and every wake is a full reset. Ignored while tracking - a tracker that deep-sleeps is not tracking."
 
+# Seconds the board stays reachable-but-not-tracking before it stores
+# itself, 0 or 10-3600. 0 is the default and means it never does: an idle
+# board stays idle until it is told otherwise. Idle is the expensive state -
+# BLE dominates it at around 90 mA - so set this for a board that could be
+# forgotten idle. It also needs sleep_interval_s: with no cadence to wake on
+# the board cannot store itself and stays reachable.
 # idle_timeout_s = 0
-# idle_timeout_s_description = "Seconds the board stays reachable-but-not-tracking before it stores itself, 0 or 10-3600. 0 is the default and means it never does: an idle board stays idle until it is told otherwise. Idle is the expensive state - BLE dominates it at around 90 mA - so set this for a board that could be forgotten idle. It also needs sleep_interval_s: with no cadence to wake on the board cannot store itself and stays reachable."

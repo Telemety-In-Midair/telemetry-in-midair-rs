@@ -10,56 +10,259 @@
 //!
 //! Everything here is pure. The firmware supplies the clock and performs
 //! the effects ([`Action`]); nothing below touches a timer, flash or radio.
+//!
+//! The five durations an app can set - the wake-check cadence, the
+//! advertising window, the modem's off and on periods, the idle timeout -
+//! are described once, in [`KNOBS`]. That table is what says where each
+//! one sits in the flash record and in the BLE settings blob, which config
+//! id writes it, what its bounds are and what a stored zero means; the
+//! record, the blob, the config write, the `[power]` section of the config
+//! file and the firmware's RTC copy are all driven from it. Adding a
+//! duration is one row and two struct fields.
 
 use crate::ble::{self, Mode};
 use crate::link;
+use crate::posture::Request;
 use gps_proto::packet;
 
 // ---------------------------------------------------------------------------
 // Settings that survive a sleep and a power cycle
 // ---------------------------------------------------------------------------
 
-/// The GPS/LoRa rail is off.
-///
-/// Stored inverted so an all-zero [`Stored`] - a cold boot with nothing
-/// saved - is a board that powers its GPS, which is what an unconfigured
-/// board should do.
-pub const PFLAG_PWR_OFF: u32 = 1 << 0;
-/// The radio was asked into standby.
-///
-/// Named for the WIO-E5's soft sleep, which existed because the ESP32-C6
-/// could not power the second MCU down mid-session. One MCU has one sleep
-/// story, so what survives is the radio half: standby instead of receive.
-pub const PFLAG_WIO_SLEEP: u32 = 1 << 1;
-/// The GPS was asked to enter backup mode.
+// Bit 0 was the GPS/LoRa rail of the two-MCU board. Reserved.
+/// The radio was asked into standby: an override inside a tracking
+/// posture, honored whenever tracking is next commanded.
+pub const PFLAG_RADIO_STANDBY: u32 = 1 << 1;
+/// The GPS was asked to enter backup mode: the other override.
 pub const PFLAG_GPS_SLEEP: u32 = 1 << 2;
+
+/// One of the five durations.
+///
+/// The order is the order of [`KNOBS`], and the order the durations were
+/// added to the record - which is what the record's version ladder reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Knob {
+    /// Seconds between deep-sleep wake checks while stored, 0 = the board
+    /// never stores itself on its own.
+    SleepInterval,
+    /// Seconds each wake check advertises for.
+    AdvWindow,
+    /// Seconds the modem stays down between windows while tracking, 0 =
+    /// never take it down.
+    BleOff,
+    /// Seconds idle lasts before the board stores itself, 0 = never.
+    IdleTimeout,
+    /// Seconds the modem stays up between off periods while tracking.
+    BleOn,
+}
+
+impl Knob {
+    /// Every knob, in table order.
+    pub const ALL: [Knob; 5] = [
+        Knob::SleepInterval,
+        Knob::AdvWindow,
+        Knob::BleOff,
+        Knob::IdleTimeout,
+        Knob::BleOn,
+    ];
+
+    /// The knob's row of the table.
+    pub fn spec(self) -> &'static KnobSpec {
+        &KNOBS[self as usize]
+    }
+
+    /// The knob a config id writes, if it is one.
+    pub fn from_id(id: u8) -> Option<Knob> {
+        KNOBS.iter().find(|k| k.id == id).map(|k| k.knob)
+    }
+
+    /// The knob a config-file key names, if it is one.
+    pub fn from_name(name: &str) -> Option<Knob> {
+        KNOBS.iter().find(|k| k.name == name).map(|k| k.knob)
+    }
+}
+
+/// What a stored zero means for a knob.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Zero {
+    /// Zero is a setting - off - and is stored and read as zero.
+    Off,
+    /// Zero is "never configured": a write is clamped up to the floor so
+    /// zero is never stored, and a record that holds one anyway reads as
+    /// this default.
+    Default(u32),
+}
+
+/// One row of the table: everything the code needs to know about a
+/// duration, in one place.
+pub struct KnobSpec {
+    pub knob: Knob,
+    /// The config-file key, which is also the name on the console.
+    pub name: &'static str,
+    /// The config characteristic id that writes it.
+    pub id: u8,
+    /// Bounds a non-zero value is clamped to.
+    pub min: u32,
+    pub max: u32,
+    pub zero: Zero,
+    /// The record version that appended it.
+    pub since: u32,
+    /// Byte offset in the flash record.
+    pub record_at: usize,
+    /// Byte offset in the BLE settings blob.
+    pub wire_at: usize,
+    /// One line for the config file and the app.
+    pub doc: &'static str,
+    get: fn(&Stored) -> u32,
+    set: fn(&mut Stored, u32),
+    wire_get: fn(&ble::Settings) -> u32,
+    wire_set: fn(&mut ble::Settings, u32),
+}
+
+impl KnobSpec {
+    /// The value a write of `asked` stores.
+    pub fn clamp(&self, asked: u32) -> u32 {
+        match self.zero {
+            Zero::Off if asked == 0 => 0,
+            _ => asked.clamp(self.min, self.max),
+        }
+    }
+
+    /// The value a stored `raw` means.
+    pub fn resolve(&self, raw: u32) -> u32 {
+        match (self.zero, raw) {
+            (Zero::Default(d), 0) => d,
+            _ => raw,
+        }
+    }
+
+    /// Whether `v` is a value a config file may carry: zero, or inside the
+    /// bounds. A file is read once and edited by hand, so anything else is
+    /// reported rather than clamped.
+    pub fn accepts(&self, v: u64) -> bool {
+        v == 0 || (u64::from(self.min)..=u64::from(self.max)).contains(&v)
+    }
+
+    pub fn get(&self, s: &Stored) -> u32 {
+        (self.get)(s)
+    }
+
+    pub fn set(&self, s: &mut Stored, v: u32) {
+        (self.set)(s, v)
+    }
+
+    pub fn wire_get(&self, w: &ble::Settings) -> u32 {
+        (self.wire_get)(w)
+    }
+
+    pub fn wire_set(&self, w: &mut ble::Settings, v: u32) {
+        (self.wire_set)(w, v)
+    }
+}
+
+/// Where the BLE on period sits in the record: after the name, which is
+/// where version 6 ended.
+const BLE_ON_AT: usize = 32 + ble::NAME_FIELD_LEN;
+
+/// The five durations.
+pub const KNOBS: [KnobSpec; 5] = [
+    KnobSpec {
+        knob: Knob::SleepInterval,
+        name: "sleep_interval_s",
+        id: ble::CFG_ESP_SLEEP_S,
+        min: ble::ESP_SLEEP_MIN_S,
+        max: ble::ESP_SLEEP_MAX_S,
+        zero: Zero::Off,
+        since: 2,
+        record_at: 8,
+        wire_at: 4,
+        doc: "Seconds between wake checks while the board is stored, 0 or 5-300. 0 means the board never stores itself on its own: with no cadence to sleep on, the idle timeout has nowhere to send it and it stays awake and reachable. That is the bench setting. A board explicitly told to store itself still sleeps, on the 300 s ceiling. Deep sleep takes the whole chip down rather than just the BLE controller, so it is the larger saving and the larger cost: the board stops beaconing, stops logging, and every wake is a full reset. Ignored while tracking - a tracker that deep-sleeps is not tracking.",
+        get: |s| s.sleep_interval_s,
+        set: |s, v| s.sleep_interval_s = v,
+        wire_get: |w| w.sleep_interval_s,
+        wire_set: |w, v| w.sleep_interval_s = v,
+    },
+    KnobSpec {
+        knob: Knob::AdvWindow,
+        name: "adv_window_s",
+        id: ble::CFG_ESP_ADV_WINDOW_S,
+        min: ble::ESP_ADV_MIN_S,
+        max: ble::ESP_ADV_MAX_S,
+        zero: Zero::Default(ble::ESP_ADV_DEFAULT_S),
+        since: 3,
+        record_at: 16,
+        wire_at: 12,
+        doc: "Seconds each wake check advertises, 0 or 1-60. 0 means the firmware default of 15 s. This is the whole of the time a stored board is reachable, so it and sleep_interval_s together are what a phone has to catch. With sleep_interval_s at 0 the board advertises forever and the window never ends.",
+        get: |s| s.adv_window_s,
+        set: |s, v| s.adv_window_s = v,
+        wire_get: |w| w.adv_window_s,
+        wire_set: |w, v| w.adv_window_s = v,
+    },
+    KnobSpec {
+        knob: Knob::BleOff,
+        name: "ble_off_s",
+        id: ble::CFG_BLE_OFF_S,
+        min: ble::BLE_OFF_MIN_S,
+        max: ble::BLE_OFF_MAX_S,
+        zero: Zero::Off,
+        since: 4,
+        record_at: 20,
+        wire_at: 16,
+        doc: "Seconds the BLE controller is powered down between advertising windows, 0 or 5-300. This is the biggest single saving the firmware has: the controller is about 71 mA of the board's 126 and nothing but ending its lifetime reduces it, so the board drops to about 60 mA for this long and is unreachable over BLE while it does. LoRa, GPS and logging keep running throughout, so it is still a working tracker. 0 keeps BLE up continuously. Read while tracking only.",
+        get: |s| s.ble_off_s,
+        set: |s, v| s.ble_off_s = v,
+        wire_get: |w| w.ble_off_s,
+        wire_set: |w, v| w.ble_off_s = v,
+    },
+    KnobSpec {
+        knob: Knob::IdleTimeout,
+        name: "idle_timeout_s",
+        id: ble::CFG_IDLE_TIMEOUT_S,
+        min: ble::IDLE_TIMEOUT_MIN_S,
+        max: ble::IDLE_TIMEOUT_MAX_S,
+        zero: Zero::Off,
+        since: 5,
+        record_at: 28,
+        wire_at: 20,
+        doc: "Seconds the board stays reachable-but-not-tracking before it stores itself, 0 or 10-3600. 0 is the default and means it never does: an idle board stays idle until it is told otherwise. Idle is the expensive state - BLE dominates it at around 90 mA - so set this for a board that could be forgotten idle. It also needs sleep_interval_s: with no cadence to wake on the board cannot store itself and stays reachable.",
+        get: |s| s.idle_timeout_s,
+        set: |s, v| s.idle_timeout_s = v,
+        wire_get: |w| w.idle_timeout_s,
+        wire_set: |w, v| w.idle_timeout_s = v,
+    },
+    KnobSpec {
+        knob: Knob::BleOn,
+        name: "ble_on_s",
+        id: ble::CFG_BLE_ON_S,
+        min: ble::BLE_ON_MIN_S,
+        max: ble::BLE_ON_MAX_S,
+        zero: Zero::Default(ble::BLE_ON_DEFAULT_S),
+        since: 7,
+        record_at: BLE_ON_AT,
+        wire_at: 24,
+        doc: "Seconds BLE stays up between off periods while tracking, 0 or 1-60. 0 means the firmware default of 15 s. The on-half of the ble_off_s duty cycle: long enough for a phone to connect, read the roster and let go. Only read while tracking, and only with ble_off_s set.",
+        get: |s| s.ble_on_s,
+        set: |s, v| s.ble_on_s = v,
+        wire_get: |w| w.ble_on_s,
+        wire_set: |w, v| w.ble_on_s = v,
+    },
+];
 
 /// Everything a config write can change that outlives the connection, in
 /// the words the firmware keeps in RTC RAM and mirrors to flash.
 ///
 /// The notify interval is deliberately not here: it is per-session state
 /// that resets with the board (see [`Action::NotifyInterval`]).
+///
+/// The five durations are read through [`Stored::knob`], which resolves a
+/// stored zero the way its [`KnobSpec`] says; the fields hold the raw
+/// stored values.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Stored {
-    /// Deep-sleep wake-check interval in seconds, 0 = stay awake.
     pub sleep_interval_s: u32,
     /// `PFLAG_*` bits.
     pub flags: u32,
-    /// Advertising window per wake check, 0 = never configured. Read it
-    /// through [`Stored::adv_window`], which substitutes the default.
     pub adv_window_s: u32,
-    /// How long the BLE controller stays powered down between advertising
-    /// windows, 0 = never take it down.
-    ///
-    /// This is the awake-state counterpart to `sleep_interval_s`. Deep
-    /// sleep takes the whole chip away and costs a full reset; this takes
-    /// only the BLE modem away, which is 71 mA of the board's 126, and
-    /// leaves the LoRa beacon and the GPS running. A board doing this is
-    /// still a working tracker and is still logging - it just cannot be
-    /// connected to until the next window.
-    ///
-    /// Honored in [`Mode::Tracking`] only: Idle exists to be reachable and
-    /// Stored has no controller to duty-cycle.
     pub ble_off_s: u32,
     /// What the board is doing, and - once [`Mode::persisted`] has had it -
     /// what it comes back doing after a flat cell.
@@ -67,16 +270,7 @@ pub struct Stored {
     /// The RTC copy holds the live mode, [`Mode::Idle`] included; only
     /// [`Stored::encode_record`] normalizes it, so flash never says idle.
     pub mode: Mode,
-    /// How long [`Mode::Idle`] lasts before the board stores itself, 0 =
-    /// it never does, which is the default.
     pub idle_timeout_s: u32,
-    /// How long BLE stays up between off periods while tracking, 0 = never
-    /// configured. Read it through [`Stored::ble_on`], which substitutes
-    /// the default.
-    ///
-    /// The on-half of the `ble_off_s` duty cycle, and [`Mode::Tracking`]'s
-    /// alone. It was the advertising window until the two were separated:
-    /// a wake check and a tracker want different lengths of window.
     pub ble_on_s: u32,
     /// What the board is called ([`ble::CFG_NAME`]), zero-padded ASCII.
     ///
@@ -140,16 +334,30 @@ impl Stored {
         true
     }
 
-    pub fn pwr_en(&self) -> bool {
-        self.flags & PFLAG_PWR_OFF == 0
-    }
-
-    pub fn wio_sleep(&self) -> bool {
-        self.flags & PFLAG_WIO_SLEEP != 0
+    pub fn radio_standby(&self) -> bool {
+        self.flags & PFLAG_RADIO_STANDBY != 0
     }
 
     pub fn gps_sleep(&self) -> bool {
         self.flags & PFLAG_GPS_SLEEP != 0
+    }
+
+    /// A duration as the board uses it: a stored zero resolved the way the
+    /// knob's row says.
+    pub fn knob(&self, knob: Knob) -> u32 {
+        let spec = knob.spec();
+        spec.resolve(spec.get(self))
+    }
+
+    /// A duration as stored, zero included.
+    pub fn knob_raw(&self, knob: Knob) -> u32 {
+        knob.spec().get(self)
+    }
+
+    /// Store a duration, already clamped by [`KnobSpec::clamp`] or checked
+    /// by [`KnobSpec::accepts`].
+    pub fn set_knob(&mut self, knob: Knob, v: u32) {
+        knob.spec().set(self, v)
     }
 
     /// How long a wake check advertises for. A stored 0 means never
@@ -157,10 +365,7 @@ impl Stored {
     /// sleeping board unreachable by anything but a physical reset, so it
     /// resolves to the default instead.
     pub fn adv_window(&self) -> u32 {
-        match self.adv_window_s {
-            0 => ble::ESP_ADV_DEFAULT_S,
-            s => s,
-        }
+        self.knob(Knob::AdvWindow)
     }
 
     /// How long [`Mode::Idle`] runs before the board stores itself, 0 for
@@ -174,7 +379,7 @@ impl Stored {
     /// the timeout to send it, so it stays awake and reachable whatever
     /// this says.
     pub fn idle_timeout(&self) -> u32 {
-        self.idle_timeout_s
+        self.knob(Knob::IdleTimeout)
     }
 
     /// How long BLE stays up between off periods while tracking. A stored
@@ -182,10 +387,7 @@ impl Stored {
     /// advertising window does and for the same reason: a zero-length on
     /// period is a tracker nobody can connect to.
     pub fn ble_on(&self) -> u32 {
-        match self.ble_on_s {
-            0 => ble::BLE_ON_DEFAULT_S,
-            s => s,
-        }
+        self.knob(Knob::BleOn)
     }
 
     /// The cadence a board that has been *told* to store itself sleeps on.
@@ -248,37 +450,21 @@ impl Stored {
             // keeps advertising, which is what a bench board and an
             // unconfigured board both want.
             Mode::Idle => match (self.idle_timeout(), self.sleep_interval_s) {
-                (0, _) | (_, 0) => Next::Advertise,
+                (0, _) | (_, 0) => Next::FOREVER,
                 (_, interval_s) => Next::Sleep { interval_s },
             },
             // A tracker never deep-sleeps on a cadence - that would stop
             // the beacon, the logging and the listening, which is the whole
             // job. What it can drop is the modem.
             Mode::Tracking => match self.ble_off_s {
-                0 => Next::Advertise,
+                0 => Next::FOREVER,
                 off_s => Next::BleDown { off_s },
             },
             // The node beside the phone exists to be connected to, so it
             // duty-cycles nothing: the phone has to be able to come back
             // whenever it likes.
-            Mode::Listening => Next::Advertise,
+            Mode::Listening => Next::FOREVER,
         }
-    }
-
-    /// Whether the GPS/LoRa rail comes up with the board.
-    ///
-    /// A sleep-interval wake check comes up dark whatever the app asked
-    /// for: the question a wake check exists to ask is whether anyone wants
-    /// the board back, which needs BLE only, so a wake nobody answers never
-    /// pays for the GPS. A connect raises the rail afterwards. A cold boot
-    /// follows the configured setting.
-    ///
-    /// The wio-s3-max-gps board has no such rail - the GPS and SD sit on
-    /// +3V3 - so its firmware logs [`Action::Rail`] and does nothing. The
-    /// policy stays here because it is tested, and a board respin could
-    /// bring the switch back.
-    pub fn rail_at_boot(&self, woke_from_sleep: bool) -> bool {
-        !woke_from_sleep && self.pwr_en()
     }
 
     fn set_flag(&mut self, flag: u32, on: bool) {
@@ -290,20 +476,20 @@ impl Stored {
     }
 
     /// The settings characteristic value, which is the only way an app
-    /// learns the board's current state on connect.
+    /// learns the board's current state on connect. Every duration goes out
+    /// resolved, so an app never sees a "never configured" zero.
     pub fn settings(&self, notify_interval_ms: u32) -> ble::Settings {
-        ble::Settings {
-            pwr_en: self.pwr_en(),
-            wio_sleep: self.wio_sleep(),
+        let mut w = ble::Settings {
+            radio_standby: self.radio_standby(),
             gps_sleep: self.gps_sleep(),
-            sleep_interval_s: self.sleep_interval_s,
             notify_interval_ms,
-            adv_window_s: self.adv_window(),
-            ble_off_s: self.ble_off_s,
             mode: self.mode,
-            idle_timeout_s: self.idle_timeout(),
-            ble_on_s: self.ble_on(),
+            ..ble::Settings::default()
+        };
+        for spec in &KNOBS {
+            spec.wire_set(&mut w, self.knob(spec.knob));
         }
+        w
     }
 
     /// Fold a config file's `[power]` section into these settings, and say
@@ -311,7 +497,7 @@ impl Stored {
     ///
     /// Only the keys the file actually carried are applied - an absent one
     /// leaves the board's live value alone, which is the whole reason
-    /// [`crate::radiocfg::PowerConfig`] is optional field by field. The
+    /// [`crate::radiocfg::PowerConfig`] holds an option per knob. The
     /// parser has already range-checked whatever is present, so there is
     /// nothing to clamp here.
     ///
@@ -320,20 +506,10 @@ impl Stored {
     /// rewrite the same record forever.
     pub fn adopt_power(&mut self, p: &crate::radiocfg::PowerConfig) -> bool {
         let before = *self;
-        if let Some(s) = p.ble_off_s {
-            self.ble_off_s = s;
-        }
-        if let Some(s) = p.adv_window_s {
-            self.adv_window_s = s;
-        }
-        if let Some(s) = p.sleep_interval_s {
-            self.sleep_interval_s = s;
-        }
-        if let Some(s) = p.idle_timeout_s {
-            self.idle_timeout_s = s;
-        }
-        if let Some(s) = p.ble_on_s {
-            self.ble_on_s = s;
+        for spec in &KNOBS {
+            if let Some(v) = p.get(spec.knob) {
+                spec.set(self, v);
+            }
         }
         *self != before
     }
@@ -344,17 +520,16 @@ impl Stored {
         let mut rec = [0u8; RECORD_LEN];
         rec[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
         rec[4..8].copy_from_slice(&RECORD_VERSION.to_le_bytes());
-        rec[8..12].copy_from_slice(&self.sleep_interval_s.to_le_bytes());
+        for spec in &KNOBS {
+            let at = spec.record_at;
+            rec[at..at + 4].copy_from_slice(&spec.get(self).to_le_bytes());
+        }
         rec[12..16].copy_from_slice(&self.flags.to_le_bytes());
-        rec[16..20].copy_from_slice(&self.adv_window_s.to_le_bytes());
-        rec[20..24].copy_from_slice(&self.ble_off_s.to_le_bytes());
         // Normalized on the way out, and only here: the RTC copy may say
         // idle, but a board that came back from a reset still believing it
         // was idle would sit at awake current with nobody coming.
         rec[24..28].copy_from_slice(&(self.mode.persisted().as_wire() as u32).to_le_bytes());
-        rec[28..32].copy_from_slice(&self.idle_timeout_s.to_le_bytes());
         rec[32..32 + ble::NAME_FIELD_LEN].copy_from_slice(&self.name);
-        rec[BLE_ON_AT..BLE_ON_AT + 4].copy_from_slice(&self.ble_on_s.to_le_bytes());
         let crc = link::crc32(&rec[0..RECORD_LEN - 4]);
         rec[RECORD_LEN - 4..RECORD_LEN].copy_from_slice(&crc.to_le_bytes());
         rec
@@ -377,45 +552,28 @@ impl Stored {
         // defaults. Their trailing bytes are erased flash, so the crc has to
         // be checked where each version put it rather than where this one
         // does.
-        // A mode this build does not know reads as the safe one: a board
-        // that stores itself can be woken, where one that guessed at
-        // tracking would run its cell down.
-        let mode = || Mode::from_wire(word(24) as u8).unwrap_or_default();
-        let (crc_at, adv_window_s, ble_off_s, mode, idle_timeout_s, named, ble_on_s) =
-            match word(4) {
-                2 => (V2_CRC_AT, 0, 0, Mode::Stored, 0, false, 0),
-                3 => (V3_CRC_AT, word(16), 0, Mode::Stored, 0, false, 0),
-                4 => (V4_CRC_AT, word(16), word(20), Mode::Stored, 0, false, 0),
-                5 => (V5_CRC_AT, word(16), word(20), mode(), word(28), false, 0),
-                6 => (V6_CRC_AT, word(16), word(20), mode(), word(28), true, 0),
-                RECORD_VERSION => (
-                    RECORD_LEN - 4,
-                    word(16),
-                    word(20),
-                    mode(),
-                    word(28),
-                    true,
-                    word(BLE_ON_AT),
-                ),
-                _ => return None,
-            };
+        let version = word(4);
+        let crc_at = record_crc_at(version)?;
         if word(crc_at) != link::crc32(&rec[0..crc_at]) {
             return None;
         }
-        let mut name = [0u8; ble::NAME_FIELD_LEN];
-        if named {
-            name.copy_from_slice(&rec[32..32 + ble::NAME_FIELD_LEN]);
+        let mut s = Self::new();
+        for spec in &KNOBS {
+            if spec.since <= version {
+                spec.set(&mut s, word(spec.record_at));
+            }
         }
-        Some(Self {
-            sleep_interval_s: word(8),
-            flags: word(12),
-            adv_window_s,
-            ble_off_s,
-            mode,
-            idle_timeout_s,
-            ble_on_s,
-            name,
-        })
+        s.flags = word(12);
+        // A mode this build does not know reads as the safe one: a board
+        // that stores itself can be woken, where one that guessed at
+        // tracking would run its cell down.
+        if version >= 5 {
+            s.mode = Mode::from_wire(word(24) as u8).unwrap_or_default();
+        }
+        if version >= 6 {
+            s.name.copy_from_slice(&rec[32..32 + ble::NAME_FIELD_LEN]);
+        }
+        Some(s)
     }
 }
 
@@ -425,31 +583,21 @@ pub const RECORD_MAGIC: u32 = 0x6D69_6441;
 /// Layout version of the flash record.
 ///
 /// Version 2 dropped a separate stow interval; a version 1 record is
-/// discarded rather than misread. Version 3 appended the advertising
-/// window, version 4 the BLE off period, and version 5 the [`Mode`] and its
-/// idle timeout. All are pure appends, so an older record still reads - a
-/// board updated in the field keeps the cadence it was left on instead of
-/// coming back advertising continuously.
+/// discarded rather than misread. Every version since has been a pure
+/// append - the advertising window (3), the BLE off period (4), the mode
+/// and its idle timeout (5), the name (6), the BLE on period (7) - so an
+/// older record still reads: a board updated in the field keeps the cadence
+/// it was left on instead of coming back advertising continuously. Which
+/// knob a version carries is the `since` column of [`KNOBS`].
 ///
 /// A record from before version 5 carries no mode, which reads as
 /// [`Mode::Stored`]: an updated board comes back reachable (a cold boot
 /// lands in [`Mode::Idle`] whatever the record says) and then stores itself
-/// on the cadence it already had. Version 6 appended the name, and a record
-/// from before it reads as never named - a board updated in the field
-/// advertises under its address until somebody names it. Version 7
-/// appended the BLE on period, which an older record reads as never
-/// configured: the default, which is what the advertising window it used
-/// to share was.
-///
-/// A version 6 record also carries an idle timeout that meant "the
-/// default" when it was 0 and means "off" now. That is the change wanted:
-/// a board updated in the field stops storing itself out of idle unless
-/// somebody had set a timeout.
+/// on the cadence it already had. A version 6 record also carries an idle
+/// timeout that meant "the default" when it was 0 and means "off" now. That
+/// is the change wanted: a board updated in the field stops storing itself
+/// out of idle unless somebody had set a timeout.
 pub const RECORD_VERSION: u32 = 7;
-
-/// Where the BLE on period sits: after the name, which is where version 6
-/// ended.
-const BLE_ON_AT: usize = 32 + ble::NAME_FIELD_LEN;
 
 /// magic, version, sleep interval, flags, advertising window, BLE off
 /// period, mode, idle timeout, name, BLE on period, crc32. Every field is a
@@ -457,17 +605,19 @@ const BLE_ON_AT: usize = 32 + ble::NAME_FIELD_LEN;
 /// flash write word.
 pub const RECORD_LEN: usize = BLE_ON_AT + 8;
 
-/// Where the crc sits in each older record: the length that version's
-/// layout had before it.
-///
-/// Every version since 2 has been a pure append, so an old record is read
-/// by checking its crc where that version left it rather than where this
-/// one does - the bytes past it are erased flash, not fields.
-const V2_CRC_AT: usize = 16;
-const V3_CRC_AT: usize = 20;
-const V4_CRC_AT: usize = 24;
-const V5_CRC_AT: usize = 32;
-const V6_CRC_AT: usize = BLE_ON_AT;
+/// Where the crc sits in a record of `version`: the length that version's
+/// layout had before it, or `None` for a version this build cannot read.
+fn record_crc_at(version: u32) -> Option<usize> {
+    Some(match version {
+        2 => 16,
+        3 => 20,
+        4 => 24,
+        5 => 32,
+        6 => BLE_ON_AT,
+        RECORD_VERSION => RECORD_LEN - 4,
+        _ => return None,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // Config characteristic writes
@@ -477,27 +627,14 @@ const V6_CRC_AT: usize = BLE_ON_AT;
 /// write into the settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// Drive the GPS/LoRa rail to this level.
-    Rail(bool),
     /// Put the radio into standby (`true`) or bring it back.
-    ///
-    /// This was a link frame and a wait for the WIO's answer, so the ack
-    /// the policy built was provisional. Same-chip it is a signal the
-    /// hardware loop picks up, and the ack always holds.
-    WioSleep(bool),
+    RadioStandby(bool),
     /// Put the GPS into (`true`) or out of backup mode.
     GpsSleep(bool),
-    /// The deep-sleep wake-check interval is now this many seconds
-    /// (0 = sleep off). Already stored and already clamped.
-    SleepInterval(u32),
-    /// The advertising window per wake check is now this many seconds.
-    /// Takes effect on the next wake, not the window already running.
-    AdvWindow(u32),
-    /// The BLE controller now stays down for this many seconds between
-    /// advertising windows (0 = never take it down). Takes effect at the
-    /// end of the window already running, not immediately - a central that
-    /// just set it keeps its connection.
-    BleOff(u32),
+    /// A duration is now this many seconds. Already stored and clamped;
+    /// the loops read it when they next decide, so it takes effect at the
+    /// next window, wake or re-arm rather than shortening the one running.
+    Knob(Knob, u32),
     /// Deep sleep now, for this many seconds, then resume as configured.
     ///
     /// Unlike every other variant here this is a command rather than a
@@ -516,15 +653,6 @@ pub enum Action {
     /// [`Action::SleepNow`] and has the same requirement: the ack must
     /// leave before the board acts, because the link does not survive it.
     SetMode(Mode),
-    /// The idle timeout is now this many seconds (0 = the board never
-    /// stores itself out of idle). Already stored and clamped; it takes
-    /// effect at the next re-arm rather than shortening the timeout already
-    /// running.
-    IdleTimeout(u32),
-    /// BLE now stays up this many seconds between off periods while
-    /// tracking. Already stored and clamped; takes effect at the next
-    /// window, like the advertising window.
-    BleOn(u32),
     /// The board has been renamed - or, with an empty label, un-named and
     /// back to advertising under its address. Already stored.
     ///
@@ -551,10 +679,10 @@ pub struct Outcome {
     /// Whether the change has to reach flash to mean anything.
     ///
     /// Set for the settings that decide whether a board comes back at all
-    /// after its battery goes flat - the sleep interval, the advertising
-    /// window and the rail. The two WIO sleep flags are not saved: they are
-    /// re-applied over the link when it next comes up, and a board that
-    /// cold-boots with its GPS running is the safer of the two failures.
+    /// after its battery goes flat - the durations, the mode, the name. The
+    /// two override flags are not saved: they are re-applied on the next
+    /// tracking command, and a board that cold-boots with its GPS running
+    /// is the safer of the two failures.
     pub save: bool,
 }
 
@@ -583,10 +711,10 @@ impl Outcome {
 ///
 /// Board-specific ids are handled here; anything else falls through to the
 /// gps-proto config protocol, so the app that predates this board keeps
-/// working against it. Writes are applied optimistically - the flag is set
-/// before the WIO is asked - because the settings characteristic has to
-/// report what the app asked for even while the WIO is unreachable, which
-/// on this board is most of the time (the rail is off through every sleep).
+/// working against it. Writes are applied before the hardware has moved -
+/// the flag is set, the request is queued - because the settings
+/// characteristic has to report what the app asked for, and the hardware
+/// loop answers on its next pass rather than in this call.
 pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
     if data.len() >= 2 {
         let id = data[0];
@@ -594,23 +722,35 @@ pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
         // A length running past the write leaves the value empty, which the
         // per-id checks below reject; only the flag ids default it.
         let value = data.get(2..2 + len).unwrap_or(&[]);
+        if let Some(knob) = Knob::from_id(id) {
+            let Ok(bytes) = <[u8; 4]>::try_from(value) else {
+                return Outcome::reject(id, packet::ACK_BAD_VALUE);
+            };
+            // Clamped the way the knob's row says - a zero kept as "off"
+            // for the knobs that have an off, brought up to the floor for
+            // the ones a zero would leave unreachable - and echoed as
+            // applied, so the app displays the effective setting rather
+            // than the request.
+            let secs = knob.spec().clamp(u32::from_le_bytes(bytes));
+            stored.set_knob(knob, secs);
+            return Outcome::new(
+                Action::Knob(knob, secs),
+                true,
+                id,
+                packet::ACK_OK,
+                &secs.to_le_bytes(),
+            );
+        }
         match id {
-            ble::CFG_PWR_EN => {
-                // A bare write with no value means "on": the rail is what
-                // makes the board a tracker, so the ambiguous case powers it.
-                let on = value.first().copied().unwrap_or(1) != 0;
-                stored.set_flag(PFLAG_PWR_OFF, !on);
-                return Outcome::new(Action::Rail(on), true, id, packet::ACK_OK, &[on as u8]);
-            }
-            ble::CFG_WIO_SLEEP => {
-                let sleep = value.first().copied().unwrap_or(0) != 0;
-                stored.set_flag(PFLAG_WIO_SLEEP, sleep);
+            ble::CFG_RADIO_STANDBY => {
+                let standby = value.first().copied().unwrap_or(0) != 0;
+                stored.set_flag(PFLAG_RADIO_STANDBY, standby);
                 return Outcome::new(
-                    Action::WioSleep(sleep),
+                    Action::RadioStandby(standby),
                     false,
                     id,
                     packet::ACK_OK,
-                    &[sleep as u8],
+                    &[standby as u8],
                 );
             }
             ble::CFG_GPS_SLEEP => {
@@ -622,64 +762,6 @@ pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
                     id,
                     packet::ACK_OK,
                     &[sleep as u8],
-                );
-            }
-            ble::CFG_ESP_SLEEP_S => {
-                let Ok(bytes) = <[u8; 4]>::try_from(value) else {
-                    return Outcome::reject(id, packet::ACK_BAD_VALUE);
-                };
-                let mut secs = u32::from_le_bytes(bytes);
-                // 0 is "sleep off" rather than a very short interval, so it
-                // is the one value that does not come up to the floor.
-                if secs > 0 {
-                    secs = secs.clamp(ble::ESP_SLEEP_MIN_S, ble::ESP_SLEEP_MAX_S);
-                }
-                stored.sleep_interval_s = secs;
-                return Outcome::new(
-                    Action::SleepInterval(secs),
-                    true,
-                    id,
-                    packet::ACK_OK,
-                    &secs.to_le_bytes(),
-                );
-            }
-            ble::CFG_ESP_ADV_WINDOW_S => {
-                let Ok(bytes) = <[u8; 4]>::try_from(value) else {
-                    return Outcome::reject(id, packet::ACK_BAD_VALUE);
-                };
-                // Clamped unconditionally: unlike the sleep interval, 0 is
-                // not an "off" here, so it comes up to the floor instead of
-                // being stored as a window nobody could ever connect in.
-                let secs = u32::from_le_bytes(bytes).clamp(ble::ESP_ADV_MIN_S, ble::ESP_ADV_MAX_S);
-                stored.adv_window_s = secs;
-                return Outcome::new(
-                    Action::AdvWindow(secs),
-                    true,
-                    id,
-                    packet::ACK_OK,
-                    &secs.to_le_bytes(),
-                );
-            }
-            ble::CFG_BLE_OFF_S => {
-                let Ok(bytes) = <[u8; 4]>::try_from(value) else {
-                    return Outcome::reject(id, packet::ACK_BAD_VALUE);
-                };
-                // 0 means off, like the sleep interval and unlike the
-                // advertising window: a board that never takes BLE down is
-                // the old behavior and has to stay reachable as one.
-                let asked = u32::from_le_bytes(bytes);
-                let secs = if asked == 0 {
-                    0
-                } else {
-                    asked.clamp(ble::BLE_OFF_MIN_S, ble::BLE_OFF_MAX_S)
-                };
-                stored.ble_off_s = secs;
-                return Outcome::new(
-                    Action::BleOff(secs),
-                    true,
-                    id,
-                    packet::ACK_OK,
-                    &secs.to_le_bytes(),
                 );
             }
             ble::CFG_MODE => {
@@ -699,45 +781,6 @@ pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
                     id,
                     packet::ACK_OK,
                     &[mode.as_wire()],
-                );
-            }
-            ble::CFG_IDLE_TIMEOUT_S => {
-                let Ok(bytes) = <[u8; 4]>::try_from(value) else {
-                    return Outcome::reject(id, packet::ACK_BAD_VALUE);
-                };
-                // 0 means off, like the sleep interval and the off period:
-                // a board that never stores itself out of idle is the
-                // default and the safe direction.
-                let asked = u32::from_le_bytes(bytes);
-                let secs = if asked == 0 {
-                    0
-                } else {
-                    asked.clamp(ble::IDLE_TIMEOUT_MIN_S, ble::IDLE_TIMEOUT_MAX_S)
-                };
-                stored.idle_timeout_s = secs;
-                return Outcome::new(
-                    Action::IdleTimeout(secs),
-                    true,
-                    id,
-                    packet::ACK_OK,
-                    &secs.to_le_bytes(),
-                );
-            }
-            ble::CFG_BLE_ON_S => {
-                let Ok(bytes) = <[u8; 4]>::try_from(value) else {
-                    return Outcome::reject(id, packet::ACK_BAD_VALUE);
-                };
-                // Clamped unconditionally, like the advertising window it
-                // was split from: a zero-length on period is a tracker
-                // nobody can connect to.
-                let secs = u32::from_le_bytes(bytes).clamp(ble::BLE_ON_MIN_S, ble::BLE_ON_MAX_S);
-                stored.ble_on_s = secs;
-                return Outcome::new(
-                    Action::BleOn(secs),
-                    true,
-                    id,
-                    packet::ACK_OK,
-                    &secs.to_le_bytes(),
                 );
             }
             ble::CFG_NAME => {
@@ -840,9 +883,11 @@ pub fn boot_mode(persisted: Mode, woke_from_sleep: bool) -> Mode {
 /// What the board should do right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Next {
-    /// Keep advertising. With a budget that bites, for at most
-    /// [`Window::remaining_ms`] longer.
-    Advertise,
+    /// Keep advertising. `bounded` says the budget ends in something, so
+    /// the wait for a central is cut at [`Window::remaining_ms`]; unbounded
+    /// is a board that advertises forever, and then the wait has no
+    /// deadline.
+    Advertise { bounded: bool },
     /// Deep sleep for this many seconds, which is the board going to
     /// [`Mode::Stored`].
     Sleep { interval_s: u32 },
@@ -852,6 +897,17 @@ pub enum Next {
     /// beacon keeps transmitting, the GPS keeps tracking and the card keeps
     /// logging. What it costs is reachability.
     BleDown { off_s: u32 },
+}
+
+impl Next {
+    /// Advertise with no end: what a spent budget resolves to in a mode
+    /// that has no duty cycle.
+    pub const FOREVER: Next = Next::Advertise { bounded: false };
+
+    /// Whether this is advertising, bounded or not.
+    pub fn advertises(self) -> bool {
+        matches!(self, Next::Advertise { .. })
+    }
 }
 
 /// The advertising budget for one wake, held as a deadline rather than as a
@@ -897,12 +953,17 @@ impl Window {
     ///
     /// The settings are passed in per call rather than captured, so a
     /// cadence or a mode changed over BLE takes effect at the next decision
-    /// instead of at the next boot.
+    /// instead of at the next boot. Derived from `at_expiry` rather than
+    /// from the settings directly, so a spent budget that resolves to "keep
+    /// advertising" cannot arm a zero-length wait and spin.
     pub fn next(&self, now_ms: u64, stored: &Stored) -> Next {
+        let at_expiry = stored.at_expiry();
         if self.remaining_ms(now_ms) > 0 {
-            Next::Advertise
+            Next::Advertise {
+                bounded: !at_expiry.advertises(),
+            }
         } else {
-            stored.at_expiry()
+            at_expiry
         }
     }
 
@@ -956,17 +1017,20 @@ impl Window {
 // The serve loop's policy
 // ---------------------------------------------------------------------------
 
-/// What the serve loop does at the top of a pass.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Pass {
-    /// Advertise. `bounded` says the budget ends in something, so the
-    /// wait for a central is cut at [`Serve::remaining_ms`]; unbounded is
-    /// a board that advertises forever, and then the wait has no deadline.
-    Advertise { bounded: bool },
-    /// The budget is spent and the mode sleeps on it. Does not return.
-    Sleep { interval_s: u32 },
-    /// The budget is spent and the mode drops the modem for this long.
-    BleDown { off_s: u32 },
+/// A command for the serve loop, from a config write on either transport.
+///
+/// One channel with one consumer, whichever wait the loop is in - the wait
+/// for a central, the connected session, the modem's off period. The loop
+/// owns the advertising and the `Rtc`, so anything that ends a wait early
+/// has to reach it here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ServeCommand {
+    /// Deep sleep now, for this long, once whatever is owed to a connected
+    /// central has left. Already resolved and clamped.
+    SleepNow(u32),
+    /// The mode moved: a wait that belongs to the old mode's budget should
+    /// end, and the next pass re-budgets on the new one.
+    ModeChanged,
 }
 
 /// How waiting for a central ended.
@@ -979,13 +1043,12 @@ pub enum Accepted {
     Failed,
     /// The budget ran out with nobody interested.
     Expired,
-    /// Something asked the board to deep sleep now, for this long.
-    SleepNow(u32),
-    /// The mode moved under the loop, over USB or from the board itself.
-    ModeChanged,
+    /// A command arrived while waiting.
+    Command(ServeCommand),
 }
 
-/// What the firmware does after [`Serve::on_accept`].
+/// What the firmware does after [`Serve::on_accept`] or
+/// [`Serve::on_session_end`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Then {
     /// Run the connected session.
@@ -994,8 +1057,8 @@ pub enum Then {
     Retry,
     /// Deep sleep for this many seconds. Does not return.
     Sleep(u32),
-    /// Drop the BLE stack for the mode's off period and come back.
-    Return,
+    /// Drop the BLE stack for this many seconds and come back.
+    BleDown(u32),
     /// Go straight back to the top of the loop.
     Continue,
 }
@@ -1063,23 +1126,13 @@ impl Serve {
     /// A wake check's window and an idle timeout are the same deadline
     /// field holding two very different numbers, so a mode that moved gets
     /// a fresh budget on its own terms rather than the old one's deadline.
-    pub fn pass(&mut self, now_ms: u64, stored: &Stored) -> (bool, Pass) {
+    pub fn pass(&mut self, now_ms: u64, stored: &Stored) -> (bool, Next) {
         let rebudgeted = stored.mode != self.mode;
         if rebudgeted {
             self.mode = stored.mode;
             self.window = Window::new(now_ms, stored.budget_s());
         }
-        let pass = match self.window.next(now_ms, stored) {
-            Next::Sleep { interval_s } => Pass::Sleep { interval_s },
-            Next::BleDown { off_s } => Pass::BleDown { off_s },
-            // Derived from `at_expiry` rather than from the settings, so a
-            // spent budget that resolves to "keep advertising" cannot arm
-            // a zero-length wait and spin.
-            Next::Advertise => Pass::Advertise {
-                bounded: stored.at_expiry() != Next::Advertise,
-            },
-        };
-        (rebudgeted, pass)
+        (rebudgeted, self.window.next(now_ms, stored))
     }
 
     /// What an accept outcome means.
@@ -1117,10 +1170,11 @@ impl Serve {
             }
             Accepted::Expired => match stored.at_expiry() {
                 Next::Sleep { interval_s } => Then::Sleep(interval_s),
-                _ => Then::Return,
+                Next::BleDown { off_s } => Then::BleDown(off_s),
+                Next::Advertise { .. } => Then::Continue,
             },
-            Accepted::SleepNow(secs) => Then::Sleep(secs),
-            Accepted::ModeChanged => Then::Continue,
+            Accepted::Command(ServeCommand::SleepNow(secs)) => Then::Sleep(secs),
+            Accepted::Command(ServeCommand::ModeChanged) => Then::Continue,
         };
         Step { promote, then }
     }
@@ -1145,41 +1199,35 @@ impl Serve {
     }
 }
 
-/// How long the modem stays down once the serve loop returns, or `None`
-/// for a mode that has no off period - a setting, or a mode, that moved
-/// while the modem was coming down, which goes straight back to
-/// advertising rather than sitting out a zero-length wait.
-pub fn down_period(stored: &Stored) -> Option<u32> {
-    match stored.at_expiry() {
-        Next::BleDown { off_s } => Some(off_s),
-        _ => None,
+/// What a command arriving during the modem's off period means: a nap
+/// takes the board down at once, a moved mode ends the off period early
+/// so the next pass can budget on the new mode.
+pub fn during_ble_down(command: ServeCommand) -> Then {
+    match command {
+        ServeCommand::SleepNow(secs) => Then::Sleep(secs),
+        ServeCommand::ModeChanged => Then::Continue,
     }
 }
 
 // ---------------------------------------------------------------------------
-// From a config write to the hardware loop
+// From a config write to the two loops
 // ---------------------------------------------------------------------------
 
 /// What an [`Action`] sets in motion beyond the settings it already changed:
-/// a request to the hardware loop, a sleep for the serve loop, a signal
-/// that the mode moved.
+/// a request to the hardware loop, a command for the serve loop, a
+/// per-session value.
 ///
 /// The two loops are answered separately because they own different
 /// things. The hardware half of a mode change is a request the hardware
-/// loop picks up on its next pass; the budget half goes to the serve loop,
-/// which owns the advertising and the `Rtc`. A store is a command that
-/// ends with the chip gone, so it goes to the serve loop by the same route
-/// a nap does - the ack has to leave before the board acts, and the link
-/// does not survive the action.
+/// loop picks up on its next pass; the budget half is a command to the
+/// serve loop, which owns the advertising and the `Rtc`. A store is a
+/// command that ends with the chip gone, so it goes to the serve loop by
+/// the same route a nap does - the ack has to leave before the board acts,
+/// and the link does not survive the action.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Dispatch {
-    pub request: Option<crate::posture::Request>,
-    /// Deep sleep for this long, once whatever is owed to the central has
-    /// left.
-    pub sleep_now: Option<u32>,
-    /// The mode moved: a serve loop waiting on a budget that belongs to the
-    /// old mode should stop waiting.
-    pub mode_signal: bool,
+    pub request: Option<Request>,
+    pub command: Option<ServeCommand>,
     /// The position notify interval, which is session state rather than a
     /// stored setting.
     pub notify_interval_ms: Option<u32>,
@@ -1188,30 +1236,21 @@ pub struct Dispatch {
 /// What `action` sets in motion, given the settings as they are after the
 /// write that produced it.
 pub fn dispatch(action: Action, stored: &Stored) -> Dispatch {
-    use crate::posture::Request;
     let mut d = Dispatch::default();
     match action {
         Action::GpsSleep(on) => d.request = Some(Request::GpsSleep(on)),
-        // No second MCU to put to sleep; the nearest thing is parking the
-        // radio, which is what the WIO's soft sleep actually bought.
-        Action::WioSleep(on) => d.request = Some(Request::RadioStandby(on)),
+        Action::RadioStandby(on) => d.request = Some(Request::RadioStandby(on)),
         Action::NotifyInterval(ms) => d.notify_interval_ms = Some(ms),
-        Action::SleepNow(secs) => d.sleep_now = Some(secs),
-        Action::SetMode(Mode::Stored) => d.sleep_now = Some(stored.sleep_cadence()),
+        Action::SleepNow(secs) => d.command = Some(ServeCommand::SleepNow(secs)),
+        Action::SetMode(Mode::Stored) => {
+            d.command = Some(ServeCommand::SleepNow(stored.sleep_cadence()));
+        }
         Action::SetMode(mode) => {
             d.request = Some(Request::Mode(mode));
-            d.mode_signal = true;
+            d.command = Some(ServeCommand::ModeChanged);
         }
-        // Settings the loops read for themselves when they next decide,
-        // and a rail this board does not have.
-        Action::Rail(_)
-        | Action::SleepInterval(_)
-        | Action::AdvWindow(_)
-        | Action::BleOff(_)
-        | Action::BleOn(_)
-        | Action::IdleTimeout(_)
-        | Action::Name
-        | Action::None => {}
+        // Settings the loops read for themselves when they next decide.
+        Action::Knob(..) | Action::Name | Action::None => {}
     }
     d
 }
@@ -1219,6 +1258,13 @@ pub fn dispatch(action: Action, stored: &Stored) -> Dispatch {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Where each older layout put its crc: the length that version had.
+    const V2_CRC_AT: usize = 16;
+    const V3_CRC_AT: usize = 20;
+    const V4_CRC_AT: usize = 24;
+    const V5_CRC_AT: usize = 32;
+    const V6_CRC_AT: usize = BLE_ON_AT;
 
     /// A config write in the wire format: `[id, len, value]`.
     fn write(id: u8, value: &[u8]) -> Vec<u8> {
@@ -1277,16 +1323,14 @@ mod tests {
     fn an_unconfigured_board_is_awake_and_powered() {
         let s = Stored::new();
         assert_eq!(s, Stored::default());
-        assert!(s.pwr_en());
-        assert!(!s.wio_sleep());
+        assert!(!s.radio_standby());
         assert!(!s.gps_sleep());
         assert_eq!(s.sleep_interval_s, 0);
         assert_eq!(s.adv_window(), ble::ESP_ADV_DEFAULT_S);
         assert_eq!(
             s.settings(packet::UPDATE_INTERVAL_DEFAULT_MS),
             ble::Settings {
-                pwr_en: true,
-                wio_sleep: false,
+                radio_standby: false,
                 gps_sleep: false,
                 sleep_interval_s: 0,
                 notify_interval_ms: packet::UPDATE_INTERVAL_DEFAULT_MS,
@@ -1304,14 +1348,12 @@ mod tests {
     #[test]
     fn settings_report_the_stored_state() {
         let mut s = Stored::new();
-        s.set_flag(PFLAG_PWR_OFF, true);
-        s.set_flag(PFLAG_WIO_SLEEP, true);
+        s.set_flag(PFLAG_RADIO_STANDBY, true);
         s.sleep_interval_s = 120;
         s.adv_window_s = 30;
 
         let settings = s.settings(2_000);
-        assert!(!settings.pwr_en);
-        assert!(settings.wio_sleep);
+        assert!(settings.radio_standby);
         assert!(!settings.gps_sleep);
         assert_eq!(settings.sleep_interval_s, 120);
         assert_eq!(settings.notify_interval_ms, 2_000);
@@ -1329,80 +1371,41 @@ mod tests {
         assert_eq!(s.settings(1_000).adv_window_s, ble::ESP_ADV_DEFAULT_S);
     }
 
-    /// A wake check comes up dark even with the rail configured on, so a
-    /// wake nobody answers never pays for the WIO and the GPS.
-    #[test]
-    fn a_wake_check_comes_up_dark() {
-        let s = Stored::new();
-        assert!(s.pwr_en());
-        assert!(!s.rail_at_boot(true), "a wake check must come up dark");
-        assert!(s.rail_at_boot(false), "a cold boot follows the setting");
-
-        let mut off = Stored::new();
-        off.set_flag(PFLAG_PWR_OFF, true);
-        assert!(!off.rail_at_boot(false));
-        assert!(!off.rail_at_boot(true));
-    }
 
     // -- config writes -----------------------------------------------------
 
-    #[test]
-    fn a_rail_write_drives_and_persists_it() {
-        let mut s = Stored::new();
-        let o = apply(&mut s, &write(ble::CFG_PWR_EN, &[0]));
-        assert_eq!(o.action, Action::Rail(false));
-        assert!(o.save, "the rail must survive a flat battery");
-        assert!(!s.pwr_en());
-        assert_eq!(o.ack(), &[ble::CFG_PWR_EN, packet::ACK_OK, 0]);
 
-        let o = apply(&mut s, &write(ble::CFG_PWR_EN, &[1]));
-        assert_eq!(o.action, Action::Rail(true));
-        assert!(s.pwr_en());
-        assert_eq!(o.ack(), &[ble::CFG_PWR_EN, packet::ACK_OK, 1]);
-    }
 
-    /// A valueless rail write powers the board rather than darkening it:
-    /// the rail is what makes it a tracker.
+    /// The override flags are recorded as soon as they are asked for, before
+    /// the hardware loop has moved, because the settings characteristic has
+    /// to report what the app asked for.
     #[test]
-    fn a_valueless_rail_write_powers_the_board() {
+    fn an_override_write_records_the_request_before_the_hardware_moves() {
         let mut s = Stored::new();
-        s.set_flag(PFLAG_PWR_OFF, true);
-        let o = apply(&mut s, &write(ble::CFG_PWR_EN, &[]));
-        assert_eq!(o.action, Action::Rail(true));
-        assert!(s.pwr_en());
-    }
-
-    /// The sleep flags are recorded as soon as they are asked for, before
-    /// the WIO has answered, because the settings characteristic has to
-    /// report what the app asked for even while the WIO is unreachable.
-    #[test]
-    fn a_sleep_write_records_the_request_before_the_wio_answers() {
-        let mut s = Stored::new();
-        let o = apply(&mut s, &write(ble::CFG_WIO_SLEEP, &[1]));
-        assert_eq!(o.action, Action::WioSleep(true));
-        assert!(s.wio_sleep());
-        assert_eq!(o.ack(), &[ble::CFG_WIO_SLEEP, packet::ACK_OK, 1]);
+        let o = apply(&mut s, &write(ble::CFG_RADIO_STANDBY, &[1]));
+        assert_eq!(o.action, Action::RadioStandby(true));
+        assert!(s.radio_standby());
+        assert_eq!(o.ack(), &[ble::CFG_RADIO_STANDBY, packet::ACK_OK, 1]);
 
         let o = apply(&mut s, &write(ble::CFG_GPS_SLEEP, &[1]));
         assert_eq!(o.action, Action::GpsSleep(true));
         assert!(s.gps_sleep());
 
         // And clearing them again.
-        apply(&mut s, &write(ble::CFG_WIO_SLEEP, &[0]));
+        apply(&mut s, &write(ble::CFG_RADIO_STANDBY, &[0]));
         apply(&mut s, &write(ble::CFG_GPS_SLEEP, &[0]));
-        assert!(!s.wio_sleep());
+        assert!(!s.radio_standby());
         assert!(!s.gps_sleep());
     }
 
-    /// The WIO sleep flags are the two settings that are not written to
-    /// flash: they are re-applied over the link when it comes up, and a
+    /// The two override flags are the settings that are not written to
+    /// flash: they are re-applied on the next tracking command, and a
     /// board that cold-boots with its GPS running is the safer failure.
     #[test]
     fn only_the_reachability_settings_reach_flash() {
         let mut s = Stored::new();
-        assert!(!apply(&mut s, &write(ble::CFG_WIO_SLEEP, &[1])).save);
+        assert!(!apply(&mut s, &write(ble::CFG_RADIO_STANDBY, &[1])).save);
         assert!(!apply(&mut s, &write(ble::CFG_GPS_SLEEP, &[1])).save);
-        assert!(apply(&mut s, &write(ble::CFG_PWR_EN, &[0])).save);
         assert!(apply(&mut s, &u32_write(ble::CFG_ESP_SLEEP_S, 60)).save);
         assert!(apply(&mut s, &u32_write(ble::CFG_ESP_ADV_WINDOW_S, 20)).save);
     }
@@ -1420,7 +1423,7 @@ mod tests {
             (ble::ESP_SLEEP_MAX_S, ble::ESP_SLEEP_MAX_S),
         ] {
             let o = apply(&mut s, &u32_write(ble::CFG_ESP_SLEEP_S, asked));
-            assert_eq!(o.action, Action::SleepInterval(applied), "asked {}", asked);
+            assert_eq!(o.action, Action::Knob(Knob::SleepInterval, applied), "asked {}", asked);
             assert_eq!(ack_u32(&o), applied);
             assert_eq!(s.sleep_interval_s, applied);
         }
@@ -1433,7 +1436,7 @@ mod tests {
         let mut s = Stored::new();
         apply(&mut s, &u32_write(ble::CFG_ESP_SLEEP_S, 300));
         let o = apply(&mut s, &u32_write(ble::CFG_ESP_SLEEP_S, 0));
-        assert_eq!(o.action, Action::SleepInterval(0));
+        assert_eq!(o.action, Action::Knob(Knob::SleepInterval, 0));
         assert_eq!(ack_u32(&o), 0);
         assert_eq!(s.sleep_interval_s, 0);
     }
@@ -1451,7 +1454,7 @@ mod tests {
             (20, 20),
         ] {
             let o = apply(&mut s, &u32_write(ble::CFG_ESP_ADV_WINDOW_S, asked));
-            assert_eq!(o.action, Action::AdvWindow(applied), "asked {}", asked);
+            assert_eq!(o.action, Action::Knob(Knob::AdvWindow, applied), "asked {}", asked);
             assert_eq!(ack_u32(&o), applied);
             assert_eq!(s.adv_window(), applied);
         }
@@ -1465,11 +1468,10 @@ mod tests {
         let mut s = Stored::new();
         apply(&mut s, &u32_write(ble::CFG_ESP_SLEEP_S, 90));
         apply(&mut s, &u32_write(ble::CFG_ESP_ADV_WINDOW_S, 30));
-        apply(&mut s, &write(ble::CFG_WIO_SLEEP, &[1]));
+        apply(&mut s, &write(ble::CFG_RADIO_STANDBY, &[1]));
         assert_eq!(s.sleep_interval_s, 90);
         assert_eq!(s.adv_window(), 30);
-        assert!(s.wio_sleep());
-        assert!(s.pwr_en());
+        assert!(s.radio_standby());
     }
 
     /// A malformed value changes nothing. Silently applying part of it
@@ -1487,7 +1489,7 @@ mod tests {
             (99_999, ble::BLE_OFF_MAX_S),
         ] {
             let o = apply(&mut s, &u32_write(ble::CFG_BLE_OFF_S, asked));
-            assert_eq!(o.action, Action::BleOff(applied), "asked {}", asked);
+            assert_eq!(o.action, Action::Knob(Knob::BleOff, applied), "asked {}", asked);
             assert_eq!(s.ble_off_s, applied, "asked {}", asked);
             assert!(o.save);
         }
@@ -1551,7 +1553,7 @@ mod tests {
     #[test]
     fn a_truncated_write_is_rejected() {
         let mut s = Stored::new();
-        for data in [vec![], vec![ble::CFG_PWR_EN]] {
+        for data in [vec![], vec![ble::CFG_GPS_SLEEP]] {
             let o = apply(&mut s, &data);
             assert_eq!(o.action, Action::None);
             assert_eq!(ack_status(&o), packet::ACK_BAD_VALUE);
@@ -1565,7 +1567,7 @@ mod tests {
     fn a_record_roundtrips() {
         let s = Stored {
             sleep_interval_s: 300,
-            flags: PFLAG_PWR_OFF | PFLAG_GPS_SLEEP,
+            flags: PFLAG_GPS_SLEEP,
             adv_window_s: 45,
             ble_off_s: 90,
             mode: Mode::Tracking,
@@ -1586,13 +1588,13 @@ mod tests {
         rec[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
         rec[4..8].copy_from_slice(&2u32.to_le_bytes());
         rec[8..12].copy_from_slice(&120u32.to_le_bytes());
-        rec[12..16].copy_from_slice(&PFLAG_WIO_SLEEP.to_le_bytes());
+        rec[12..16].copy_from_slice(&PFLAG_RADIO_STANDBY.to_le_bytes());
         let crc = link::crc32(&rec[0..V2_CRC_AT]);
         rec[V2_CRC_AT..V2_CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
 
         let s = Stored::decode_record(&rec).expect("a version 2 record still reads");
         assert_eq!(s.sleep_interval_s, 120);
-        assert!(s.wio_sleep());
+        assert!(s.radio_standby());
         // No window in that layout, so the default applies.
         assert_eq!(s.adv_window_s, 0);
         assert_eq!(s.adv_window(), ble::ESP_ADV_DEFAULT_S);
@@ -1610,14 +1612,14 @@ mod tests {
         rec[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
         rec[4..8].copy_from_slice(&3u32.to_le_bytes());
         rec[8..12].copy_from_slice(&120u32.to_le_bytes());
-        rec[12..16].copy_from_slice(&PFLAG_WIO_SLEEP.to_le_bytes());
+        rec[12..16].copy_from_slice(&PFLAG_RADIO_STANDBY.to_le_bytes());
         rec[16..20].copy_from_slice(&45u32.to_le_bytes());
         let crc = link::crc32(&rec[0..V3_CRC_AT]);
         rec[V3_CRC_AT..V3_CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
 
         let s = Stored::decode_record(&rec).expect("a version 3 record still reads");
         assert_eq!(s.sleep_interval_s, 120);
-        assert!(s.wio_sleep());
+        assert!(s.radio_standby());
         assert_eq!(s.adv_window_s, 45);
         // The field that version predates reads as disabled, so an updated
         // board does not start going dark on its own.
@@ -1633,7 +1635,7 @@ mod tests {
         rec[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
         rec[4..8].copy_from_slice(&4u32.to_le_bytes());
         rec[8..12].copy_from_slice(&120u32.to_le_bytes());
-        rec[12..16].copy_from_slice(&PFLAG_WIO_SLEEP.to_le_bytes());
+        rec[12..16].copy_from_slice(&PFLAG_RADIO_STANDBY.to_le_bytes());
         rec[16..20].copy_from_slice(&45u32.to_le_bytes());
         rec[20..24].copy_from_slice(&30u32.to_le_bytes());
         let crc = link::crc32(&rec[0..V4_CRC_AT]);
@@ -1660,7 +1662,7 @@ mod tests {
         rec[0..4].copy_from_slice(&RECORD_MAGIC.to_le_bytes());
         rec[4..8].copy_from_slice(&5u32.to_le_bytes());
         rec[8..12].copy_from_slice(&120u32.to_le_bytes());
-        rec[12..16].copy_from_slice(&PFLAG_WIO_SLEEP.to_le_bytes());
+        rec[12..16].copy_from_slice(&PFLAG_RADIO_STANDBY.to_le_bytes());
         rec[16..20].copy_from_slice(&45u32.to_le_bytes());
         rec[20..24].copy_from_slice(&30u32.to_le_bytes());
         rec[24..28].copy_from_slice(&(Mode::Tracking.as_wire() as u32).to_le_bytes());
@@ -1873,7 +1875,7 @@ mod tests {
         assert_eq!(s.idle_timeout(), 0);
 
         let o = apply(&mut s, &u32_write(ble::CFG_IDLE_TIMEOUT_S, 900));
-        assert_eq!(o.action, Action::IdleTimeout(900));
+        assert_eq!(o.action, Action::Knob(Knob::IdleTimeout, 900));
         assert!(o.save);
         assert_eq!(ack_u32(&o), 900);
         assert_eq!(s.idle_timeout(), 900);
@@ -1895,10 +1897,10 @@ mod tests {
             sleep_interval_s: 120,
             ..s
         };
-        assert_eq!(idle.at_expiry(), Next::Advertise);
+        assert_eq!(idle.at_expiry(), Next::FOREVER);
         assert_eq!(
             Window::new(0, idle.budget_s()).next(3_600_000, &idle),
-            Next::Advertise
+            Next::FOREVER
         );
     }
 
@@ -1912,7 +1914,7 @@ mod tests {
 
         apply(&mut s, &u32_write(ble::CFG_ESP_ADV_WINDOW_S, 5));
         let o = apply(&mut s, &u32_write(ble::CFG_BLE_ON_S, 40));
-        assert_eq!(o.action, Action::BleOn(40));
+        assert_eq!(o.action, Action::Knob(Knob::BleOn, 40));
         assert!(o.save);
         assert_eq!(ack_u32(&o), 40);
         assert_eq!(s.adv_window(), 5);
@@ -1951,9 +1953,9 @@ mod tests {
             idle_timeout_s: 60,
             ..Stored::new()
         };
-        assert_eq!(s.at_expiry(), Next::Advertise);
+        assert_eq!(s.at_expiry(), Next::FOREVER);
         let w = Window::new(0, s.budget_s());
-        assert_eq!(w.next(3_600_000, &s), Next::Advertise);
+        assert_eq!(w.next(3_600_000, &s), Next::FOREVER);
         assert_eq!(boot_mode(Mode::Listening, false), Mode::Listening);
         assert_eq!(boot_mode(Mode::Listening, true), Mode::Listening);
         let back = Stored::decode_record(&s.encode_record()).expect("round trip");
@@ -2017,9 +2019,9 @@ mod tests {
             idle_timeout_s: 60,
             ..Stored::new()
         };
-        assert_eq!(s.at_expiry(), Next::Advertise);
+        assert_eq!(s.at_expiry(), Next::FOREVER);
         let w = Window::new(0, s.budget_s());
-        assert_eq!(w.next(60_000, &s), Next::Advertise);
+        assert_eq!(w.next(60_000, &s), Next::FOREVER);
     }
 
     /// Being *told* to store the board is different: somebody asked for it,
@@ -2053,7 +2055,7 @@ mod tests {
             mode: Mode::Idle,
             ..s
         };
-        assert_eq!(promoted.at_expiry(), Next::Advertise);
+        assert_eq!(promoted.at_expiry(), Next::FOREVER);
     }
 
     /// A disconnect in idle re-arms the whole timeout rather than the five
@@ -2102,7 +2104,7 @@ mod tests {
         s.mode = Mode::Idle;
         let w = Window::new(8_000, s.budget_s());
         assert_eq!(w.remaining_ms(8_000), 600_000);
-        assert_eq!(w.next(20_000, &s), Next::Advertise, "the wake check would have slept");
+        assert_eq!(w.next(20_000, &s), Next::Advertise { bounded: true }, "the wake check would have slept");
         assert_eq!(
             w.next(608_000, &s),
             Next::Sleep { interval_s: 300 },
@@ -2155,9 +2157,9 @@ mod tests {
     fn sleep_off_means_the_board_never_sleeps() {
         let s = idle(0);
         let w = Window::new(0, 15);
-        assert_eq!(w.next(0, &s), Next::Advertise);
-        assert_eq!(w.next(15_000, &s), Next::Advertise);
-        assert_eq!(w.next(u64::MAX, &s), Next::Advertise);
+        assert_eq!(w.next(0, &s), Next::FOREVER);
+        assert_eq!(w.next(15_000, &s), Next::FOREVER);
+        assert_eq!(w.next(u64::MAX, &s), Next::FOREVER);
     }
 
     /// The wake advertises for the configured window and then sleeps for
@@ -2167,9 +2169,9 @@ mod tests {
         let s = cadence(60);
         let w = Window::new(1_000, 15);
         assert_eq!(w.ends_ms(), 16_000);
-        assert_eq!(w.next(1_000, &s), Next::Advertise);
+        assert_eq!(w.next(1_000, &s), Next::Advertise { bounded: true });
         assert_eq!(w.remaining_ms(1_000), 15_000);
-        assert_eq!(w.next(15_999, &s), Next::Advertise);
+        assert_eq!(w.next(15_999, &s), Next::Advertise { bounded: true });
         assert_eq!(w.remaining_ms(15_999), 1);
         assert_eq!(w.next(16_000, &s), Next::Sleep { interval_s: 60 });
         assert_eq!(w.remaining_ms(16_000), 0);
@@ -2188,7 +2190,7 @@ mod tests {
         let mut now = 0;
         // A connect attempt that fails every 200 ms, as the firmware's
         // retry pause does.
-        while let Next::Advertise = w.next(now, &s) {
+        while w.next(now, &s).advertises() {
             now += 200;
             assert!(now <= 15_200, "the window never ended");
         }
@@ -2206,10 +2208,10 @@ mod tests {
         // The phone tried at 14.9 s of a 15 s window and did not finish.
         let tried_at = 14_900;
         w.after_connect_attempt(tried_at);
-        assert_eq!(w.next(tried_at, &s), Next::Advertise);
+        assert_eq!(w.next(tried_at, &s), Next::Advertise { bounded: true });
         assert_eq!(
             w.next(15_100, &s),
-            Next::Advertise,
+            Next::Advertise { bounded: true },
             "the window it tried in has expired, and it is still advertising"
         );
         assert_eq!(
@@ -2247,7 +2249,7 @@ mod tests {
             "the budget was already spent while connected"
         );
         w.after_disconnect(disconnected_at, &s);
-        assert_eq!(w.next(disconnected_at, &s), Next::Advertise);
+        assert_eq!(w.next(disconnected_at, &s), Next::Advertise { bounded: true });
         assert_eq!(w.remaining_ms(disconnected_at), LINGER_S * 1000);
         assert_eq!(
             w.next(disconnected_at + LINGER_S * 1000, &s),
@@ -2260,7 +2262,7 @@ mod tests {
     #[test]
     fn enabling_sleep_takes_effect_within_the_window() {
         let w = Window::new(0, 15);
-        assert_eq!(w.next(20_000, &idle(0)), Next::Advertise);
+        assert_eq!(w.next(20_000, &idle(0)), Next::FOREVER);
         assert_eq!(w.next(20_000, &idle(300)), Next::Sleep { interval_s: 300 });
     }
 
@@ -2293,9 +2295,8 @@ mod tests {
         // first visit.
         let mut now = 0;
         for _ in 0..3 {
-            assert!(!s.rail_at_boot(true), "a wake check comes up dark");
             let w = Window::new(now, s.budget_s());
-            assert_eq!(w.next(now, &s), Next::Advertise);
+            assert_eq!(w.next(now, &s), Next::Advertise { bounded: true });
             now += 10_000;
             assert_eq!(w.next(now, &s), Next::Sleep { interval_s: 120 });
             now += 120_000;
@@ -2403,10 +2404,7 @@ mod tests {
         assert_eq!(stored, before);
 
         // One key present changes that key and nothing else.
-        let p = crate::radiocfg::PowerConfig {
-            ble_off_s: Some(30),
-            ..Default::default()
-        };
+        let p = crate::radiocfg::PowerConfig::default().with(Knob::BleOff, 30);
         assert!(stored.adopt_power(&p));
         assert_eq!(stored.ble_off_s, 30);
         assert_eq!(stored.sleep_interval_s, 60);
@@ -2424,10 +2422,7 @@ mod tests {
             ble_off_s: 45,
             ..Stored::new()
         };
-        let p = crate::radiocfg::PowerConfig {
-            ble_off_s: Some(0),
-            ..Default::default()
-        };
+        let p = crate::radiocfg::PowerConfig::default().with(Knob::BleOff, 0);
         assert!(stored.adopt_power(&p));
         assert_eq!(stored.ble_off_s, 0);
     }
@@ -2446,7 +2441,7 @@ mod tests {
         };
         let mut serve = Serve::new(0, &s);
         assert_eq!(serve.mode(), Mode::Tracking);
-        assert_eq!(serve.pass(0, &s), (false, Pass::Advertise { bounded: true }));
+        assert_eq!(serve.pass(0, &s), (false, Next::Advertise { bounded: true }));
         assert_eq!(serve.remaining_ms(0), 20_000);
         assert_eq!(
             serve.on_accept(5_000, Accepted::Connected, &s),
@@ -2458,12 +2453,13 @@ mod tests {
         // The session outlasts the budget; the disconnect buys a linger.
         assert_eq!(serve.on_session_end(60_000, None, &s), Then::Continue);
         assert_eq!(serve.remaining_ms(60_000), LINGER_S * 1000);
-        assert_eq!(serve.pass(60_000, &s), (false, Pass::Advertise { bounded: true }));
-        assert_eq!(serve.pass(65_000, &s), (false, Pass::BleDown { off_s: 30 }));
-        assert_eq!(down_period(&s), Some(30));
+        assert_eq!(serve.pass(60_000, &s), (false, Next::Advertise { bounded: true }));
+        assert_eq!(serve.pass(65_000, &s), (false, Next::BleDown { off_s: 30 }));
+        assert_eq!(during_ble_down(ServeCommand::SleepNow(9)), Then::Sleep(9));
+        assert_eq!(during_ble_down(ServeCommand::ModeChanged), Then::Continue);
         // Expiry while advertising says the same thing.
         let mut serve = Serve::new(0, &s);
-        assert_eq!(serve.on_accept(20_000, Accepted::Expired, &s).then, Then::Return);
+        assert_eq!(serve.on_accept(20_000, Accepted::Expired, &s).then, Then::BleDown(30));
     }
 
     /// A wake check: a connect attempt, completed or not, promotes it to
@@ -2489,12 +2485,12 @@ mod tests {
                 mode: Mode::Idle,
                 ..s
             };
-            assert_eq!(serve.pass(20_000, &idle), (false, Pass::Advertise { bounded: true }));
-            assert_eq!(serve.pass(608_000, &idle), (false, Pass::Sleep { interval_s: 120 }));
+            assert_eq!(serve.pass(20_000, &idle), (false, Next::Advertise { bounded: true }));
+            assert_eq!(serve.pass(608_000, &idle), (false, Next::Sleep { interval_s: 120 }));
         }
         let mut serve = Serve::new(0, &s);
         assert_eq!(serve.on_accept(15_000, Accepted::Expired, &s).then, Then::Sleep(120));
-        assert_eq!(serve.on_accept(3_000, Accepted::SleepNow(45), &s).then, Then::Sleep(45));
+        assert_eq!(serve.on_accept(3_000, Accepted::Command(ServeCommand::SleepNow(45)), &s).then, Then::Sleep(45));
     }
 
     /// A mode that moved under the loop re-budgets on its own terms.
@@ -2508,17 +2504,16 @@ mod tests {
         };
         let mut serve = Serve::new(0, &s);
         assert_eq!(serve.remaining_ms(0), 600_000);
-        assert_eq!(serve.on_accept(1_000, Accepted::ModeChanged, &s).then, Then::Continue);
+        assert_eq!(serve.on_accept(1_000, Accepted::Command(ServeCommand::ModeChanged), &s).then, Then::Continue);
         s.mode = Mode::Tracking;
         let (rebudgeted, pass) = serve.pass(1_000, &s);
         assert!(rebudgeted);
-        assert_eq!(pass, Pass::Advertise { bounded: false });
+        assert_eq!(pass, Next::Advertise { bounded: false });
         assert_eq!(serve.mode(), Mode::Tracking);
         assert_eq!(serve.remaining_ms(1_000), u64::from(ble::BLE_ON_DEFAULT_S) * 1000);
-        assert_eq!(down_period(&s), None);
         // Listening never bounds its wait.
         s.mode = Mode::Listening;
-        assert_eq!(serve.pass(1_000, &s).1, Pass::Advertise { bounded: false });
+        assert_eq!(serve.pass(1_000, &s).1, Next::Advertise { bounded: false });
     }
 
     /// A sleep asked for during the session is honored after it, and a
@@ -2558,7 +2553,7 @@ mod tests {
             }
         );
         assert_eq!(
-            dispatch(Action::WioSleep(false), &s),
+            dispatch(Action::RadioStandby(false), &s),
             Dispatch {
                 request: Some(Request::RadioStandby(false)),
                 ..none
@@ -2568,7 +2563,7 @@ mod tests {
             dispatch(Action::SetMode(Mode::Tracking), &s),
             Dispatch {
                 request: Some(Request::Mode(Mode::Tracking)),
-                mode_signal: true,
+                command: Some(ServeCommand::ModeChanged),
                 ..none
             }
         );
@@ -2577,18 +2572,18 @@ mod tests {
         assert_eq!(
             dispatch(Action::SetMode(Mode::Stored), &s),
             Dispatch {
-                sleep_now: Some(120),
+                command: Some(ServeCommand::SleepNow(120)),
                 ..none
             }
         );
         assert_eq!(
-            dispatch(Action::SetMode(Mode::Stored), &Stored::new()).sleep_now,
-            Some(ble::ESP_SLEEP_MAX_S)
+            dispatch(Action::SetMode(Mode::Stored), &Stored::new()).command,
+            Some(ServeCommand::SleepNow(ble::ESP_SLEEP_MAX_S))
         );
         assert_eq!(
             dispatch(Action::SleepNow(30), &s),
             Dispatch {
-                sleep_now: Some(30),
+                command: Some(ServeCommand::SleepNow(30)),
                 ..none
             }
         );
@@ -2600,16 +2595,100 @@ mod tests {
             }
         );
         for a in [
-            Action::Rail(true),
-            Action::SleepInterval(60),
-            Action::AdvWindow(10),
-            Action::BleOff(30),
-            Action::BleOn(20),
-            Action::IdleTimeout(0),
+            Action::Knob(Knob::SleepInterval, 60),
+            Action::Knob(Knob::AdvWindow, 10),
+            Action::Knob(Knob::BleOff, 30),
+            Action::Knob(Knob::BleOn, 20),
+            Action::Knob(Knob::IdleTimeout, 0),
             Action::Name,
             Action::None,
         ] {
             assert_eq!(dispatch(a, &s), none, "{a:?}");
         }
+    }
+
+    // -- the knob table ----------------------------------------------------
+
+    /// One row per knob, in the enum's order, with distinct ids and
+    /// distinct, word-aligned offsets in both layouts - and the resolve and
+    /// clamp rules the write path and the read path share.
+    #[test]
+    fn the_knob_table_is_consistent() {
+        for (i, spec) in KNOBS.iter().enumerate() {
+            assert_eq!(spec.knob as usize, i, "{:?} is out of order", spec.knob);
+            assert_eq!(Knob::ALL[i], spec.knob);
+            assert_eq!(Knob::from_id(spec.id), Some(spec.knob));
+            assert_eq!(Knob::from_name(spec.name), Some(spec.knob));
+            assert_eq!(spec.record_at % 4, 0);
+            assert_eq!(spec.wire_at % 4, 0);
+            assert!(spec.record_at + 4 <= RECORD_LEN - 4);
+            assert!(spec.wire_at + 4 <= ble::SETTINGS_LEN);
+            assert!(spec.min <= spec.max);
+            for other in KNOBS.iter().skip(i + 1) {
+                assert_ne!(spec.id, other.id);
+                assert_ne!(spec.name, other.name);
+                assert_ne!(spec.record_at, other.record_at);
+                assert_ne!(spec.wire_at, other.wire_at);
+            }
+            // A write is clamped the way the zero rule says, and a read
+            // resolves what a write could have stored.
+            assert_eq!(spec.clamp(spec.max + 1), spec.max);
+            assert_eq!(spec.clamp(spec.min), spec.min);
+            match spec.zero {
+                Zero::Off => {
+                    assert_eq!(spec.clamp(0), 0);
+                    assert_eq!(spec.resolve(0), 0);
+                    assert!(spec.accepts(0));
+                }
+                Zero::Default(d) => {
+                    assert_eq!(spec.clamp(0), spec.min);
+                    assert_eq!(spec.resolve(0), d);
+                    assert!((spec.min..=spec.max).contains(&d));
+                }
+            }
+            assert!(!spec.accepts(u64::from(spec.max) + 1));
+            // The accessors and the fields agree.
+            let mut s = Stored::new();
+            spec.set(&mut s, 42);
+            assert_eq!(spec.get(&s), 42);
+            assert_eq!(s.knob_raw(spec.knob), 42);
+            let mut w = ble::Settings::default();
+            spec.wire_set(&mut w, 7);
+            assert_eq!(spec.wire_get(&w), 7);
+        }
+        // The fields the knobs sit beside in the record.
+        assert_eq!(RECORD_LEN, 56);
+    }
+
+    /// Every knob is written by its id, echoed as clamped, and comes back
+    /// resolved from the settings and intact from the record.
+    #[test]
+    fn every_knob_writes_reads_and_persists() {
+        for spec in &KNOBS {
+            let mut s = Stored::new();
+            let o = apply(&mut s, &u32_write(spec.id, spec.min + 1));
+            assert_eq!(o.action, Action::Knob(spec.knob, spec.min + 1));
+            assert!(o.save);
+            assert_eq!(ack_u32(&o), spec.min + 1);
+            assert_eq!(s.knob(spec.knob), spec.min + 1);
+            assert_eq!(spec.wire_get(&s.settings(1_000)), spec.min + 1);
+            let back = Stored::decode_record(&s.encode_record()).expect("record");
+            assert_eq!(back.knob(spec.knob), spec.min + 1);
+            // A short value is refused by id.
+            let o = apply(&mut s, &write(spec.id, &[1, 2]));
+            assert_eq!(ack_status(&o), packet::ACK_BAD_VALUE);
+            assert_eq!(ack_id(&o), spec.id);
+        }
+    }
+
+    /// The rail this board does not have is refused as the unknown id it
+    /// now is, with nothing stored.
+    #[test]
+    fn the_old_rail_id_is_unknown() {
+        let mut s = Stored::new();
+        let o = apply(&mut s, &write(0x10, &[1]));
+        assert_eq!(o.action, Action::None);
+        assert_eq!(ack_status(&o), packet::ACK_UNKNOWN_ID);
+        assert_eq!(s, Stored::new());
     }
 }

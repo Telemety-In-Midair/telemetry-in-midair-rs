@@ -22,54 +22,52 @@ from pathlib import Path
 import serial
 from serial.tools import list_ports
 
-# -- Wire protocol constants (mirror of proto/src/link.rs and ble.rs) --------
+# -- Wire protocol constants ------------------------------------------------
+#
+# Read from wire_consts.json beside this file, which the protocol crate
+# prints (cargo run --example wire_consts --features std in proto/) and a
+# test there holds current. Nothing here restates a byte the crate owns.
 
-SYNC = 0xAA
-MAX_PAYLOAD = 256
+import json
 
-RESP_ACK = 0x81
-RESP_NAK = 0x82
+_WIRE = json.loads((Path(__file__).resolve().parent / "wire_consts.json").read_text())
 
-USB_PING = 0x50
-USB_BULK = 0x51
-USB_BULK_ACK = 0x52
-USB_INFO = 0x53
-USB_SLEEP = 0x54
-USB_CFG = 0x55
+SYNC = _WIRE["link"]["sync"]
+MAX_PAYLOAD = _WIRE["link"]["max_payload"]
+RESP_ACK = _WIRE["link"]["ack"]
 
-OP_BEGIN = 0x01
-OP_DATA = 0x02
-OP_END = 0x03
-OP_ABORT = 0x04
+USB_PING = _WIRE["usb"]["ping"]
+USB_BULK = _WIRE["usb"]["bulk"]
+USB_BULK_ACK = _WIRE["usb"]["bulk_ack"]
+USB_INFO = _WIRE["usb"]["info"]
+USB_SLEEP = _WIRE["usb"]["sleep"]
+USB_CFG = _WIRE["usb"]["cfg"]
 
-KIND_TOML = 1
-# An ESP-IDF application image for the inactive OTA slot. Kind 2 was the
-# WIO-E5's firmware format and is retired, not reused - an STM32 image
-# accepted as an ESP one would be written into an app slot and bootloop the
-# board, so the firmware rejects it outright.
-KIND_OTA = 3
+OP_BEGIN = _WIRE["bulk"]["begin"]
+OP_DATA = _WIRE["bulk"]["data"]
+OP_END = _WIRE["bulk"]["end"]
+OP_ABORT = _WIRE["bulk"]["abort"]
+KIND_TOML = _WIRE["bulk"]["kind_toml"]
+KIND_OTA = _WIRE["bulk"]["kind_ota"]
+ACK_ID_BULK = _WIRE["bulk"]["ack_id"]
+# Data bytes per OP_DATA.
+DATA_CHUNK = _WIRE["bulk"]["data_max"]
+# Largest config the board reads or takes in a transfer.
+CONFIG_MAX = _WIRE["bulk"]["config_max"]
 
-ACK_ID_BULK = 0x20
-ACK_OK = 0
-
-# Bulk ack status codes (gps-proto packet ACK_* + midair-proto ble ACK_*).
+ACK_OK = _WIRE["ack"]["ok"]
 STATUS_NAMES = {
-    0x00: "OK",
-    0x01: "unknown id",
-    0x02: "bad value",
-    # 0x10 named a WIO-E5 NAK on the ESP32-C6's UART link. One MCU cannot
-    # fail that way; the single-module firmware reuses it for a write that
-    # the board could not carry out - a flash sector that would not take an
-    # OTA chunk, or a slot it could not activate.
-    0x10: "write failed on the board (flash?)",
-    # 0x11 named a link timeout, which no longer exists. Kept reserved so a
-    # board still running the two-MCU firmware reports something legible.
-    0x11: "link timeout (no ack) - two-MCU firmware only",
-    0x12: "bad state (a transfer is already active, or on the other transport?)",
+    _WIRE["ack"]["ok"]: "OK",
+    _WIRE["ack"]["unknown_id"]: "unknown id",
+    _WIRE["ack"]["bad_value"]: "bad value",
+    _WIRE["ack"]["board_error"]: "the board could not carry it out (flash?)",
+    _WIRE["ack"]["bad_state"]: "bad state (a transfer is already active, or on the other transport?)",
 }
 
-# Data bytes per OP_DATA (link::DATA_CHUNK).
-DATA_CHUNK = 192
+# Config characteristic ids: the fixed ones, plus the five durations by
+# their config-file names, each with its bounds and what a zero means.
+CFG_IDS = _WIRE["cfg"]
+KNOBS = {k["name"]: k for k in _WIRE["knobs"]}
 
 # Espressif USB vendor id, used to auto-detect the port.
 ESPRESSIF_VID = 0x303A
