@@ -1,0 +1,11 @@
+[package]
+name = "midair-explore"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Exhaustive state-space exploration for the telemetry-in-midair state machines: every reachable state of a model, every invariant checked, the shortest trace to any violation"
+
+# Host only, and deliberately dependency-free: it is a dev-dependency of the
+# protocol crate and of the app, and both should be able to run their state
+# space tests without pulling anything new into their trees.
+[dependencies]
