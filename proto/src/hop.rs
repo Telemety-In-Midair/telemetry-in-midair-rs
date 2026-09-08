@@ -161,10 +161,10 @@ impl Plan {
     }
 
     /// Whether moving from slot `from` to slot `to` changes the carrier.
-    /// Never on a one-channel plan, which is the shipped default - and so
-    /// the receiver is never taken out of receive at a slot boundary
-    /// there, where a retune to the same carrier would cost it a
-    /// millisecond of deafness a second for nothing.
+    /// Never on a one-channel plan, which is the shipped default. The
+    /// driver keeps the carrier it is on and compares, which is the same
+    /// question asked once rather than twice; this is the property, for
+    /// the test that pins it.
     pub fn retunes(&self, from: u32, to: u32) -> bool {
         self.frequency_for_slot(from) != self.frequency_for_slot(to)
     }

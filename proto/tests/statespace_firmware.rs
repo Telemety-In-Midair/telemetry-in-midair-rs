@@ -462,7 +462,7 @@ impl Machine for Firmware {
             }
         }
         if b.sleep_ready && b.posture.card != Card::Parked {
-            return Err("the park signalled done with the card not parked".into());
+            return Err("the park signaled done with the card not parked".into());
         }
         if b.tx && !(b.posture.live.transmits() && b.posture.radio_up()) {
             return Err("transmitting in a posture that must not".into());

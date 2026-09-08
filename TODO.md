@@ -73,11 +73,12 @@ exhaustive models forced, none of them run on a board: the serve loop and
 the hardware task now drive `session::Serve` and `posture::Posture`, the
 request queue is a coalescing set, the receiver no longer retunes on the
 one-channel default, and a mode commanded over an override flag lands on
-the flag. Watch for: `tracking: node N (...), gps and radio up` after a
-`CFG_MODE tracking`; `radio: standby` / `gps: backup mode` only while
-tracking; a wake check that a phone connects to coming up `promoted to
-idle`; and `sleep: park did not finish in time` never printing on a
-commanded store.
+the flag. Watch for: `tracking: node N (leaf), gps up, radio up` after a
+`CFG_MODE tracking` - and `gps in backup` or `radio standby` in that line
+when the matching override flag is set; `radio: standby` / `gps: backup
+mode` only while tracking; a wake check that a phone connects to coming
+up `promoted to idle`; and `sleep: park did not finish in time` never
+printing on a commanded store.
 
 **Every state, on a bench.** The models say what the firmware decides;
 what they cannot say is what the hardware does with it. The three places

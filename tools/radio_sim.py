@@ -241,13 +241,21 @@ class Clock:
         return last_ms is None or self.slot(last_ms) != slot
 
     def tx_start(self, plan: Plan, address: int, interval_ms: int, now_ms: int, airtime_ms: int, turns: bool = True) -> int:
-        lo, hi = plan.start_range_for(address, self.slots_for(interval_ms), airtime_ms) if turns else plan.start_range_ms(airtime_ms)
+        n = self.slots_for(interval_ms)
+        lo, hi = plan.start_range_for(address, n, airtime_ms) if turns else plan.start_range_ms(airtime_ms)
         self.rng = xorshift(self.rng)
         target = lo + self.rng % (hi - lo + 1)
         phase = self.phase_ms(now_ms)
-        if phase <= target:
+        slot = self.slot(now_ms)
+        # The node's own slot of the interval, not merely the next one:
+        # with turns off (the legacy schedule) every slot is the node's.
+        mine = plan.turn_slot(address, n) if turns else slot % n
+        if slot % n == mine and phase <= target:
             return int(now_ms) + (target - phase)
-        return int(now_ms) + (self.dwell_ms - phase) + target
+        ahead = 1
+        while ((slot + ahead) & SLOT_MASK) % n != mine:
+            ahead += 1
+        return int(now_ms) + (self.dwell_ms - phase) + (ahead - 1) * self.dwell_ms + target
 
     def wait_for_window_ms(self, plan: Plan, address: int, interval_ms: int, now_ms: int, airtime_ms: int, turns: bool = True) -> int:
         lo, hi = plan.start_range_for(address, self.slots_for(interval_ms), airtime_ms) if turns else plan.start_range_ms(airtime_ms)

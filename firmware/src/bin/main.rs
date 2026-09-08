@@ -60,7 +60,7 @@ use midair_proto::bulk::{self, Owner};
 use midair_proto::radiocfg::{self, RadioConfig};
 use midair_proto::roster::{Report, Value};
 use midair_proto::ble::{self, Mode};
-use midair_proto::posture::{Effect, Posture, Request};
+use midair_proto::posture::{Card, Effect, Posture, Radio, Request};
 use midair_proto::session::{Accepted, Pass, Then};
 use midair_proto::{link, lora, session};
 #[cfg(feature = "dual-core")]
@@ -1166,8 +1166,11 @@ async fn serve<C: Controller>(
             // the link dropped in between, or the stack is out of room.
             // Held open like a fizzled handshake: something was connecting,
             // and letting the budget expire here sends the board dark or
-            // asleep on a phone that is about to try again.
+            // asleep on a phone that is about to try again. Paused like one
+            // too, so a stack that keeps refusing is not a hot spin.
             serve.on_accept(Instant::now().as_millis(), Accepted::Failed, &stored);
+            qprintln!("attribute server did not attach, holding the window open");
+            Timer::after(Duration::from_millis(200)).await;
             continue;
         };
         qprintln!("central connected");
@@ -1820,16 +1823,21 @@ async fn hardware_task(
             for e in fx {
                 effect!(e, now);
             }
+            // Said from what the posture is, not from what was asked: a
+            // mode commanded over an override flag lands on the flag, and a
+            // board already parked for sleep ignores the request.
             match r {
-                Request::Mode(m) => status_println!(
-                    "{}: node {} ({}), {}",
+                Request::Mode(m) if posture.card != Card::Parked => status_println!(
+                    "{}: node {} ({}), gps {}, radio {}",
                     m.as_str(),
                     cfg.address,
                     cfg.role.as_str(),
-                    match m {
-                        Mode::Tracking => "gps and radio up",
-                        Mode::Listening => "receiver up, nothing transmitted",
-                        _ => "gps in backup, radio asleep",
+                    if posture.gps_awake() { "up" } else { "in backup" },
+                    match posture.radio {
+                        Radio::Up if m.transmits() => "up",
+                        Radio::Up => "receiving, nothing transmitted",
+                        Radio::Standby => "standby",
+                        Radio::Asleep => "asleep",
                     }
                 ),
                 Request::RadioStandby(false) if fx.contains(Effect::RadioInit) => {
@@ -2004,8 +2012,13 @@ async fn hardware_task(
                 };
             if !beacon_owed {
                 // A turn that passed while something held the transmit is
-                // gone; the next one is planned afresh when it comes.
-                beacon_at = None;
+                // gone; the next one is planned afresh when it comes. A
+                // plan still ahead is kept: on an interval several slots
+                // long it names the node's own next slot, and the slots
+                // between are nobody's turn to plan in.
+                if beacon_at.is_some_and(|at| now_ms >= at) {
+                    beacon_at = None;
+                }
             } else if beacon_at.is_none() {
                 // No plan: jitter on top of the interval so two nodes that
                 // happened to line up do not stay lined up - the weaker of

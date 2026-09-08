@@ -30,7 +30,7 @@
 //!   dark for good.
 //! - [`Explored::assert_some`] is coverage: at least one reachable state
 //!   satisfies a predicate, so that an invariant about connected sessions
-//!   cannot pass because no session was ever modelled.
+//!   cannot pass because no session was ever modeled.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fmt::{Debug, Display, Write as _};
@@ -129,6 +129,10 @@ pub struct Explored<M: Machine> {
     depth: Vec<usize>,
     /// Successor indices per state, deduplicated.
     succ: Vec<Vec<usize>>,
+    /// Whether a state's events were enumerated. A state at the depth
+    /// limit, or left in the queue when the state limit hit, was not, and
+    /// its empty successor list is ignorance rather than a dead end.
+    expanded: Vec<bool>,
     transitions: usize,
     violation: Option<Violation<M::State, M::Event>>,
     truncated: bool,
@@ -146,6 +150,7 @@ pub fn explore_with<M: Machine>(machine: &M, limits: Limits) -> Explored<M> {
         parent: Vec::new(),
         depth: Vec::new(),
         succ: Vec::new(),
+        expanded: Vec::new(),
         transitions: 0,
         violation: None,
         truncated: false,
@@ -173,6 +178,7 @@ pub fn explore_with<M: Machine>(machine: &M, limits: Limits) -> Explored<M> {
         if out.depth[i] >= limits.max_depth {
             continue;
         }
+        out.expanded[i] = true;
         let from = out.states[i].clone();
         for event in machine.events(&from) {
             let to = machine.step(&from, &event);
@@ -227,6 +233,7 @@ impl<M: Machine> Explored<M> {
         self.parent.push(parent);
         self.depth.push(depth);
         self.succ.push(Vec::new());
+        self.expanded.push(false);
         i
     }
 
@@ -287,10 +294,12 @@ impl<M: Machine> Explored<M> {
         self.states.iter().filter(|s| pred(s)).count()
     }
 
-    /// States with no enabled event.
+    /// States with no enabled event. A state whose events were never
+    /// enumerated - at the depth limit, or beyond the state limit - is not
+    /// one.
     pub fn dead_ends(&self) -> Vec<usize> {
         (0..self.states.len())
-            .filter(|&i| self.succ[i].is_empty() && self.depth[i] < usize::MAX)
+            .filter(|&i| self.expanded[i] && self.succ[i].is_empty())
             .collect()
     }
 
@@ -408,12 +417,22 @@ impl<M: Machine> Explored<M> {
     /// Liveness: from every reachable state, some state satisfying `pred`
     /// is still reachable. Fails with the trace to the shallowest state
     /// from which none is.
+    ///
+    /// Only states whose events were enumerated are held to it: a state
+    /// at the depth limit has no recorded successors and cannot be a
+    /// trap, only unknown. A truncated walk is refused outright, since
+    /// what it never saw may be the way out.
     pub fn assert_always_reachable(
         &self,
         machine: &M,
         pred: impl Fn(&M::State) -> bool,
         what: &str,
     ) -> &Self {
+        assert!(
+            !self.truncated,
+            "exploration truncated at {} states: liveness cannot be judged on a walk that stopped early",
+            self.states.len()
+        );
         let n = self.states.len();
         // Reverse edges, then a breadth-first walk back from every state
         // that satisfies the predicate.
@@ -439,7 +458,7 @@ impl<M: Machine> Explored<M> {
                 }
             }
         }
-        if let Some(i) = (0..n).find(|&i| !can[i]) {
+        if let Some(i) = (0..n).find(|&i| self.expanded[i] && !can[i]) {
             panic!(
                 "state space violation: from here nothing can reach a state where {what}\n  after {} events:\n{}",
                 self.depth[i],
@@ -644,6 +663,39 @@ mod tests {
         // And a state check after the fact finds the shallowest offender.
         let r = std::panic::catch_unwind(|| x.assert_none(&Trap, |s| s.0 == 2, "the trap is entered"));
         assert!(r.is_err());
+    }
+
+    /// A depth-bounded walk has frontier states with no successors, and
+    /// they are unknown rather than traps: liveness holds them to nothing,
+    /// and they are not dead ends.
+    #[test]
+    fn a_bounded_walk_does_not_mistake_its_frontier_for_a_trap() {
+        let m = Counter {
+            ceiling: 100,
+            bad: None,
+        };
+        let x = explore_with(
+            &m,
+            Limits {
+                max_states: 10_000,
+                max_depth: 4,
+            },
+        );
+        x.assert_ok(&m);
+        assert!(x.dead_ends().is_empty());
+        x.assert_always_reachable(&m, |s| s.0 == 0, "the counter is at zero");
+        // A truncated walk is refused, not judged.
+        let cut = explore_with(
+            &m,
+            Limits {
+                max_states: 5,
+                max_depth: usize::MAX,
+            },
+        );
+        assert!(std::panic::catch_unwind(|| {
+            cut.assert_always_reachable(&m, |s| s.0 == 0, "zero")
+        })
+        .is_err());
     }
 
     #[test]

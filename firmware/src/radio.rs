@@ -114,6 +114,10 @@ struct Hop {
     /// The slot the radio is tuned for, so a poll can tell a boundary has
     /// passed. `None` after an init, which tunes for the slot it ran in.
     rx_slot: Option<u32>,
+    /// The carrier the radio is on, Hz. A slot boundary that maps to the
+    /// same carrier - every one on the one-channel default - is noted
+    /// without touching the radio.
+    carrier_hz: u32,
 }
 
 pub struct Sx1262Driver<'d> {
@@ -229,6 +233,7 @@ impl<'d> Sx1262Driver<'d> {
                 plan,
                 clock,
                 rx_slot: None,
+                carrier_hz: 0,
             }
         });
 
@@ -306,7 +311,8 @@ impl<'d> Sx1262Driver<'d> {
             Some(h) => {
                 let slot = h.clock.slot(now);
                 h.rx_slot = Some(slot);
-                h.plan.frequency_for_slot(slot)
+                h.carrier_hz = h.plan.frequency_for_slot(slot);
+                h.carrier_hz
             }
             None => cfg.frequency_hz,
         };
@@ -633,28 +639,31 @@ impl<'d> Sx1262Driver<'d> {
     /// has left.
     fn hop_tick(&mut self, now_ms: u64) {
         let clk = self.standby_clk();
-        let Some(h) = &self.hop else {
+        // The plan's carrier for this slot is one permutation of the
+        // channels, computed once here and compared against the carrier
+        // the radio is on.
+        let (slot, carrier, same, dwell_ms) = {
+            let Some(h) = &self.hop else {
+                return;
+            };
+            let slot = h.clock.slot(now_ms);
+            if h.rx_slot == Some(slot) {
+                return;
+            }
+            let carrier = h.plan.frequency_for_slot(slot);
+            (slot, carrier, carrier == h.carrier_hz, u32::from(h.plan.dwell_ms))
+        };
+        if !same && !self.gate.may_leave(now_ms, dwell_ms) {
+            return;
+        }
+        let Some(h) = &mut self.hop else {
             return;
         };
-        let slot = h.clock.slot(now_ms);
-        if h.rx_slot == Some(slot) {
+        h.rx_slot = Some(slot);
+        if same {
             return;
         }
-        let same_carrier = h.rx_slot.is_some_and(|from| !h.plan.retunes(from, slot));
-        let dwell_ms = u32::from(h.plan.dwell_ms);
-        let carrier = h.plan.frequency_for_slot(slot);
-        if same_carrier {
-            if let Some(h) = &mut self.hop {
-                h.rx_slot = Some(slot);
-            }
-            return;
-        }
-        if !self.gate.may_leave(now_ms, dwell_ms) {
-            return;
-        }
-        if let Some(h) = &mut self.hop {
-            h.rx_slot = Some(slot);
-        }
+        h.carrier_hz = carrier;
         self.radio.set_standby(clk);
         self.radio.set_rf_frequency(carrier);
         // Re-armed on the new channel by the poll, which is the one caller.
@@ -917,7 +926,8 @@ impl<'d> Sx1262Driver<'d> {
         let tx_start_ms = Instant::now().as_millis() + u64::from(self.tx_lead_ms());
         if let Some(h) = &mut self.hop {
             let slot = h.clock.slot(tx_start_ms);
-            self.radio.set_rf_frequency(h.plan.frequency_for_slot(slot));
+            h.carrier_hz = h.plan.frequency_for_slot(slot);
+            self.radio.set_rf_frequency(h.carrier_hz);
             // The receiver comes back up on this channel after TxDone; the
             // next poll moves it if the slot has changed by then.
             h.rx_slot = Some(slot);

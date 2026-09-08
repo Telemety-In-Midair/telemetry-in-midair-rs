@@ -93,7 +93,7 @@ order to state its invariant. None has been flashed.
 | 3 | A request could be dropped on a full queue (`Channel<_, 4>`, `try_send`), and the dropped one could be the park before a deep sleep - which then happened over a radio in continuous receive. | `state.rs` | `posture::Requests`: one slot per kind, a newer replaces an older, never full. Drained mode first, park after everything that raises. |
 | 4 | A `CFG_MODE tracking` over the console between the park and the chip going down raised the receiver and the radio for the sleep to happen over. | `posture.rs` | A parked posture ignores everything but another park or a reboot. |
 | 5 | The one-channel default retuned at every slot boundary: through standby to the carrier it was already on, a millisecond deaf a second, and a preamble landing there was a frame lost. | `radio.rs` `hop_tick` | `Plan::retunes` says whether the carrier changes; the boundary is only noted when it does not. |
-| 6 | `Clock::tx_start` planned "the next slot" on a multi-slot interval - another node's slot, where nothing is owed - so the plan was dropped and the beacon waited a whole interval. Any pass that came late at the start of the node's slot. | `hop.rs` | It plans the node's own next slot; a test walks every address, interval and phase. |
+| 6 | `Clock::tx_start` planned "the next slot" on a multi-slot interval - another node's slot, where nothing is owed - so the plan was dropped and the beacon waited a whole interval. Any pass that came late at the start of the node's slot. | `hop.rs`, `main.rs` | It plans the node's own next slot, and the hardware loop keeps a plan that is still ahead across the slots between rather than discarding it on the first one that is not the node's; a test walks every address, interval and phase. The simulator's port and its vectors follow. |
 | 7 | A valid header seen after a stale preamble's hold had lapsed inherited the stale start, so its hold could already be spent. Reachable where preamble and header land in one poll. | `rxgate.rs` | A header after a lapsed hold starts a fresh one. |
 | 8 | A config pushed during a wake check was written to a card that had never been mounted. | `posture.rs` | The apply mounts the card first. |
 | 9 | Repeats were not gated on a pending sleep the way beacons are. | `main.rs` | `Posture::may_transmit` gates both. |
@@ -177,10 +177,11 @@ at ~700k states and 20 s is about as large as a test should be.
 
 ## Bench
 
-1. Flash the default build. `tracking: node N (...), gps and radio up`
-   after a `CFG_MODE tracking`; `radio: standby` and `gps: backup mode`
-   only while tracking; a wake check a phone connects to prints
-   `promoted to idle`.
+1. Flash the default build. `tracking: node N (leaf), gps up, radio up`
+   after a `CFG_MODE tracking`, and `gps in backup` or `radio standby` in
+   that line when the matching override flag is set; `radio: standby` and
+   `gps: backup mode` only while tracking; a wake check a phone connects
+   to prints `promoted to idle`.
 2. `wio-set gps-sleep 0` with `wio-set wio-sleep 1` set: the receiver
    reports sentences and a fix with the radio in standby.
 3. `wio-set mode stored` while beaconing, then `wio-set mode tracking`

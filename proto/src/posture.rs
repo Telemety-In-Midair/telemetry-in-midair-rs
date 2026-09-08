@@ -327,6 +327,14 @@ impl Posture {
         self.move_radio(want_radio, fx);
     }
 
+    /// Bring up a card a wake check left off the bus.
+    fn mount(&mut self, fx: &mut Effects) {
+        if self.card == Card::Deferred {
+            fx.push(Effect::MountCard);
+            self.card = Card::Mounted;
+        }
+    }
+
     fn move_gps(&mut self, want: Gps, fx: &mut Effects) {
         if self.gps == want {
             return;
@@ -396,10 +404,7 @@ impl Posture {
                 self.live = m;
                 // The card first: a config that has not been read yet is
                 // the one the radio is about to be initialized from.
-                if self.card == Card::Deferred {
-                    fx.push(Effect::MountCard);
-                    self.card = Card::Mounted;
-                }
+                self.mount(&mut fx);
                 if m.tracks() {
                     self.apply_overrides(stored, &mut fx);
                 } else {
@@ -408,10 +413,7 @@ impl Posture {
                 }
             }
             Request::ApplyConfig => {
-                if self.card == Card::Deferred {
-                    fx.push(Effect::MountCard);
-                    self.card = Card::Mounted;
-                }
+                self.mount(&mut fx);
                 fx.push(Effect::ApplyConfig);
                 // The apply re-initializes the radio, which is the one
                 // thing that brings it up. A board that was not using it
