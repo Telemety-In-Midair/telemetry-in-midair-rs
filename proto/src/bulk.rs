@@ -37,7 +37,7 @@ pub const IDLE_TIMEOUT_MS: u64 = 5_000;
 /// A transfer is stateful across several writes, so two transports pushing
 /// at once would interleave into one buffer. The second one to start is
 /// refused with [`ble::ACK_BAD_STATE`] instead.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Owner {
     Ble,
     Usb,

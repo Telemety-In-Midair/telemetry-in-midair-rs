@@ -366,6 +366,14 @@ impl Posture {
     /// the settings characteristic reports is what the hardware is doing.
     pub fn on(&mut self, r: Request, stored: &Stored) -> Effects {
         let mut fx = Effects::default();
+        // A board parked for a deep sleep stays parked. The sleep follows
+        // within a bounded wait and resets everything, so a mode or an
+        // override that arrives in that window - from the console, since
+        // the session that could have sent one is gone - would raise the
+        // receiver or the radio for the sleep to happen over.
+        if self.card == Card::Parked && !matches!(r, Request::PrepareSleep | Request::Reboot) {
+            return fx;
+        }
         match r {
             // The overrides only mean anything inside a tracking posture.
             // Elsewhere the mode has already parked both, and waking one
@@ -782,5 +790,26 @@ mod tests {
         let (mut p, _) = Posture::at_boot(Mode::Tracking, &s);
         p.on(Request::RadioStandby(true), &s);
         assert!(!p.may_transmit(true, false, false));
+    }
+
+    /// Once parked for a sleep, a board stays parked: a mode that arrives
+    /// in the window before the chip goes down must not raise anything
+    /// for the sleep to happen over.
+    #[test]
+    fn a_parked_board_ignores_what_would_raise_it() {
+        let s = Stored::new();
+        let (mut p, _) = Posture::at_boot(Mode::Tracking, &s);
+        p.on(Request::PrepareSleep, &s);
+        for r in [
+            Request::Mode(Mode::Tracking),
+            Request::Mode(Mode::Idle),
+            Request::GpsSleep(false),
+            Request::RadioStandby(false),
+            Request::ApplyConfig,
+        ] {
+            assert!(p.on(r, &s).is_empty(), "{r:?}");
+            assert_eq!(p.consistent(&s), Ok(()), "{r:?}");
+        }
+        assert_eq!(p.card, Card::Parked);
     }
 }

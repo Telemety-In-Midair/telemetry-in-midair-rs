@@ -279,45 +279,15 @@ pub fn drain_log() {
 // Requests from the BLE session to the hardware loop
 // ---------------------------------------------------------------------------
 
-/// A request from the BLE session to the hardware loop.
+/// A request from the BLE session or the host tools to the hardware loop.
 ///
 /// The two-MCU build sent these over the link and waited for an ack. Same
-/// chip, so this is a signal the loop picks up on its next pass; the
+/// chip, so this is a queue the loop drains on its next pass; the
 /// characteristic is acked immediately because there is no longer a peer
-/// that can fail to answer.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Request {
-    GpsSleep(bool),
-    RadioStandby(bool),
-    /// Raise or lower everything at once, because a mode is a posture
-    /// rather than one subsystem.
-    ///
-    /// [`Mode::Tracking`] wakes the GPS, re-arms its settings push and
-    /// brings the radio back; anything else parks the GPS in backup and
-    /// puts the radio in cold sleep. A board promoted out of a wake check
-    /// also mounts its card here, which is the mount the wake check
-    /// deferred.
-    ///
-    /// [`Mode::Stored`] arrives as a [`Request::PrepareSleep`] instead -
-    /// deep sleep is entered from the side that owns the `Rtc` - so this
-    /// treats it as the lowering half and leaves the sleeping to that.
-    Mode(midair_proto::ble::Mode),
-    /// A new radio config was pushed over BLE or USB and verified. The
-    /// hardware loop owns the radio, the GPS and the card, so it is what
-    /// re-inits them and writes the file back.
-    ApplyConfig,
-    /// A firmware image landed in the inactive OTA slot. Reboot into it.
-    Reboot,
-    /// The board is about to deep sleep. Park what a sleeping board cannot
-    /// use and raise [`SLEEP_READY`].
-    ///
-    /// All of it, not just the radio: the card is flushed and unmounted
-    /// (deep sleep is a full reset, and the pending buffer is RAM), the GPS
-    /// goes into backup (a sleeping S3 cannot use a receiver that is
-    /// acquiring, and it is most of the sleeping board's current), and the
-    /// panel is blanked.
-    PrepareSleep,
-}
+/// that can fail to answer. What each one changes, and the rule the
+/// result has to satisfy, is [`midair_proto::posture::Posture`], which the
+/// state space tests walk exhaustively.
+pub use midair_proto::posture::Request;
 
 // ---------------------------------------------------------------------------
 // Sleep on command
@@ -409,21 +379,30 @@ pub fn clear_sleep_now() {
 /// the sleep path has to ask rather than reach for it.
 pub static SLEEP_READY: Signal<CriticalSectionRawMutex, ()> = Signal::new();
 
-/// Requests are a short queue rather than a signal.
+/// The requests waiting for the hardware loop.
 ///
-/// A `Signal` holds one value, so a config push arriving while a GPS sleep
-/// request is still waiting would silently replace it. Four is ample: the
-/// producers are a BLE session and a USB task, each answering one write at
-/// a time, against a loop that drains the queue every 10 ms.
-static REQUESTS: Channel<CriticalSectionRawMutex, Request, 4> = Channel::new();
+/// A set with one slot per kind rather than a channel: the channel this
+/// replaced held four and dropped the fifth, and the fifth could be the
+/// park before a deep sleep - which then happened over a radio still in
+/// continuous receive. A newer request of a kind replaces an older one
+/// still waiting, and [`Requests::take`] drains them in the order that is
+/// correct whoever asked first: a mode before the overrides that sit on
+/// top of it, a park after everything that raises.
+static REQUESTS: Mutex<RefCell<midair_proto::posture::Requests>> =
+    Mutex::new(RefCell::new(midair_proto::posture::Requests::new()));
 
 pub fn request(r: Request) {
-    // Dropping a request is better than blocking the GATT handler, and a
-    // full queue means the hardware loop is wedged, which nothing here can
-    // fix anyway.
-    let _ = REQUESTS.try_send(r);
+    critical_section::with(|cs| REQUESTS.borrow(cs).borrow_mut().push(r));
 }
 
 pub fn take_request() -> Option<Request> {
-    REQUESTS.try_receive().ok()
+    critical_section::with(|cs| REQUESTS.borrow(cs).borrow_mut().take())
+}
+
+/// Whether a deep sleep is on its way: asked for and not yet acted on, or
+/// acted on and waiting for the hardware loop to park. Either way a
+/// transmit started now is one the sleep would have to wait out.
+pub fn park_pending() -> bool {
+    sleep_now_pending()
+        || critical_section::with(|cs| REQUESTS.borrow(cs).borrow().sleep_pending())
 }
