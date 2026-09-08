@@ -34,7 +34,7 @@ pub const SLOTS: usize = 8;
 pub const TTL_MS: u64 = 30 * 60 * 1000;
 
 /// What a node last told us, in the bytes the link delivered.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Report {
     /// Position report: `[src, rssi, packet]`.
     Position([u8; ble::REMOTE_LEN]),
@@ -71,7 +71,7 @@ impl Value {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct Slot {
     report: Report,
     /// When the report arrived, on the caller's monotonic millisecond clock.
@@ -82,7 +82,7 @@ struct Slot {
 }
 
 /// Per-node table of the latest report from each remote node.
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Roster {
     slots: [Option<Slot>; SLOTS],
 }

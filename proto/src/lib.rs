@@ -20,7 +20,15 @@
 //! - [`roster`]: the latest report from each remote node, and the BLE values
 //!   the firmware serves from it.
 //! - [`session`]: what a BLE config write changes, and the sleep/advertise
-//!   cycle the firmware runs between visits.
+//!   cycle the firmware runs between visits - the serve loop's policy.
+//! - [`posture`]: what the hardware task raises and lowers for each
+//!   request, and the request set that carries them to it.
+//! - [`rxgate`]: what the receiver has seen of an arriving frame, and how
+//!   long a hop or a transmit has to wait for it.
+//!
+//! The last three, with `hop` and `roster`, are the machines the state
+//! space tests in `tests/` walk exhaustively; `midair-explore` is the
+//! harness.
 //!
 //! The BLE position/ack protocol itself lives in the shared `gps-proto`
 //! crate (re-exported here) so the existing gps-gui-rs app keeps working.
@@ -36,6 +44,8 @@ pub mod geo;
 pub mod hop;
 pub mod link;
 pub mod lora;
+pub mod posture;
 pub mod radiocfg;
 pub mod roster;
+pub mod rxgate;
 pub mod session;

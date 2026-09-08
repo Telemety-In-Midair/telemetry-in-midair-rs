@@ -217,7 +217,7 @@ pub const RADIO_CONFIG_UUID_U128: u128 = 0xc3a1000a_9f6e_4b2c_8f5a_2e32c3b1e5d0;
 /// Not to be confused with [`crate::session::Stored`], the settings record.
 /// `Mode::Stored` is the device in storage; `session::Stored` is what
 /// survives a sleep.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Mode {
     /// Everything the firmware can lower, lowered: deep sleep on the
     /// wake-check cadence, GPS in backup, radio in cold sleep, card

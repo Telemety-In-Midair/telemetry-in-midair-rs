@@ -39,7 +39,7 @@ pub const PFLAG_GPS_SLEEP: u32 = 1 << 2;
 ///
 /// The notify interval is deliberately not here: it is per-session state
 /// that resets with the board (see [`Action::NotifyInterval`]).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Stored {
     /// Deep-sleep wake-check interval in seconds, 0 = stay awake.
     pub sleep_interval_s: u32,
@@ -838,7 +838,7 @@ pub fn boot_mode(persisted: Mode, woke_from_sleep: bool) -> Mode {
 }
 
 /// What the board should do right now.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Next {
     /// Keep advertising. With a budget that bites, for at most
     /// [`Window::remaining_ms`] longer.
@@ -864,7 +864,7 @@ pub enum Next {
 /// the board woke, drew its full advertising current and never slept again.
 /// A deadline cannot be restarted by a retry; only a disconnect
 /// ([`Window::linger`]) sets a new one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Window {
     ends_ms: u64,
 }
@@ -950,6 +950,270 @@ impl Window {
             _ => self.linger(now_ms),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The serve loop's policy
+// ---------------------------------------------------------------------------
+
+/// What the serve loop does at the top of a pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pass {
+    /// Advertise. `bounded` says the budget ends in something, so the
+    /// wait for a central is cut at [`Serve::remaining_ms`]; unbounded is
+    /// a board that advertises forever, and then the wait has no deadline.
+    Advertise { bounded: bool },
+    /// The budget is spent and the mode sleeps on it. Does not return.
+    Sleep { interval_s: u32 },
+    /// The budget is spent and the mode drops the modem for this long.
+    BleDown { off_s: u32 },
+}
+
+/// How waiting for a central ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Accepted {
+    /// A central connected and the attribute server attached.
+    Connected,
+    /// A central started a connection and it did not complete, or the
+    /// attribute server would not attach to one that did.
+    Failed,
+    /// The budget ran out with nobody interested.
+    Expired,
+    /// Something asked the board to deep sleep now, for this long.
+    SleepNow(u32),
+    /// The mode moved under the loop, over USB or from the board itself.
+    ModeChanged,
+}
+
+/// What the firmware does after [`Serve::on_accept`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Then {
+    /// Run the connected session.
+    Serve,
+    /// Pause briefly, then advertise again.
+    Retry,
+    /// Deep sleep for this many seconds. Does not return.
+    Sleep(u32),
+    /// Drop the BLE stack for the mode's off period and come back.
+    Return,
+    /// Go straight back to the top of the loop.
+    Continue,
+}
+
+/// What [`Serve::on_accept`] decided: whether the connect attempt promoted
+/// a wake check to idle, and what to do next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Step {
+    /// The board was a wake check and someone tried to connect, so it is
+    /// now idle with the idle budget. The firmware records the mode and
+    /// asks the hardware loop to raise what idle raises.
+    pub promote: bool,
+    pub then: Then,
+}
+
+/// The serve loop: advertise, accept one central, serve it, repeat, on a
+/// budget the mode decides.
+///
+/// This is the policy half of the loop the firmware runs. The firmware
+/// supplies the clock, the advertising and the connection; this decides
+/// what each outcome means, and it is what the state space tests walk -
+/// with every mode, every setting and every ordering of connects, drops,
+/// commands and expiries - to show that the board is never left
+/// unreachable.
+///
+/// What a spent budget means is a property of the mode, not a race between
+/// two settings ([`Stored::at_expiry`]): a wake check sleeps again, idle
+/// stores the board, tracking drops the modem for a while, listening
+/// never expires. The budget is a deadline rather than a per-attempt
+/// timeout, so no retry path can extend it ([`Window`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Serve {
+    /// The mode the window was budgeted for. The live mode can move under
+    /// the loop; the next pass notices and re-budgets.
+    mode: Mode,
+    window: Window,
+}
+
+impl Serve {
+    /// Begin serving at `now_ms`, on the budget of the stored mode.
+    pub fn new(now_ms: u64, stored: &Stored) -> Self {
+        Self {
+            mode: stored.mode,
+            window: Window::new(now_ms, stored.budget_s()),
+        }
+    }
+
+    /// The mode the current budget belongs to.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    pub fn window(&self) -> Window {
+        self.window
+    }
+
+    /// How much of the budget is left.
+    pub fn remaining_ms(&self, now_ms: u64) -> u64 {
+        self.window.remaining_ms(now_ms)
+    }
+
+    /// The top of a pass: notice a mode that moved and budget on it, then
+    /// say what to do. Returns whether the budget was restarted.
+    ///
+    /// A wake check's window and an idle timeout are the same deadline
+    /// field holding two very different numbers, so a mode that moved gets
+    /// a fresh budget on its own terms rather than the old one's deadline.
+    pub fn pass(&mut self, now_ms: u64, stored: &Stored) -> (bool, Pass) {
+        let rebudgeted = stored.mode != self.mode;
+        if rebudgeted {
+            self.mode = stored.mode;
+            self.window = Window::new(now_ms, stored.budget_s());
+        }
+        let pass = match self.window.next(now_ms, stored) {
+            Next::Sleep { interval_s } => Pass::Sleep { interval_s },
+            Next::BleDown { off_s } => Pass::BleDown { off_s },
+            // Derived from `at_expiry` rather than from the settings, so a
+            // spent budget that resolves to "keep advertising" cannot arm
+            // a zero-length wait and spin.
+            Next::Advertise => Pass::Advertise {
+                bounded: stored.at_expiry() != Next::Advertise,
+            },
+        };
+        (rebudgeted, pass)
+    }
+
+    /// What an accept outcome means.
+    ///
+    /// A connect during a wake check is a doorbell, not a leash: the
+    /// attempt alone promotes the board to idle with the idle timeout
+    /// armed, and the app can take its time - including reconnecting after
+    /// a handshake that fizzled, which phones do routinely. On the attempt
+    /// rather than on a completed session, because the failure mode of the
+    /// stricter rule is a board that goes back down for five minutes over
+    /// one bad handshake.
+    ///
+    /// `stored` is the settings as they were before any promotion; the
+    /// idle budget is computed from them with the mode moved.
+    pub fn on_accept(&mut self, now_ms: u64, accepted: Accepted, stored: &Stored) -> Step {
+        let promote =
+            self.mode == Mode::Stored && matches!(accepted, Accepted::Connected | Accepted::Failed);
+        if promote {
+            self.mode = Mode::Idle;
+            let idle = Stored {
+                mode: Mode::Idle,
+                ..*stored
+            };
+            self.window = Window::new(now_ms, idle.budget_s());
+        }
+        let then = match accepted {
+            Accepted::Connected => Then::Serve,
+            Accepted::Failed => {
+                // Held open for the retry rather than left to run out: a
+                // phone that fizzled a handshake comes back within a
+                // second or two, and before this it could find the board
+                // dark for `ble_off_s` or asleep for a whole cadence.
+                self.window.after_connect_attempt(now_ms);
+                Then::Retry
+            }
+            Accepted::Expired => match stored.at_expiry() {
+                Next::Sleep { interval_s } => Then::Sleep(interval_s),
+                _ => Then::Return,
+            },
+            Accepted::SleepNow(secs) => Then::Sleep(secs),
+            Accepted::ModeChanged => Then::Continue,
+        };
+        Step { promote, then }
+    }
+
+    /// The session ended. Sleep if a command asked for it during the
+    /// session, else re-arm the budget the way the mode does after a
+    /// disconnect and advertise again.
+    ///
+    /// Checked after the session rather than inside it so the ack, the
+    /// settings republish and the link teardown have all happened: the
+    /// board is gone the moment a sleep starts, and anything still owed to
+    /// the central has to have left first.
+    pub fn on_session_end(&mut self, now_ms: u64, sleep_now: Option<u32>, stored: &Stored) -> Then {
+        if let Some(secs) = sleep_now {
+            return Then::Sleep(secs);
+        }
+        // Re-arm by advertising, not by idling: the point is to let the
+        // phone come straight back, which it cannot do if the board is
+        // awake but not discoverable.
+        self.window.after_disconnect(now_ms, stored);
+        Then::Continue
+    }
+}
+
+/// How long the modem stays down once the serve loop returns, or `None`
+/// for a mode that has no off period - a setting, or a mode, that moved
+/// while the modem was coming down, which goes straight back to
+/// advertising rather than sitting out a zero-length wait.
+pub fn down_period(stored: &Stored) -> Option<u32> {
+    match stored.at_expiry() {
+        Next::BleDown { off_s } => Some(off_s),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// From a config write to the hardware loop
+// ---------------------------------------------------------------------------
+
+/// What an [`Action`] sets in motion beyond the settings it already changed:
+/// a request to the hardware loop, a sleep for the serve loop, a signal
+/// that the mode moved.
+///
+/// The two loops are answered separately because they own different
+/// things. The hardware half of a mode change is a request the hardware
+/// loop picks up on its next pass; the budget half goes to the serve loop,
+/// which owns the advertising and the `Rtc`. A store is a command that
+/// ends with the chip gone, so it goes to the serve loop by the same route
+/// a nap does - the ack has to leave before the board acts, and the link
+/// does not survive the action.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Dispatch {
+    pub request: Option<crate::posture::Request>,
+    /// Deep sleep for this long, once whatever is owed to the central has
+    /// left.
+    pub sleep_now: Option<u32>,
+    /// The mode moved: a serve loop waiting on a budget that belongs to the
+    /// old mode should stop waiting.
+    pub mode_signal: bool,
+    /// The position notify interval, which is session state rather than a
+    /// stored setting.
+    pub notify_interval_ms: Option<u32>,
+}
+
+/// What `action` sets in motion, given the settings as they are after the
+/// write that produced it.
+pub fn dispatch(action: Action, stored: &Stored) -> Dispatch {
+    use crate::posture::Request;
+    let mut d = Dispatch::default();
+    match action {
+        Action::GpsSleep(on) => d.request = Some(Request::GpsSleep(on)),
+        // No second MCU to put to sleep; the nearest thing is parking the
+        // radio, which is what the WIO's soft sleep actually bought.
+        Action::WioSleep(on) => d.request = Some(Request::RadioStandby(on)),
+        Action::NotifyInterval(ms) => d.notify_interval_ms = Some(ms),
+        Action::SleepNow(secs) => d.sleep_now = Some(secs),
+        Action::SetMode(Mode::Stored) => d.sleep_now = Some(stored.sleep_cadence()),
+        Action::SetMode(mode) => {
+            d.request = Some(Request::Mode(mode));
+            d.mode_signal = true;
+        }
+        // Settings the loops read for themselves when they next decide,
+        // and a rail this board does not have.
+        Action::Rail(_)
+        | Action::SleepInterval(_)
+        | Action::AdvWindow(_)
+        | Action::BleOff(_)
+        | Action::BleOn(_)
+        | Action::IdleTimeout(_)
+        | Action::Name
+        | Action::None => {}
+    }
+    d
 }
 
 #[cfg(test)]
@@ -2166,5 +2430,186 @@ mod tests {
         };
         assert!(stored.adopt_power(&p));
         assert_eq!(stored.ble_off_s, 0);
+    }
+
+    // -- the serve loop ----------------------------------------------------
+
+    /// A tracker with an off period: the budget is the on period, expiry
+    /// drops the modem, and a disconnect lingers.
+    #[test]
+    fn serve_runs_a_tracker_s_duty_cycle() {
+        let s = Stored {
+            mode: Mode::Tracking,
+            ble_off_s: 30,
+            ble_on_s: 20,
+            ..Stored::new()
+        };
+        let mut serve = Serve::new(0, &s);
+        assert_eq!(serve.mode(), Mode::Tracking);
+        assert_eq!(serve.pass(0, &s), (false, Pass::Advertise { bounded: true }));
+        assert_eq!(serve.remaining_ms(0), 20_000);
+        assert_eq!(
+            serve.on_accept(5_000, Accepted::Connected, &s),
+            Step {
+                promote: false,
+                then: Then::Serve
+            }
+        );
+        // The session outlasts the budget; the disconnect buys a linger.
+        assert_eq!(serve.on_session_end(60_000, None, &s), Then::Continue);
+        assert_eq!(serve.remaining_ms(60_000), LINGER_S * 1000);
+        assert_eq!(serve.pass(60_000, &s), (false, Pass::Advertise { bounded: true }));
+        assert_eq!(serve.pass(65_000, &s), (false, Pass::BleDown { off_s: 30 }));
+        assert_eq!(down_period(&s), Some(30));
+        // Expiry while advertising says the same thing.
+        let mut serve = Serve::new(0, &s);
+        assert_eq!(serve.on_accept(20_000, Accepted::Expired, &s).then, Then::Return);
+    }
+
+    /// A wake check: a connect attempt, completed or not, promotes it to
+    /// idle on the idle budget; nobody coming puts it back to sleep.
+    #[test]
+    fn serve_promotes_a_wake_check_on_the_attempt() {
+        let s = Stored {
+            mode: Mode::Stored,
+            sleep_interval_s: 120,
+            adv_window_s: 15,
+            idle_timeout_s: 600,
+            ..Stored::new()
+        };
+        for attempt in [Accepted::Connected, Accepted::Failed] {
+            let mut serve = Serve::new(0, &s);
+            let step = serve.on_accept(8_000, attempt, &s);
+            assert!(step.promote, "{attempt:?}");
+            assert_eq!(serve.mode(), Mode::Idle);
+            assert_eq!(serve.remaining_ms(8_000), 600_000);
+            // The firmware records the promotion; the next pass finds the
+            // stored mode equal to the budgeted one and keeps the budget.
+            let idle = Stored {
+                mode: Mode::Idle,
+                ..s
+            };
+            assert_eq!(serve.pass(20_000, &idle), (false, Pass::Advertise { bounded: true }));
+            assert_eq!(serve.pass(608_000, &idle), (false, Pass::Sleep { interval_s: 120 }));
+        }
+        let mut serve = Serve::new(0, &s);
+        assert_eq!(serve.on_accept(15_000, Accepted::Expired, &s).then, Then::Sleep(120));
+        assert_eq!(serve.on_accept(3_000, Accepted::SleepNow(45), &s).then, Then::Sleep(45));
+    }
+
+    /// A mode that moved under the loop re-budgets on its own terms.
+    #[test]
+    fn serve_rebudgets_when_the_mode_moves() {
+        let mut s = Stored {
+            mode: Mode::Idle,
+            sleep_interval_s: 120,
+            idle_timeout_s: 600,
+            ..Stored::new()
+        };
+        let mut serve = Serve::new(0, &s);
+        assert_eq!(serve.remaining_ms(0), 600_000);
+        assert_eq!(serve.on_accept(1_000, Accepted::ModeChanged, &s).then, Then::Continue);
+        s.mode = Mode::Tracking;
+        let (rebudgeted, pass) = serve.pass(1_000, &s);
+        assert!(rebudgeted);
+        assert_eq!(pass, Pass::Advertise { bounded: false });
+        assert_eq!(serve.mode(), Mode::Tracking);
+        assert_eq!(serve.remaining_ms(1_000), u64::from(ble::BLE_ON_DEFAULT_S) * 1000);
+        assert_eq!(down_period(&s), None);
+        // Listening never bounds its wait.
+        s.mode = Mode::Listening;
+        assert_eq!(serve.pass(1_000, &s).1, Pass::Advertise { bounded: false });
+    }
+
+    /// A sleep asked for during the session is honored after it, and a
+    /// failed attempt holds the window without extending a long one.
+    #[test]
+    fn serve_sleeps_after_the_session_that_asked() {
+        let s = Stored {
+            mode: Mode::Idle,
+            idle_timeout_s: 600,
+            ..Stored::new()
+        };
+        let mut serve = Serve::new(0, &s);
+        assert_eq!(serve.on_session_end(5_000, Some(90), &s), Then::Sleep(90));
+        let mut serve = Serve::new(0, &s);
+        assert_eq!(serve.on_accept(1_000, Accepted::Failed, &s).then, Then::Retry);
+        assert_eq!(serve.window().ends_ms(), 600_000, "an early failure cannot shorten idle");
+    }
+
+    // -- dispatch ----------------------------------------------------------
+
+    /// Each action reaches the loop that owns it: overrides and modes to
+    /// the hardware loop, a nap and a store to the serve loop, and the
+    /// settings the loops read for themselves nowhere.
+    #[test]
+    fn dispatch_sends_each_action_to_the_loop_that_owns_it() {
+        use crate::posture::Request;
+        let s = Stored {
+            sleep_interval_s: 120,
+            ..Stored::new()
+        };
+        let none = Dispatch::default();
+        assert_eq!(
+            dispatch(Action::GpsSleep(true), &s),
+            Dispatch {
+                request: Some(Request::GpsSleep(true)),
+                ..none
+            }
+        );
+        assert_eq!(
+            dispatch(Action::WioSleep(false), &s),
+            Dispatch {
+                request: Some(Request::RadioStandby(false)),
+                ..none
+            }
+        );
+        assert_eq!(
+            dispatch(Action::SetMode(Mode::Tracking), &s),
+            Dispatch {
+                request: Some(Request::Mode(Mode::Tracking)),
+                mode_signal: true,
+                ..none
+            }
+        );
+        // A store is a sleep on the cadence, not a hardware request: the
+        // park happens on the way into the sleep.
+        assert_eq!(
+            dispatch(Action::SetMode(Mode::Stored), &s),
+            Dispatch {
+                sleep_now: Some(120),
+                ..none
+            }
+        );
+        assert_eq!(
+            dispatch(Action::SetMode(Mode::Stored), &Stored::new()).sleep_now,
+            Some(ble::ESP_SLEEP_MAX_S)
+        );
+        assert_eq!(
+            dispatch(Action::SleepNow(30), &s),
+            Dispatch {
+                sleep_now: Some(30),
+                ..none
+            }
+        );
+        assert_eq!(
+            dispatch(Action::NotifyInterval(500), &s),
+            Dispatch {
+                notify_interval_ms: Some(500),
+                ..none
+            }
+        );
+        for a in [
+            Action::Rail(true),
+            Action::SleepInterval(60),
+            Action::AdvWindow(10),
+            Action::BleOff(30),
+            Action::BleOn(20),
+            Action::IdleTimeout(0),
+            Action::Name,
+            Action::None,
+        ] {
+            assert_eq!(dispatch(a, &s), none, "{a:?}");
+        }
     }
 }

@@ -160,6 +160,15 @@ impl Plan {
         self.channel_hz(self.index_for_slot(slot))
     }
 
+    /// Whether moving from slot `from` to slot `to` changes the carrier.
+    /// Never on a one-channel plan, which is the shipped default - and so
+    /// the receiver is never taken out of receive at a slot boundary
+    /// there, where a retune to the same carrier would cost it a
+    /// millisecond of deafness a second for nothing.
+    pub fn retunes(&self, from: u32, to: u32) -> bool {
+        self.frequency_for_slot(from) != self.frequency_for_slot(to)
+    }
+
     /// Time given up at each end of a slot to disagreement between clocks,
     /// ms: a transmission neither starts before it nor is planned to run
     /// into it.
@@ -517,9 +526,16 @@ impl Clock {
     /// The local time node `address`, transmitting every `interval_ms`,
     /// should start a transmission of `airtime_ms`, at or after `now_ms`: a
     /// random point inside the node's turn of the slot's window, in this
-    /// slot if that point is still ahead and otherwise in the next. The
-    /// turn is what keeps two nodes apart; the randomness inside it is for
-    /// two nodes that share a turn.
+    /// slot if it is the node's and that point is still ahead, and
+    /// otherwise in the next slot that is the node's. The turn is what
+    /// keeps two nodes apart; the randomness inside it is for two nodes
+    /// that share a turn.
+    ///
+    /// The slot has to be the node's own: on an interval several slots
+    /// long a start planned for "the next slot" lands in another node's,
+    /// where [`turn_due`](Self::turn_due) says nothing is owed, so the plan
+    /// is dropped and the beacon waits a whole interval. That was the case
+    /// for any pass that came late at the start of the node's slot.
     pub fn tx_start(
         &mut self,
         plan: &Plan,
@@ -528,15 +544,25 @@ impl Clock {
         now_ms: u64,
         airtime_ms: u32,
     ) -> u64 {
-        let (lo, hi) = plan.start_range_for(address, self.slots_for(interval_ms), airtime_ms);
+        let n = self.slots_for(interval_ms);
+        let (lo, hi) = plan.start_range_for(address, n, airtime_ms);
         self.rng = xorshift(self.rng);
         let target = lo + self.rng % (hi - lo + 1);
         let phase = self.phase_ms(now_ms);
-        if phase <= target {
-            now_ms + u64::from(target - phase)
-        } else {
-            now_ms + u64::from(self.dwell_ms - phase) + u64::from(target)
+        let slot = self.slot(now_ms);
+        let mine = plan.turn_slot(address, n);
+        if slot % n == mine && phase <= target {
+            return now_ms + u64::from(target - phase);
         }
+        // Slots until the next one that is the node's, at least one.
+        let mut ahead = 1u32;
+        while (slot.wrapping_add(ahead) & SLOT_MASK) % n != mine {
+            ahead += 1;
+        }
+        now_ms
+            + u64::from(self.dwell_ms - phase)
+            + u64::from(ahead - 1) * u64::from(self.dwell_ms)
+            + u64::from(target)
     }
 
     /// How long a transmission of `airtime_ms` by node `address` that wants
@@ -964,5 +990,53 @@ mod tests {
             .count();
         // About one slot in fifty; anything in a wide band around that.
         assert!((30..300).contains(&hits), "{hits} coincidences in 5000 slots");
+    }
+
+    /// A one-channel plan never retunes; a fifty-channel plan retunes at
+    /// every boundary inside a cycle, since a permutation repeats nothing.
+    #[test]
+    fn a_single_channel_plan_never_retunes() {
+        let one = plan();
+        for slot in 0..2_000u32 {
+            assert!(!one.retunes(slot, slot + 1));
+        }
+        let p = wide();
+        for cycle in 0..40u32 {
+            for i in 0..p.cycle() - 1 {
+                let s = cycle * p.cycle() + i;
+                assert!(p.retunes(s, s + 1), "slot {s}");
+            }
+        }
+    }
+
+    /// On a multi-slot interval a start planned past this slot's turn
+    /// lands in the node's own next slot, never in another node's - which
+    /// `turn_due` would refuse, dropping the beacon for a whole interval.
+    #[test]
+    fn tx_start_lands_in_the_node_s_own_slot() {
+        let p = plan();
+        for n in 1..=7u32 {
+            let interval_ms = n * 1000;
+            for address in 1..=20u8 {
+                let mut c = Clock::new(1000, 0, u32::from(address));
+                c.discipline_gps(0, 0);
+                let (lo, hi) = p.start_range_for(address, n, 289);
+                for phase in (0..1000u64).step_by(50) {
+                    for base in [0u64, 3_000, 4_000] {
+                        let now = 10_000 + base + phase;
+                        let start = c.tx_start(&p, address, interval_ms, now, 289);
+                        assert!(start >= now);
+                        assert!(
+                            c.turn_due(&p, address, None, interval_ms, start),
+                            "n {n} address {address} now {now} start {start}"
+                        );
+                        let ph = c.phase_ms(start);
+                        assert!((lo..=hi).contains(&ph), "phase {ph} not in {lo}..={hi}");
+                        // Never later than one interval away.
+                        assert!(start - now <= u64::from(interval_ms), "waited {}", start - now);
+                    }
+                }
+            }
+        }
     }
 }

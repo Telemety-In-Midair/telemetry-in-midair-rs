@@ -12,3 +12,7 @@ description = "Shared protocol for the telemetry-in-midair board: LoRa payloads,
 # tests use the same implementation so a result cannot differ by platform.
 libm = "0.2"
 gps-proto = { path = "../../gps-proto" }
+
+[dev-dependencies]
+# The state space explorer the tests in `tests/` drive the machines with.
+midair-explore = { path = "../explore" }
