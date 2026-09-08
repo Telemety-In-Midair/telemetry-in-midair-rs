@@ -114,6 +114,47 @@ the work.
 
 ## Radio
 
+The slot clock is in and untested on hardware. `hop_channels` now defaults
+to `1`, so the default build runs the clock, the turns and the sync word on
+one carrier and never retunes - see the addendum in `docs/RADIO-AUDIT.md`
+for why. The first thing to watch is the console: `hop: clock on gps time`
+on a board with a fix, then `hop: clock from node N` on one without, and
+two nodes landing in different halves of the second.
+
+Then run it again with `hop_channels = 50` pushed, which is the path that
+actually retunes and the one the fifty-channel numbers in the audit
+describe. Watch the channel index move in the status line, and time a base
+station with no fix from boot to first frame - the model says 61 s there
+against 4 s at the default, and that gap is the whole argument for the
+default being what it is.
+
+The app's Radio page applies the wrong band rule to the new default.
+`gps-gui-rs/src/radio.rs`, `airtime()`: any plan at all takes the
+`HopVisit` branch and gets a 400 ms per-visit budget, but a one-channel
+plan at 500 kHz has no dwell limit - it is a digital modulation, not a
+hopper. Nothing shows at the default beacon (289 ms); add altitude and
+speed to `fields` and the page warns about a frame that is legal. The
+branch needs to key on `plan.channels > 1` rather than `plan.is_some()`,
+with a one-channel plan falling through to the existing bandwidth test.
+Separate repo, so a separate commit.
+
+Price hopping against real interference. It is the one thing the new
+default gives up and the simulator has nothing to say about it: no
+interferers are modelled. Two boards in a band with a live 900 MHz talker
+nearby, at `hop_channels` 1 and 50, is the experiment.
+
+Faster join for a node with no clock, if the fifty-channel plan is ever
+the one deployed. An RSSI sweep (retune, settle, read, about a millisecond
+a channel) finds a strong signal in one pass where the blind receiver
+waits a cycle per coincidence; it cannot see a signal under the noise
+floor, so it complements the wait rather than replacing it. The other
+reference is the phone: its GPS time over BLE would make the board on the
+desk stratum 0 without a fix, and that one helps at any channel count.
+
+Hop statistics in telemetry: frames heard per channel, clock corrections
+applied and their size. Without them a receiver that is a little out of
+step looks like a range problem.
+
 Wake-on-radio: `SetRxDutyCycle` (0x94). The radio cycles sleep/RX on its own
 and only wakes the MCU when a real preamble arrives, instead of holding
 continuous RX. Biggest battery win available on a leaf that mostly listens.
@@ -152,8 +193,10 @@ Beeper.
 ## Open questions
 
 Will flashing the firmware with a `RADIO.CFG` present overwrite flags such
-as the node address? (It should not: the card is read at boot and the card
-wins. Untested.)
+as the node address? (It should not, and there are now two reasons: the card
+is read at boot and the card wins, and the flash backup lives in `nvs`, which
+the runner does not erase - `--erase-parts otadata` is the whole erase list.
+Untested on hardware.)
 
 Will a sleeping board ever be connected to if an awake board is nearby?
 
@@ -211,6 +254,7 @@ Check bluetooth docs for lower power state management. Wake without advertising?
 Confirm in app for stored mode.
 
 - Boot into idle.
-- Should be able to turn off idle auto to stored. 
 - Quick double flash on rx.
 - Log gps data to flash. Can load from usb or over BLE.
+- Show RSSI for BLE even when connected?
+- Link in status should reflect current BLE status.

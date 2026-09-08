@@ -2082,11 +2082,11 @@ async fn hardware_task(
             // this pass was about to begin.
             //
             // Two stages. The interval decides *that* a beacon is owed; on
-            // a hopping network the slot clock then decides *when* in a slot
-            // it goes, and that instant is planned here and waited for by
-            // this loop rather than inside the transmit, where the wait would
-            // hold the receiver off the air for up to a slot. On a single
-            // channel the planned instant is now.
+            // a scheduled network the slot clock then decides *when* in a
+            // slot it goes, and that instant is planned here and waited for
+            // by this loop rather than inside the transmit, where the wait
+            // would hold the receiver off the air for up to a slot. With no
+            // plan at all the planned instant is now.
             //
             // The last gate is a frame arriving: keying up over it would
             // lose both, and the poll below will have delivered it by the
@@ -2119,11 +2119,13 @@ async fn hardware_task(
                 // gone; the next one is planned afresh when it comes.
                 beacon_at = None;
             } else if beacon_at.is_none() {
-                // Single channel: jitter on top of the interval so two nodes
-                // that happened to line up do not stay lined up. Hopping,
-                // the random start inside the node's turn is that jitter,
-                // and a delay here would only push a beacon out of its slot.
-                let jitter = if node.radio().hopping() {
+                // No plan: jitter on top of the interval so two nodes that
+                // happened to line up do not stay lined up - the weaker of
+                // the two schemes, and all there is without a slot clock.
+                // On a plan, the random start inside the node's turn is
+                // that jitter, and a delay here would only push a beacon
+                // out of its slot.
+                let jitter = if node.radio().scheduled() {
                     0
                 } else {
                     node.random((interval_ms / 2).min(2_000))

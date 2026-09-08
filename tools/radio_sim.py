@@ -988,15 +988,23 @@ def merge(reports: list[dict]) -> dict:
     return out
 
 
-def run_all(seconds: float, seed: int, which: list[str], variants: list[str], seeds: int = 1) -> dict:
+def make_plan(channels: int) -> Plan:
+    """The plan the runs are on. One channel is the firmware default: the
+    slot clock and the turns with nowhere to hop to."""
+    return Plan.new(channels, 500, 915_000_000, 1000, int(math.ceil(TOA_BEACON)))
+
+
+def run_all(seconds: float, seed: int, which: list[str], variants: list[str], seeds: int = 1,
+            channels: int = 50) -> dict:
     results = {}
+    plan = make_plan(channels)
     for name in which:
         specs = scenarios()[name]
         results[name] = {}
         for var in variants:
             reports = []
             for k in range(seeds):
-                sim = Sim(specs, VARIANTS[var](), seconds, seed + k)
+                sim = Sim(specs, VARIANTS[var](), seconds, seed + k, plan)
                 sim.run()
                 reports.append(sim.report())
             results[name][var] = merge(reports) if seeds > 1 else reports[0]
@@ -1028,8 +1036,9 @@ def print_summary(results: dict, seconds: float):
                 )
 
 
-def gantt(name: str, var: str, seconds: float, seed: int, from_s: float, span_s: float) -> str:
-    sim = Sim(scenarios()[name], VARIANTS[var](), seconds, seed)
+def gantt(name: str, var: str, seconds: float, seed: int, from_s: float, span_s: float,
+          channels: int = 50) -> str:
+    sim = Sim(scenarios()[name], VARIANTS[var](), seconds, seed, make_plan(channels))
     sim.run()
     a, b = from_s * 1000, (from_s + span_s) * 1000
     frames = [f for f in sim.frames if f.rf_end > a and f.rf_start < b]
@@ -1080,16 +1089,20 @@ def main() -> int:
     ap.add_argument("--gantt", metavar="SCENARIO", help="print a mermaid gantt of a few seconds of one scenario")
     ap.add_argument("--from", dest="from_s", type=float, default=120.0)
     ap.add_argument("--span", type=float, default=4.0)
+    ap.add_argument("--channels", type=int, default=50,
+                    help="channels in the plan; 1 is the firmware default - the slot "
+                         "clock and the turns on a single carrier (default 50)")
     args = ap.parse_args()
 
     if args.selftest:
         return selftest(args.vectors)
     variants = args.variant or list(VARIANTS)
     if args.gantt:
-        print(gantt(args.gantt, variants[0], args.seconds, args.seed, args.from_s, args.span))
+        print(gantt(args.gantt, variants[0], args.seconds, args.seed, args.from_s, args.span,
+                    args.channels))
         return 0
     which = args.scenario or list(scenarios())
-    results = run_all(args.seconds, args.seed, which, variants, args.seeds)
+    results = run_all(args.seconds, args.seed, which, variants, args.seeds, args.channels)
     print_summary(results, args.seconds)
     if args.json:
         with open(args.json, "w", encoding="utf-8") as f:

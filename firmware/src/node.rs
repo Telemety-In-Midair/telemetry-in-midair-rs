@@ -228,14 +228,15 @@ impl<'d> Node<'d> {
     }
 
     /// The sync word a frame this node sends carries: a placeholder the
-    /// radio overwrites at the instant of transmission on a hopping
-    /// network, nothing otherwise.
+    /// radio overwrites at the instant of transmission on a scheduled
+    /// network, nothing otherwise. Sent on a one-channel plan too - it
+    /// carries the clock, which is needed wherever the schedule runs.
     fn sync_placeholder(&self) -> Option<SyncWord> {
-        self.radio.hopping().then_some(SyncWord::default())
+        self.radio.scheduled().then_some(SyncWord::default())
     }
 
     /// Broadcast a payload as a new frame from this node, one sent every
-    /// `interval_ms` - which on a hopping network is what picks the turn
+    /// `interval_ms` - which on a scheduled network is what picks the turn
     /// it goes out in.
     ///
     /// Fails with [`TxError::Muted`] on a receive-only node rather than
@@ -264,7 +265,7 @@ impl<'d> Node<'d> {
 
     /// Bytes ahead of the payload in a frame this node sends.
     pub fn frame_overhead(&self) -> usize {
-        HEADER_LEN + if self.radio.hopping() { midair_proto::hop::SYNC_LEN } else { 0 }
+        HEADER_LEN + if self.radio.scheduled() { midair_proto::hop::SYNC_LEN } else { 0 }
     }
 
     /// Poll the radio for one frame.

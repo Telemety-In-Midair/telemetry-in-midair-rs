@@ -126,7 +126,7 @@ classDiagram
         tx_start() word_at()
     }
     class HopPlan {
-        channels, step, dwell
+        channels (1 by default), step, dwell
         frequency_for_slot()
         turns by address
     }
@@ -370,11 +370,14 @@ Receive polling checks DIO1 as a GPIO before paying for an SPI round trip,
 which is most of what an idle node does. On the WIO-E5 there was no such
 pin - DIO1 was an internal NVIC vector - so every poll cost a transaction.
 
-## Frequency hopping
+## The slot clock
 
-The radio is on a different channel every slot, and every node has to
-agree on which. The agreement is a clock, and the clock is set by whatever
-the node has: its own GPS, the frames it hears, or nothing.
+Time is cut into slots, and every node has to agree on where one begins:
+it is what gives each node its own turn to transmit in, and - on a plan
+with more than one channel - which channel to be on. The agreement is a
+clock, and the clock is set by whatever the node has: its own GPS, the
+frames it hears, or nothing. The default plan is one channel wide, so by
+default the clock is the whole of it and nothing ever retunes.
 
 ```mermaid
 stateDiagram-v2
@@ -427,7 +430,7 @@ frame the modulation allows once a header has.
 
 ```mermaid
 gantt
-    title One hop slot at the default dwell - two nodes taking turns, and a receiver following them
+    title One slot at the default dwell - two nodes taking turns, and a receiver following them
     dateFormat x
     axisFormat %L ms
 
@@ -447,7 +450,7 @@ gantt
     preamble seen, hop held      :milestone, m1, 180, 0ms
     frame lands, clock offered   :milestone, m2, 419, 0ms
     second frame lands           :milestone, m3, 829, 0ms
-    retune to slot s+1           :crit,     r2, 1000, 2ms
+    retune to slot s+1 (a no-op on one channel) :crit, r2, 1000, 2ms
     on channel of slot s+1       :active,  r3, 1002, 300ms
 ```
 

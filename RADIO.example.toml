@@ -34,28 +34,32 @@
 # -- Radio --------------------------------------------------------------
 # frequency, spreading factor, bandwidth, coding rate and power are the
 # LoRa link-budget knobs: together they set sensitivity, on-air time and
-# radiated power - i.e. range. The three hop_* keys are the channel plan:
-# by default the network hops across fifty 500 kHz channels filling
-# 902-928 MHz, one second on each, which is what lets a node beacon every
-# second on that band instead of every twenty.
+# radiated power - i.e. range. The three hop_* keys are the channel plan
+# and the slot clock that runs it. The default plan is one channel: a
+# 500 kHz signal may hold a single carrier in the 902-928 MHz band as
+# often as it likes, so hopping buys no air time there that the default
+# modulation does not already have. What the plan is kept for is the
+# clock, which cuts every second into turns and gives each address one -
+# without it two nodes beaconing at the same rate talk over each other.
+# Raise hop_channels to hop for real; see the notes on that key.
 [radio]
 frequency_hz = 915000000
-frequency_hz_description = "RF center frequency in Hz. Valid 150000000-960000000. With hopping on this is the center of the channel plan, and the channels straddle it."
+frequency_hz_description = "RF center frequency in Hz. Valid 150000000-960000000. With more than one hop channel this is the center of the plan and the channels straddle it; with one it is simply the carrier."
 
-hop_channels = 50
-hop_channels_description = "Channels to hop across, 0-255. 0 stays on frequency_hz. Hopping is what allows a short beacon interval in the 902-928 MHz band: the rule there caps how long one channel is occupied per visit, and a hopping node visits each channel once a cycle. 50 is the band's minimum for a signal narrower than 250 kHz. Every node hops on one shared clock - from GPS where a node has a fix, from the frames it hears where it does not - so a node that knows nobody's clock spends roughly hop_channels times the beacon interval, divided by the number of nodes transmitting, finding the network."
+hop_channels = 1
+hop_channels_description = "Channels in the plan, 0-255. This key carries two decisions, and 0 and 1 are not the same setting. 0 turns the slot clock off with the plan: nodes beacon on their own intervals with random jitter and collide whenever two starts land within a preamble of each other. 1, the default, keeps the clock on the single carrier at frequency_hz - nodes still share slots and still take turns inside them by address - and is the right answer at 500 kHz bandwidth, where the band lets one carrier be held as often as you like. More than 1 adds channel diversity: a fade or an interferer parked on one carrier costs one beacon in hop_channels rather than every beacon, and below 500 kHz of bandwidth 50 channels is what the 902-928 MHz band requires. Hopping is not free - every node hops on one shared clock, from GPS where a node has a fix and from the frames it hears where it does not, so a node that knows nobody's clock spends roughly hop_channels times the beacon interval, divided by the number of nodes transmitting, before it hears the network at all."
 
 hop_step_khz = 500
-hop_step_khz_description = "Spacing between hop channels in kHz, 25-5000. At least the bandwidth, or adjacent channels overlap. 500 kHz for 50 channels spans 902.75-927.25 MHz around the 915 MHz center."
+hop_step_khz_description = "Spacing between hop channels in kHz, 25-5000. At least the bandwidth, or adjacent channels overlap. Unused with hop_channels at 0 or 1, since there is nothing to space. 500 kHz for 50 channels spans 902.75-927.25 MHz around the 915 MHz center."
 
 hop_dwell_ms = 1000
-hop_dwell_ms_description = "How long every node stays on each channel, 100-10000 ms. One transmission per node per slot, which has to fit the slot with a 100 ms guard at each end, so at 1000 ms a beacon may be up to 800 ms on air. The band caps one visit at 400 ms; the default beacon is 289 ms. The 800 ms window is cut into as many default beacons as fit - two - and nodes take those turns by address, so two nodes may beacon every second without overlapping."
+hop_dwell_ms_description = "Slot length in ms, 100-10000, and so how long every node stays on each channel. Read even on a one-channel plan, where it is the slot alone. One transmission per node per slot, which has to fit the slot with a 100 ms guard at each end, so at 1000 ms a beacon may be up to 800 ms on air. The band caps one visit at 400 ms; the default beacon is 289 ms. The 800 ms window is cut into as many default beacons as fit - two - and nodes take those turns by address, so two nodes may beacon every second without overlapping."
 
 spreading_factor = 12
 spreading_factor_description = "LoRa spreading factor, 5-12. Higher gives longer range at a lower data rate."
 
 bandwidth_khz = 500
-bandwidth_khz_description = "LoRa bandwidth in kHz: 62, 125, 250 or 500 (62 means 62.5). Narrower gives longer range at a lower data rate, and a longer frame: the default beacon is 289 ms at 500 and 1150 ms at 125, past the 400 ms one hop visit may occupy a channel. In the 902-928 MHz band only 500 is wide enough to sit on one channel with hopping off."
+bandwidth_khz_description = "LoRa bandwidth in kHz: 62, 125, 250 or 500 (62 means 62.5). Narrower gives longer range at a lower data rate, and a longer frame: the default beacon is 289 ms at 500 and 1150 ms at 125, past the 400 ms one hop visit may occupy a channel. In the 902-928 MHz band only 500 is wide enough to hold a single carrier; anything narrower has to hop, so it needs hop_channels raised to 50 as well."
 
 coding_rate = 5
 coding_rate_description = "Coding rate denominator 5-8 for 4/5..4/8. Higher adds forward error correction at a lower data rate."
@@ -99,7 +103,7 @@ rx_boost_description = "Boosted receiver gain: roughly +2 dB of sensitivity for 
 # deployment where the reporting only ever runs one way.
 [network]
 address = 1
-address_description = "This node's address, 1-255. Must be unique among the nodes that transmit: two senders sharing an address are mutually deaf, each dropping the other's broadcasts as an echo of its own, so neither ever sees the other. An rx_only node never puts its address on the air, so it can keep the default. With hopping on, the address also picks the node's turn inside a slot: number a fleet 1, 2, 3... and the first 2 x interval_s of them never overlap on the air."
+address_description = "This node's address, 1-255. Must be unique among the nodes that transmit: two senders sharing an address are mutually deaf, each dropping the other's broadcasts as an echo of its own, so neither ever sees the other. An rx_only node never puts its address on the air, so it can keep the default. With a hop plan - one channel or fifty, the default either way - the address also picks the node's turn inside a slot: number a fleet 1, 2, 3... and the first 2 x interval_s of them never overlap on the air."
 
 role = "leaf"
 role_description = "leaf transmits its own position and receives everyone else's. Repeater also retransmits other nodes' broadcasts, extending range past one radio horizon at the cost of doubling the traffic it forwards. tx_only beacons without ever switching the receiver on, which is the largest power saving available to a node nobody needs to track from. rx_only listens without ever transmitting, for a base station that only collects."
@@ -114,7 +118,7 @@ dedup_ttl_s_description = "How long a broadcast is remembered so a repeat of it 
 # -- Beacon -------------------------------------------------------------
 [beacon]
 interval_s = 1
-interval_s_description = "Position broadcast period in seconds while the node has a fix, 0-3600. With hopping on a node transmits at most once per hop slot, so 1 is every slot at the default dwell. It also sets how many nodes fit: a slot holds two default beacons, so 2 x interval_s addresses beacon without overlapping - two every second, four every two seconds, ten every five. 0 silences the node's own transmissions altogether, pings included, as does a role of rx_only."
+interval_s_description = "Position broadcast period in seconds while the node has a fix, 0-3600. With a hop plan a node transmits at most once per slot, so 1 is every slot at the default dwell. It also sets how many nodes fit: a slot holds two default beacons, so 2 x interval_s addresses beacon without overlapping - two every second, four every two seconds, ten every five. 0 silences the node's own transmissions altogether, pings included, as does a role of rx_only."
 
 ping_interval_s = 5
 ping_interval_s_description = "How often a node with no fix says so, 0-3600 s: a small ping goes out in place of the position, so a node that cannot see the sky is still heard. Slower than the beacon by default, since a searching receiver has nothing new to report every second. 0 sends no pings."

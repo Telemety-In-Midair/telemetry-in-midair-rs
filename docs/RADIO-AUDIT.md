@@ -278,8 +278,62 @@ misbehaves in a way that smells of scheduling, build with
    survives the flash write.
 7. The `idle N Hz` figure roughly doubles; that is both cores counting.
 
+## Addendum, 2026-09-08: the default plan is now one channel
+
+Everything above was measured across fifty channels, which was the
+default when it was written. It no longer is: `hop_channels` now ships at
+`1`, keeping the slot clock, the turns and the sync word on a single
+carrier at `frequency_hz`. The reasoning, and then what the model says.
+
+**Hopping was not buying what the documents claimed.** The 902-928 MHz
+band takes a 500 kHz signal as a digital modulation, which may hold one
+carrier with no dwell or duty ceiling - so the default modulation reaches
+`interval_s = 1` on one channel without hopping at all. Nor is there a
+link-budget case: the band's 0.4 s dwell caps time on air, time on air is
+what buys sensitivity, and the two routes therefore land within about a
+decibel of each other. The best legal hopped plan is SF10/BW125 at 330 ms
+on air, 1 dB better than SF12/BW500; the modes that would be worth 3 dB
+(SF11/BW125, SF12/BW250 - 659 ms) are legal under neither rule.
+
+**What hopping was buying is the clock, and the clock is separable.**
+Finding 1 above - the turns that took two 1 Hz nodes from 76% delivery to
+99.6% - is a property of the slot schedule, not of the channel plan. The
+firmware ties both to `hop_channels`, so `0` still turns off the schedule
+along with the plan; `1` is the setting that keeps the schedule and drops
+the hop.
+
+**What the model says.** Same fixes, same seeds, `--channels 1` against
+`--channels 50` (a flag added to `radio_sim.py` for this):
+
+| scenario | node | 50 channels | 1 channel |
+|---|---|---|---|
+| A, two trackers with a fix | both | 99.6%, 100% | 99.6%, 100% - identical |
+| B, listener with no fix | listener heard | 76.5% | **99.8%** |
+| B | listener join | 61 s | **4 s** |
+| B | listener frames lost off-channel | 127 / 300 s | **0** |
+| C, four trackers (over capacity) | listener heard | 4.0% | 12.6% |
+| C | listener join | 202 s | 4 s |
+
+Two nodes that both have a fix are unaffected, which is the point: they
+were never using the channel diversity for anything. The node that gains
+is the one without a fix. Its join was known (`Join`, above); what was not
+is that it goes on paying afterwards - a follower sits a stratum below and
+re-anchors on what it hears, and every disagreement about where a slot
+began puts it on the wrong channel for a whole frame. That is the 127
+frames, a quarter of the traffic, and on one channel the loss class does
+not exist. The base station on a desk was the worst case for hopping and
+is the biggest winner from dropping it.
+
+**What is given up** is diversity against a narrowband interferer or a
+persistent fade, which is real and unmeasured - the model does not
+simulate external interference at all - and the narrower modulations,
+which need `hop_channels = 50` to be legal. Both are a config push away.
+
 ## Still open
 
+- **Hopping against real interference.** The one benefit the new default
+  gives up, and the model cannot speak to it: it has no interferers in it.
+  A bench comparison in a noisy band is the only way to price it.
 - **BLE transmit power.** The controller runs at 0 dBm, lowered from the
   +9 dBm default on a supply-noise argument (`main.rs`). The board's 2.4 GHz
   port is a test point with no antenna, so the link is marginal, and 9 dB

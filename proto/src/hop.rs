@@ -13,6 +13,12 @@
 //! agree on the time find each other: their channels coincide in about one
 //! slot in `n`, where a fixed order with a fixed offset would never meet.
 //!
+//! `n` of 1 is a plan like any other, and it is the shipped default: one
+//! carrier, every slot, and the whole of the clock and the turns below
+//! still running. What that says is that the schedule and the channel
+//! diversity are separable, and only the schedule is always worth paying
+//! for. Hopping proper is a setting - see [`RadioConfig::hop_channels`].
+//!
 //! The clock itself is nothing but a local millisecond counter and the two
 //! numbers that map it onto slots - when a slot began, and which slot it
 //! was. Three things set those numbers, in order of trust:
@@ -561,16 +567,41 @@ impl Clock {
 mod tests {
     use super::*;
 
+    /// The shipped default: one channel, and the slot clock that goes with
+    /// it. Every test about turns, windows and clocks runs on this, since
+    /// none of them depend on the channel count.
     fn plan() -> Plan {
-        Plan::from_config(&RadioConfig::default()).expect("hopping is the default")
+        Plan::from_config(&RadioConfig::default()).expect("one channel is still a plan")
     }
 
-    /// The default plan fills the 902-928 MHz band with fifty 500 kHz
+    /// The plan a node hopping for real is on: fifty channels of the
+    /// default width, cut into turns by the same 289 ms beacon.
+    fn wide() -> Plan {
+        Plan::new(50, 500, 915_000_000, 1000, 289)
+    }
+
+    /// One channel is a plan whose every slot is the same carrier, and the
+    /// turns survive: it is the clock that is being kept, not the hopping.
+    #[test]
+    fn a_single_channel_plan_never_moves() {
+        let p = plan();
+        assert_eq!(p.channels, 1);
+        assert_eq!(p.cycle(), 1);
+        assert_eq!(p.span_hz(), (915_000_000, 915_000_000));
+        for slot in 0..200 {
+            assert_eq!(p.frequency_for_slot(slot), 915_000_000);
+        }
+        // Two turns of the 800 ms window, as at any other channel count.
+        assert_eq!(p.sub_slots, wide().sub_slots);
+        assert_eq!(p.window_ms(), 800);
+    }
+
+    /// A fifty-channel plan fills the 902-928 MHz band with 500 kHz
     /// channels about 915 MHz, every carrier a whole channel inside the
     /// band edges.
     #[test]
-    fn default_plan_covers_the_us_band() {
-        let p = plan();
+    fn a_fifty_channel_plan_covers_the_us_band() {
+        let p = wide();
         assert_eq!(p.channels, 50);
         assert_eq!(p.dwell_ms, 1000);
         let (lo, hi) = p.span_hz();
@@ -588,7 +619,7 @@ mod tests {
     /// An odd count puts a channel on the center itself.
     #[test]
     fn odd_count_has_a_channel_on_the_center() {
-        let p = Plan { channels: 51, ..plan() };
+        let p = Plan { channels: 51, ..wide() };
         assert_eq!(p.channel_hz(25), 915_000_000);
     }
 
@@ -596,7 +627,7 @@ mod tests {
     /// use them in different orders.
     #[test]
     fn each_cycle_is_a_fresh_permutation() {
-        let p = plan();
+        let p = wide();
         let n = p.cycle();
         let mut orders = alloc_orders(&p, 0..4);
         for order in &orders {
@@ -622,7 +653,7 @@ mod tests {
     /// it would cycle through a handful; reshuffling each cycle fixes that.
     #[test]
     fn a_periodic_sender_uses_every_channel() {
-        let p = plan();
+        let p = wide();
         let mut hit = [false; 256];
         for k in 0..2_000u32 {
             hit[p.index_for_slot(k * 20) as usize] = true;
@@ -905,7 +936,7 @@ mod tests {
     /// on the slot, whatever their local clocks read.
     #[test]
     fn synced_nodes_share_a_channel() {
-        let p = plan();
+        let p = wide();
         let mut a = Clock::new(1000, 0, 1);
         a.discipline_gps(3_600_000, 500);
         let mut b = Clock::new(1000, 0, 2);
@@ -922,7 +953,7 @@ mod tests {
     /// a channel now and then - which is how they find each other at all.
     #[test]
     fn unsynced_nodes_coincide_sometimes() {
-        let p = plan();
+        let p = wide();
         let a = Clock::new(1000, 0, 11);
         let b = Clock::new(1000, 0, 12);
         let hits = (0..5_000u64)

@@ -386,17 +386,31 @@ pub struct RadioConfig {
     /// saving and boosted), so this is a bool rather than an enum - the
     /// intermediate values have no specified behavior to expose.
     pub rx_boost: bool,
-    /// Channels to hop across, 0 for a single channel at
-    /// [`frequency_hz`](Self::frequency_hz). With hopping on, the plan is
-    /// this many channels [`hop_step_khz`](Self::hop_step_khz) apart,
-    /// centered on `frequency_hz`, and every node changes channel once per
-    /// [`hop_dwell_ms`](Self::hop_dwell_ms) on a clock the frames themselves
-    /// keep in step (see [`crate::hop`]).
+    /// Channels in the plan: this many, [`hop_step_khz`](Self::hop_step_khz)
+    /// apart, centered on [`frequency_hz`](Self::frequency_hz), visited one
+    /// per [`hop_dwell_ms`](Self::hop_dwell_ms) on a clock the frames
+    /// themselves keep in step (see [`crate::hop`]).
     ///
-    /// Hopping is what lets a node transmit as often as once a slot: the
-    /// 902-928 MHz band caps how long any one channel is occupied, not how
-    /// often a hopping node transmits. Fifty channels is that band's floor
-    /// for a signal narrower than 250 kHz, and enough for the wider ones.
+    /// The value carries two decisions rather than one, and 0 and 1 are not
+    /// the same setting:
+    ///
+    /// - **0** turns the slot clock off with the plan. Nothing schedules
+    ///   transmissions: a node beacons on its own interval with random
+    ///   jitter, and two nodes at the same rate collide whenever their
+    ///   starts land closer together than a preamble takes to detect.
+    /// - **1** keeps the clock on a single carrier at `frequency_hz`.
+    ///   Nodes still share slots and still take turns inside them by
+    ///   address, which is what keeps them off each other's transmissions;
+    ///   there is simply nowhere to hop to. This is the default.
+    /// - **more** adds channel diversity on top: a fade or an interferer
+    ///   sitting on one carrier costs one beacon in `hop_channels` rather
+    ///   than every beacon. It costs the join, since a node that knows
+    ///   nobody's clock has to wait for a slot where its free-running
+    ///   channel coincides with the network's.
+    ///
+    /// A plan wide enough to be legal below 500 kHz of bandwidth needs at
+    /// least 50 channels in the 902-928 MHz band; see the README for when
+    /// that is the plan to be on.
     pub hop_channels: u8,
     /// Spacing between hop channels, kHz. At least the signal bandwidth,
     /// or adjacent channels overlap.
@@ -537,19 +551,26 @@ impl Default for RadioConfig {
             // already listening continuously, and range is set by the worse
             // of the two directions.
             rx_boost: true,
-            // Hopping, across fifty 500 kHz channels filling 902-928 MHz,
-            // one second per channel. The slot is what makes a short beacon
-            // interval legal on that band: the occupancy cap is per channel
-            // per visit, and a node visits each channel once a cycle.
+            // One channel, and the slot clock that would hop across many.
             //
-            // The clock every node needs for this comes from GPS where a
-            // node has a fix and from the frames it hears where it does not,
-            // so a node without a fix is still on the air and still heard -
-            // after it has heard one frame. What that costs is the join: a
-            // node that knows nobody's clock coincides with the network on
-            // about one slot in fifty, so it waits, on average, fifty beacon
-            // intervals divided by the number of nodes transmitting.
-            hop_channels: 50,
+            // A 500 kHz signal is a digital modulation in the 902-928 MHz
+            // band, which may hold one carrier with no dwell or duty
+            // ceiling, so at the default modulation hopping buys no air
+            // time that this does not already have. What is worth keeping
+            // is the clock: it is what cuts a slot into turns and gives
+            // each address one, and without it two nodes beaconing at the
+            // same rate pick random starts and lose both frames whenever
+            // those land within a preamble of each other. So the plan
+            // stays, one channel wide.
+            //
+            // Raise this to hop for real - 50 channels is the band's floor
+            // below 500 kHz of bandwidth, and the answer to a carrier
+            // somebody else is sitting on. It is not free: a node that
+            // knows nobody's clock then coincides with the network on
+            // about one slot in fifty, so it waits, on average, fifty
+            // beacon intervals divided by the number of nodes
+            // transmitting, before it hears anything at all.
+            hop_channels: 1,
             hop_step_khz: 500,
             hop_dwell_ms: 1_000,
             address: 1,
@@ -1454,17 +1475,26 @@ mod tests {
         assert_eq!(parse("listen_ms = 900").unwrap(), RadioConfig::default());
     }
 
-    /// Hopping is on by default, with the plan the 902-928 MHz band asks
-    /// for, and every key of it is bounded.
+    /// The default is one channel with the slot clock running, and every
+    /// key of the plan is bounded. One channel is a plan, not the absence
+    /// of one: it still cuts slots into turns. Zero is the absence of one.
     #[test]
-    fn hopping_is_the_default_and_bounded() {
+    fn the_default_is_one_channel_with_a_clock() {
         let cfg = RadioConfig::default();
-        assert_eq!((cfg.hop_channels, cfg.hop_step_khz, cfg.hop_dwell_ms), (50, 500, 1000));
-        assert!(crate::hop::Plan::from_config(&cfg).is_some());
+        assert_eq!((cfg.hop_channels, cfg.hop_step_khz, cfg.hop_dwell_ms), (1, 500, 1000));
+        let plan = crate::hop::Plan::from_config(&cfg).expect("one channel is still a plan");
+        // Nowhere to hop to: every slot is frequency_hz itself.
+        assert_eq!(plan.span_hz(), (cfg.frequency_hz, cfg.frequency_hz));
+        for slot in 0..8 {
+            assert_eq!(plan.frequency_for_slot(slot), cfg.frequency_hz);
+        }
+        // But the turns are there, which is the point of keeping it.
+        assert!(plan.sub_slots >= 2);
 
         let off = parse("hop_channels = 0").unwrap();
         assert_eq!(off.hop_channels, 0);
         assert!(crate::hop::Plan::from_config(&off).is_none());
+        assert_eq!(parse("hop_channels = 50").unwrap().hop_channels, 50);
 
         assert_eq!(parse("hop_channels = 64").unwrap().hop_channels, 64);
         assert_eq!(parse("hop_channels = 256"), Err(ConfigError::OutOfRange(1)));
@@ -1608,7 +1638,7 @@ mod tests {
         };
         assert_eq!(cfg.time_on_air_us(13), 46_336);
         assert_eq!(cfg.beacon_airtime_us(), 46_336);
-        cfg.hop_channels = 50;
+        cfg.hop_channels = 1;
         assert_eq!(cfg.beacon_airtime_us(), 51_456);
 
         // The shipped default (SF12/BW500) beacon: ~289 ms. Shorter than the
@@ -1900,13 +1930,13 @@ mod tests {
         // reads back as pinging on.
         assert_eq!(old.ping_interval_s, 20);
         assert_eq!(
-            RadioConfig { hop_channels: 50, ping_interval_s: 5, ..old },
+            RadioConfig { hop_channels: 1, ping_interval_s: 5, ..old },
             RadioConfig { beacon_interval_s: 20, ..RadioConfig::default() }
         );
         // A blob with the plan but not the ping interval: hopping as sent,
         // ping on the beacon interval.
         let hop_only = RadioConfig::decode(&good[..RADIO_CONFIG_LEN_HOP]).unwrap();
-        assert_eq!(hop_only.hop_channels, 50);
+        assert_eq!(hop_only.hop_channels, 1);
         assert_eq!(hop_only.ping_interval_s, 20);
         // Cut inside a field, the field is absent rather than half-read.
         let cut = RadioConfig::decode(&good[..RADIO_CONFIG_LEN - 1]).unwrap();

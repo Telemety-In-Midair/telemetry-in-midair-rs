@@ -22,8 +22,11 @@ fn list<I: IntoIterator<Item = T>, T: std::fmt::Display>(items: I) -> String {
 }
 
 fn main() {
-    let cfg = RadioConfig::default();
-    let plan = Plan::from_config(&cfg).expect("hopping is the default");
+    // Fifty channels, not the one-channel default: the simulator's
+    // scenarios hop, and vectors from a plan with nowhere to hop to would
+    // check the permutation against a column of zeroes.
+    let cfg = RadioConfig { hop_channels: 50, ..RadioConfig::default() };
+    let plan = Plan::from_config(&cfg).expect("a plan with channels is a plan");
     let mut out = String::from("{\n");
 
     out += &format!(

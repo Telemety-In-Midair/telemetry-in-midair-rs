@@ -24,8 +24,12 @@
 //! config the receiver retunes at every slot boundary of the network's
 //! clock ([`midair_proto::hop`]), a transmit is held to this node's turn of
 //! the slot's window and stamped with that clock on its way out, and every
-//! frame heard is offered to the clock as a reference. Without one, nothing
-//! here moves off `frequency_hz`.
+//! frame heard is offered to the clock as a reference. Without a plan at
+//! all, none of that runs and nothing here moves off `frequency_hz`.
+//!
+//! The default plan is one channel wide, so by default the retune is a
+//! no-op and everything else - the clock, the turns, the sync word - is
+//! what the plan is there for.
 //!
 //! Two timing details the clock leans on. The sync word describes the
 //! instant the preamble leaves the antenna, not the instant the command
@@ -493,8 +497,12 @@ impl<'d> Sx1262Driver<'d> {
         }
     }
 
-    /// Whether the radio is hopping at all.
-    pub fn hopping(&self) -> bool {
+    /// Whether the node is on the network's schedule: a hop plan, and so a
+    /// slot clock, turns by address and a sync word on every frame. True on
+    /// the default one-channel plan, where nothing ever retunes - the
+    /// schedule is the part that is always worth having, and the hopping is
+    /// what `hop_channels` above 1 adds to it.
+    pub fn scheduled(&self) -> bool {
         self.hop.is_some()
     }
 

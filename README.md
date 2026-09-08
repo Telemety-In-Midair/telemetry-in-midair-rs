@@ -106,7 +106,7 @@ bandwidth_khz = 500        # 62|125|250|500 (500)
 coding_rate = 5            # 4/5..4/8 (5)
 power_dbm = 22             # -9..22 (22)
 rx_boost = true            # boosted RX gain (true)
-hop_channels = 50          # channels to hop across, 0 = single channel (50)
+hop_channels = 1           # channels in the plan; 1 = slot clock, no hop (1)
 hop_step_khz = 500         # channel spacing, 25-5000 (500)
 hop_dwell_ms = 1000        # time on each channel, 100-10000 (1000)
 dcdc_enabled = true        # internal DC-DC instead of LDO (true)
@@ -174,20 +174,23 @@ duty cycle and the board's name, since both records live in `nvs`.
 
 ### Modulation
 
-The default is SF12 at 500 kHz, hopping across fifty 500 kHz channels that
-fill 902-928 MHz, one second on each.
+The default is SF12 at 500 kHz on a single carrier at 915 MHz, with the
+network's slot clock running under it.
 
-That band gives a transmitter two ways to be legal. A 500 kHz signal counts
-as a digital modulation and may sit on one channel indefinitely, with no
-dwell or duty cycle ceiling. Anything narrower has to hop: at least 50
-channels, no more than 0.4 s on any one of them per 20 s, and receivers
-hopping in step with the sender. Hopping is the default here for what that
-rule does *not* say. The 0.4 s is per visit, a hopping node visits each
-channel once a cycle, and nothing caps how often it transmits - so where a
-single channel made the beacon interval a trade of shared air time against
-staleness, a hopping node may transmit every slot, and `interval_s = 1` is
-a legal setting. The other thing hopping buys is that a fade on one channel
-costs one beacon rather than every beacon.
+That band gives a transmitter two ways to be legal, and the default takes
+the simpler one. A 500 kHz signal counts as a digital modulation and may
+hold one carrier indefinitely, with no dwell or duty cycle ceiling, so
+`interval_s = 1` is legal without hopping anywhere. Anything narrower has
+to hop: at least 50 channels, no more than 0.4 s on any one of them per
+20 s, and receivers hopping in step with the sender.
+
+Hopping is therefore a setting rather than the default. Raising
+`hop_channels` buys two things - the narrower modulations, and diversity,
+since a fade or an interferer parked on one carrier then costs one beacon
+in `hop_channels` rather than every beacon. It does not buy link budget:
+the 0.4 s dwell caps time on air, time on air is what buys sensitivity,
+and the best a legal hopped plan manages against the default is about a
+decibel (SF10 at 125 kHz, 330 ms on air). What it costs is below.
 
 SF12 at 500 kHz keeps the frame inside a slot. The default beacon is 289 ms
 on air, and the same frame at BW125 is 1.15 s - past the 0.4 s a visit may
@@ -198,20 +201,28 @@ still sent, since receivers hold their hop for a frame in progress, but it
 is one channel held longer than a hop is meant to be.
 
 Somewhere the band rules differ - EU 868, say, where there is no minimum
-bandwidth and the constraint is a duty cycle - `hop_channels = 0` puts the
-node on `frequency_hz` alone, and `spreading_factor = 9`,
-`bandwidth_khz = 62` and `power_dbm = 14` get the narrow modulation back.
+bandwidth and the constraint is a duty cycle - `spreading_factor = 9`,
+`bandwidth_khz = 62` and `power_dbm = 14` get the narrow modulation back,
+and `hop_channels = 50` makes it legal where hopping is what is asked for.
 
-### Frequency hopping
+### The slot clock
 
 Every node keeps a slot clock: time cut into `hop_dwell_ms` slots, and in
-slot `s` every node is on the `s mod 50`-th channel of a permutation of all
-fifty, reshuffled every cycle of fifty slots from the cycle number. A node
-that beacons every slot uses each channel once a cycle; one that beacons
-every twentieth slot still lands somewhere different each time, because the
-order under it changes. The reshuffle is also what lets two nodes that do
-not agree on the time find each other at all: their channels coincide in
-about one slot in fifty, where a fixed order at a fixed offset never meets.
+slot `s` every node is on the `s mod n`-th channel of a permutation of all
+`n`, reshuffled every cycle of `n` slots from the cycle number. At the
+default `hop_channels = 1` that permutation has one entry and nothing ever
+retunes; what is left is the clock, which is what gives each node its own
+turn to transmit in. `hop_channels = 0` is the other setting, and it is
+not the same one: it takes the clock away with the plan, leaving each node
+on its own interval with random jitter - enough for one transmitter, not
+for two.
+
+With `hop_channels` raised, a node that beacons every slot uses each
+channel once a cycle; one that beacons every twentieth slot still lands
+somewhere different each time, because the order under it changes. The
+reshuffle is also what lets two nodes that do not agree on the time find
+each other at all: their channels coincide in about one slot in `n`, where
+a fixed order at a fixed offset never meets.
 
 The clock has three sources, in order of trust, and every frame says which
 its sender is on:
@@ -235,14 +246,20 @@ that gets a fix back outranks everyone again at once. Crystal drift is a
 few milliseconds per ten minutes, against a 100 ms guard at each end of the
 slot, so an aged clock is still a usable one.
 
-What all this costs is the join. A node that knows nobody's clock hears the
-network only when its channel happens to coincide, so it waits on average
-`hop_channels x interval / nodes transmitting` seconds - 50 s with one node
-beaconing every second, 250 s if that node has no fix and is pinging every
-five. A node with a fix never waits, and a node that has synced once stays
-synced through fix loss, a config push, a standby and a brownout of the
-radio. The base station on a desk is the case to know about: give it a
-fix, or a short interval on the nodes it is waiting for.
+What hopping costs is the join, and it is why the default plan is one
+channel wide. A node that knows nobody's clock hears the network only when
+its channel happens to coincide, so it waits on average `hop_channels x
+interval / nodes transmitting` seconds - 50 s across fifty channels with
+one node beaconing every second, 250 s if that node has no fix and is
+pinging every five. It goes on paying after the join, too: a follower is a
+stratum below and re-anchors on what it hears, and every disagreement about
+where a slot began puts it on the wrong channel for a frame. In simulation
+a fixless listener loses about a quarter of the traffic that way across
+fifty channels and none of it across one. A node with a fix never waits,
+and a node that has synced once stays synced through fix loss, a config
+push, a standby and a brownout of the radio. The base station on a desk is
+the case to know about on a hopping network: give it a fix, or a short
+interval on the nodes it is waiting for.
 
 On the air, nodes take turns inside a slot. The window (the slot less a
 100 ms guard at each end) is cut into as many lean beacons as fit back to
@@ -267,9 +284,11 @@ telemetry characteristic reports both to the app's Status page.
 the receiver, the GPS UART, the card and the BLE notifier - and
 `docs/RADIO-AUDIT.md` is what it found; `pixi run radio-sim` runs it.
 
-None of this is a certification. The plan follows the shape of the band's
-hopping rule - fifty channels, each used equally on average, receivers in
-step - but whether a given board and antenna comply is a measurement.
+None of this is a certification. At the default the node holds one 500 kHz
+carrier, which is the band's digital-modulation route rather than its
+hopping one; raised to fifty channels the plan follows the shape of the
+hopping rule - each channel used equally on average, receivers in step.
+Whether a given board and antenna comply either way is a measurement.
 
 ### Beacon payload
 
