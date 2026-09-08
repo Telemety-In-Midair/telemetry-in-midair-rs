@@ -142,3 +142,15 @@ rides inside every frame - and the causes were elsewhere:
 Two-node delivery in the model went from 76% to 99.6-100% with zero
 overlaps, GPS sentence loss from 11% to 0%, and phone position updates
 from 208 to 300 per 300 s.
+
+## State space testing (2026-09-08)
+
+`explore/` is an exhaustive state-space explorer; `proto/` carries the
+serve loop, the hardware posture, the request set and the receive gate as
+host-testable machines the firmware drives; `proto/tests/statespace_*.rs`
+walk the composed board, the gate and the roster. Nine firmware changes
+came out of it (`docs/STATESPACE.md`), all unflashed.
+
+The app's Radio page band rule keys on `channels > 1` rather than on a
+plan existing, so the one-channel default reads as the single carrier it
+is. Done in `gps-gui-rs`.

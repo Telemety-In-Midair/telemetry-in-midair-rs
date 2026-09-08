@@ -106,14 +106,17 @@ impl Default for Limits {
 
 /// An invariant that did not hold.
 #[derive(Clone, Debug)]
-pub struct Violation<E> {
+pub struct Violation<S, E> {
     /// What the check said.
     pub what: String,
-    /// Index of the state the violation was found in.
+    /// Index of the state the violation was found in - for a transition
+    /// check, the state the offending event was taken from.
     pub state: usize,
-    /// The event that led there, for a transition check; `None` for a
-    /// state check, whose trace already ends in the offending state.
-    pub event: Option<E>,
+    /// For a transition check, the event and the state it led to. Kept
+    /// here rather than looked up, because the state it led to may have
+    /// been reached first by some other path, whose trace would not show
+    /// the step that broke the rule.
+    pub step: Option<(E, S)>,
 }
 
 /// Everything an exploration found. States are numbered in the order they
@@ -127,7 +130,7 @@ pub struct Explored<M: Machine> {
     /// Successor indices per state, deduplicated.
     succ: Vec<Vec<usize>>,
     transitions: usize,
-    violation: Option<Violation<M::Event>>,
+    violation: Option<Violation<M::State, M::Event>>,
     truncated: bool,
 }
 
@@ -159,7 +162,7 @@ pub fn explore_with<M: Machine>(machine: &M, limits: Limits) -> Explored<M> {
             out.violation = Some(Violation {
                 what,
                 state: i,
-                event: None,
+                step: None,
             });
             return out;
         }
@@ -175,16 +178,10 @@ pub fn explore_with<M: Machine>(machine: &M, limits: Limits) -> Explored<M> {
             let to = machine.step(&from, &event);
             out.transitions += 1;
             if let Err(what) = machine.check_step(&from, &event, &to) {
-                // The offending state may be new; record it so the trace
-                // can end in it.
-                let j = match index.get(&to) {
-                    Some(&j) => j,
-                    None => out.push(&mut index, to, Some((i, event.clone())), out.depth[i] + 1),
-                };
                 out.violation = Some(Violation {
                     what,
-                    state: j,
-                    event: Some(event),
+                    state: i,
+                    step: Some((event, to)),
                 });
                 return out;
             }
@@ -200,7 +197,7 @@ pub fn explore_with<M: Machine>(machine: &M, limits: Limits) -> Explored<M> {
                         out.violation = Some(Violation {
                             what,
                             state: j,
-                            event: None,
+                            step: None,
                         });
                         return out;
                     }
@@ -258,8 +255,26 @@ impl<M: Machine> Explored<M> {
         self.truncated
     }
 
-    pub fn violation(&self) -> Option<&Violation<M::Event>> {
+    pub fn violation(&self) -> Option<&Violation<M::State, M::Event>> {
         self.violation.as_ref()
+    }
+
+    /// The violation as a report: the trace to where it was found, and for
+    /// a transition check the step that broke the rule.
+    pub fn format_violation(&self, machine: &M) -> Option<String> {
+        let v = self.violation.as_ref()?;
+        let mut out = format!(
+            "state space violation: {}\n  after {} events:\n{}",
+            v.what,
+            self.depth[v.state] + usize::from(v.step.is_some()),
+            self.format_trace(machine, v.state)
+        );
+        if let Some((event, to)) = &v.step {
+            let n = self.depth[v.state] + 1;
+            let _ = writeln!(out, "  {n:>3}. {event:?}");
+            let _ = writeln!(out, "       -> {}", machine.describe(to));
+        }
+        Some(out)
     }
 
     /// Every state reached, in discovery order.
@@ -356,13 +371,8 @@ impl<M: Machine> Explored<M> {
     /// Panic with the shortest trace if an invariant failed or the walk was
     /// cut short. Returns `self` otherwise, so checks can be chained.
     pub fn assert_ok(&self, machine: &M) -> &Self {
-        if let Some(v) = &self.violation {
-            panic!(
-                "state space violation: {}\n  after {} events:\n{}",
-                v.what,
-                self.depth[v.state],
-                self.format_trace(machine, v.state)
-            );
+        if let Some(report) = self.format_violation(machine) {
+            panic!("{report}");
         }
         assert!(
             !self.truncated,
@@ -545,7 +555,7 @@ mod tests {
         let x = explore(&m);
         let v = x.violation().expect("count 3 is reachable");
         assert_eq!(v.what, "count reached 3");
-        assert!(v.event.is_none());
+        assert!(v.step.is_none());
         let trace = x.trace(v.state);
         assert_eq!(trace.len(), 4);
         assert!(trace[1..].iter().all(|(e, _)| matches!(e, Some(Tick::Up))));
@@ -585,8 +595,11 @@ mod tests {
         }
         let x = explore(&NoBigJump);
         let v = x.violation().expect("the first Up jumps by two");
-        assert!(matches!(v.event, Some(Tick::Up)));
-        assert_eq!(x.trace(v.state).len(), 2);
+        assert!(matches!(v.step, Some((Tick::Up, Count(2)))));
+        assert_eq!(x.trace(v.state).len(), 1);
+        let report = x.format_violation(&NoBigJump).unwrap();
+        assert!(report.contains("after 1 events"), "{report}");
+        assert!(report.ends_with("-> Count(2)\n"), "{report}");
     }
 
     /// Liveness: a trap state from which the counter can never reset is

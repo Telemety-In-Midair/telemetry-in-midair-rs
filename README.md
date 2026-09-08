@@ -12,6 +12,7 @@ intent and `ARCHITECTURE.md` for the UML views.
 |-|-|-|
 | `proto/` | Shared no_std protocol crate: LoRa payloads, BLE extensions, `RADIO.CFG` parser, USB bulk framing. Host-testable (`cargo test`). | any |
 | `firmware/` | Wio-S3 firmware (embassy + trouble BLE): radio, GPS, SD and the GATT service. | `xtensa-esp32s3-none-elf` (`esp` channel) |
+| `explore/` | `midair-explore`: an exhaustive state-space explorer, no dependencies. A dev-dependency of `proto/` and of the app; `proto/tests/statespace_*.rs` walk the serve loop, the hardware posture, the receive gate and the roster with it. See `docs/STATESPACE.md`. | host |
 | `tools/` | Host tools (Python/pixi): push a radio config, push a firmware image, read a board's BLE address, simulate the radio network. | host |
 | `docs/` | Deep dives and history: the power investigation and its audit, the port record, the module datasheet, the V1 board's issues. | - |
 
@@ -27,7 +28,8 @@ channel rather than `stable`:
 # once per machine - provides the `esp` channel and the Xtensa target
 espup install
 
-# protocol tests (host)
+# protocol tests (host), the state space models included - the composed
+# board model takes about twenty seconds
 cd proto && cargo test
 
 # firmware: builds, flashes over USB Serial/JTAG, and stays on the console

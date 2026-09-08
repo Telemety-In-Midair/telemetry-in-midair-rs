@@ -68,6 +68,27 @@ Two things the first bench run of the modes changed (2026-08-31):
 
 ## Bench work
 
+**Flash the state space work.** `docs/STATESPACE.md` lists nine changes the
+exhaustive models forced, none of them run on a board: the serve loop and
+the hardware task now drive `session::Serve` and `posture::Posture`, the
+request queue is a coalescing set, the receiver no longer retunes on the
+one-channel default, and a mode commanded over an override flag lands on
+the flag. Watch for: `tracking: node N (...), gps and radio up` after a
+`CFG_MODE tracking`; `radio: standby` / `gps: backup mode` only while
+tracking; a wake check that a phone connects to coming up `promoted to
+idle`; and `sleep: park did not finish in time` never printing on a
+commanded store.
+
+**Every state, on a bench.** The models say what the firmware decides;
+what they cannot say is what the hardware does with it. The three places
+to look are the ones where the model abstracts: a deep sleep entered while
+a transmit is in flight (the park waits it out - check the meter afterwards
+for a radio left in receive), a config push while the radio is in standby
+(the apply re-inits the radio and the posture puts it back), and a
+`CFG_GPS_SLEEP=0` with the radio in standby (the receiver should be polled
+and report a fix).
+
+
 **Measure the BLE modem sleep.** It is implemented now - a port of
 ESP-IDF's sequence into the vendored esp-radio, since upstream ships the
 callbacks as `todo!()` - and not a milliamp of it has been read. Flash the
@@ -127,16 +148,6 @@ describe. Watch the channel index move in the status line, and time a base
 station with no fix from boot to first frame - the model says 61 s there
 against 4 s at the default, and that gap is the whole argument for the
 default being what it is.
-
-The app's Radio page applies the wrong band rule to the new default.
-`gps-gui-rs/src/radio.rs`, `airtime()`: any plan at all takes the
-`HopVisit` branch and gets a 400 ms per-visit budget, but a one-channel
-plan at 500 kHz has no dwell limit - it is a digital modulation, not a
-hopper. Nothing shows at the default beacon (289 ms); add altitude and
-speed to `fields` and the page warns about a frame that is legal. The
-branch needs to key on `plan.channels > 1` rather than `plan.is_some()`,
-with a one-channel plan falling through to the existing bandwidth test.
-Separate repo, so a separate commit.
 
 Price hopping against real interference. It is the one thing the new
 default gives up and the simulator has nothing to say about it: no

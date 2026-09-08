@@ -914,6 +914,182 @@ And one that does nothing here: `PFLAG_PWR_OFF` and `Action::Rail` are the
 old board's GPS/LoRa rail switch. This carrier has no such rail, so the
 firmware logs the request and honors nothing.
 
+## The state space, walked
+
+Everything above describes what the board is meant to do. This is how the
+parts that decide it are checked against every ordering of what can happen
+to them - not the timing, which `tools/radio_sim.py` models, but the
+discrete states: which mode the hardware is in against which the settings
+report, what a request does when it lands between a park and a sleep,
+whether a wake check can be left dark for good.
+
+The decisions live in `midair-proto` as values with a `step`, and the
+firmware and the app drive them. `explore/` (`midair-explore`) walks every
+reachable state of a model built from those values, breadth first, checks
+an invariant in each, and stops at the first violation with the shortest
+trace that produces it - which is what makes a violation a bug report
+rather than a log. Because the machines are the code the firmware runs,
+a new mode, request or effect that is not handled fails to compile before
+it fails to explore; the models are in `proto/tests/statespace_*.rs` and
+`gps-gui-rs/src/ble/statespace.rs`, and `docs/STATESPACE.md` is the
+report.
+
+```mermaid
+classDiagram
+    direction LR
+
+    class Machine {
+        <<trait, midair-explore>>
+        initial() states
+        events(state) enabled events
+        step(state, event) state
+        check(state) invariant
+        check_step(from, event, to)
+    }
+    class Explored {
+        breadth first, every state once
+        shortest trace to a violation
+        assert_always_reachable() liveness
+        assert_some() coverage
+        gantt(trace)
+    }
+    Machine <.. Explored : explore()
+
+    class Serve {
+        <<session, proto>>
+        pass(now, stored) Pass
+        on_accept(now, Accepted) Step
+        on_session_end(now, sleep_now) Then
+    }
+    class Posture {
+        <<posture, proto>>
+        live, radio, gps, card
+        at_boot(mode, stored) Effects
+        on(Request, stored) Effects
+        consistent(stored) the rule
+        may_transmit()
+    }
+    class Requests {
+        <<posture, proto>>
+        one slot per kind, never drops
+        take() in a fixed order
+    }
+    class Dispatch {
+        <<session, proto>>
+        dispatch(Action, stored)
+        request, sleep_now, mode_signal
+    }
+    class RxGate {
+        <<rxgate, proto>>
+        observe(now, Irq) Seen
+        in_progress(now)
+        may_leave(now, cap)
+    }
+    class Roster
+    class HopClock
+
+    class FirmwareModel {
+        <<proto tests>>
+        Serve x Posture x Requests
+        x signals x transfer x tx x sleep
+        693k states
+    }
+    class GateModel {
+        <<proto tests>>
+        every irq at every phase of a hold
+    }
+    class RosterModel {
+        <<proto tests>>
+        record, take, replay, age
+    }
+    class WorkerModel {
+        <<gps-gui-rs tests>>
+        presses x link x worker x UI
+        Inbox, Wanted, ConfigPush, stale()
+    }
+
+    FirmwareModel ..|> Machine
+    GateModel ..|> Machine
+    RosterModel ..|> Machine
+    WorkerModel ..|> Machine
+    FirmwareModel --> Serve
+    FirmwareModel --> Posture
+    FirmwareModel --> Requests
+    FirmwareModel --> Dispatch
+    GateModel --> RxGate
+    RosterModel --> Roster
+
+    class ServeTask {
+        <<firmware main.rs>>
+    }
+    class HardwareTask {
+        <<firmware main.rs>>
+        carries out Effects
+    }
+    class ConfigWrite {
+        <<firmware config.rs>>
+    }
+    class Sx1262Driver {
+        <<firmware radio.rs>>
+    }
+    class BleWorker {
+        <<gps-gui-rs ble/>>
+    }
+    ServeTask --> Serve : drives
+    HardwareTask --> Posture : drives
+    HardwareTask --> Requests : drains
+    ConfigWrite --> Dispatch
+    Sx1262Driver --> RxGate
+    Sx1262Driver --> HopClock
+    BleWorker --> WorkerModel : same Inbox and Wanted
+```
+
+What the composed firmware model holds in every state, and what it
+checks there:
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    [*] --> Advertising : cold boot, every persisted mode and flag set
+    Advertising --> Connected : connect (a wake check is promoted)
+    Advertising --> Advertising : handshake fizzled, hold the window
+    Advertising --> Parking : budget spent in stored or idle, or a nap commanded
+    Advertising --> Down : on period spent while tracking
+    Connected --> Advertising : disconnect, linger or idle re-arm
+    Connected --> Parking : the session that asked for a sleep ends
+    Down --> Advertising : off period over, or the mode moved
+    Down --> Parking : a nap commanded over the console
+    Parking --> Asleep : the hardware loop signals the park done
+    Asleep --> Advertising : timer wake, boot_mode decides the flavor
+
+    note right of Parking
+        Invariant: nothing arriving after
+        the park can raise the receiver
+        or the radio again.
+    end note
+    note right of Asleep
+        Invariant: radio asleep, GPS parked,
+        card parked, and the park finished.
+    end note
+    note left of Connected
+        Every write, over BLE or the console,
+        goes through session::apply and
+        session::dispatch; the loop drains
+        posture::Requests on its next pass.
+        Invariant once drained: the hardware
+        is in the mode the settings report,
+        with the receiver and the radio where
+        the override flags say.
+    end note
+```
+
+Time in that model is two-valued: an event happens either before the
+serve budget's deadline or at it, which is all the policy ever asks, so the
+deadline is one of a handful of values and the state stays finite.
+Liveness is checked as well as safety - from every state the board can
+still be advertised, commanded into tracking and put to sleep - which is
+how "the board is never left dark for good" is stated as a test.
+
 ## What the board forces on the firmware
 
 Board facts that firmware cannot work around, from the carrier design:
