@@ -332,7 +332,7 @@ pub const SFLAG_RADIO_STANDBY: u8 = 1 << 1;
 pub const SFLAG_GPS_SLEEP: u8 = 1 << 2;
 
 /// Everything the config characteristic can set, in one readable blob.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Settings {
     /// The radio is parked in standby ([`CFG_RADIO_STANDBY`]).
     pub radio_standby: bool,

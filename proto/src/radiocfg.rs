@@ -46,7 +46,7 @@ use crate::session::{Knob, KNOBS};
 /// transmit. Each saves the power the unused half costs, and on a tracker
 /// that is the larger saving by far: continuous RX draws current every
 /// second between beacons, while a beacon is milliseconds of TX.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Role {
     /// Originates its own broadcasts and receives everyone else's, but
     /// never retransmits. A network of nothing but leaves works: every
@@ -126,7 +126,7 @@ impl Role {
 /// below 2.5 V the switch's own truth table calls the part undefined. See
 /// [`RadioConfig::dio2_rf_switch`] for what an undefined switch does to a
 /// transmitting PA.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TcxoVolts {
     V1_6,
     V1_7,
@@ -185,7 +185,7 @@ impl TcxoVolts {
 }
 
 /// GPS receiver power mode (u-blox M10 `CFG-PM-OPERATEMODE`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PowerMode {
     /// Continuous tracking, lowest fix latency.
     Full,
@@ -229,7 +229,7 @@ impl PowerMode {
 
 /// GPS navigation dynamic model (u-blox M10 `CFG-NAVSPG-DYNMODEL`). Only the
 /// subset useful for this tracker is exposed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DynModel {
     Portable,
     Stationary,
@@ -294,7 +294,7 @@ impl DynModel {
 ///
 /// The constellation and power defaults match the M10 factory set, so an
 /// absent `[gps]` section leaves the module at its out-of-box behavior.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct GpsConfig {
     pub gps_enabled: bool,
     pub glonass_enabled: bool,
@@ -373,7 +373,7 @@ impl PowerConfig {
 }
 
 /// Parsed and validated radio configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct RadioConfig {
     /// RF frequency in Hz.
     pub frequency_hz: u32,
@@ -960,7 +960,7 @@ impl RadioConfig {
 
 /// Config parse/validation errors. The u32 is the offending line number
 /// (1-based) where one applies.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConfigError {
     /// Line is not `key = value`, a comment, a blank or a `[section]`.
     Syntax(u32),
@@ -977,7 +977,7 @@ pub enum ConfigError {
 // ---------------------------------------------------------------------------
 
 /// What a key takes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Kind {
     /// An integer inside inclusive bounds.
     Int { min: i64, max: i64 },

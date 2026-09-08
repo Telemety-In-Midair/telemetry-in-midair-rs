@@ -126,7 +126,7 @@ pub const TELEMETRY_LEN: usize = 19;
 /// Layout (little-endian): `last_rssi: i16, last_snr_cb: i16,
 /// secs_since_rx: u16, rx_count: u32, tx_count: u32, flags: u8, sats: u8,
 /// hop: u8, hop_channel: u8, parks_missed: u8`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Telemetry {
     /// RSSI of the last received LoRa packet (dBm), 0 if none yet.
     pub last_rssi: i16,
