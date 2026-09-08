@@ -73,10 +73,14 @@ const LORA_SPI_HZ: u32 = 8_000_000;
 const SD_SPI_HZ: u32 = 400_000;
 
 /// Stack for the second core's executor thread. The hardware task's own
-/// state lives in the task arena; this is what polling it uses - the card
-/// driver's frames and the console formatting are the deep parts.
+/// state lives in the task arena, but its future is built on this stack
+/// before it is moved there, so the stack has to hold the whole of
+/// `Hardware` once, beside the peripherals being moved into it; after that
+/// it is what polling uses - the card driver's frames and the console
+/// formatting are the deep parts. 32 KiB overflowed at the spawn when the
+/// constructor was an `async fn` holding the state twice.
 #[cfg(feature = "dual-core")]
-const APP_CORE_STACK: usize = 32 * 1024;
+const APP_CORE_STACK: usize = 48 * 1024;
 
 /// A value handed to the second core's start function, which has to be
 /// `Send`.
@@ -477,7 +481,11 @@ async fn main(spawner: Spawner) -> ! {
                 })
             },
         );
-        println!("hardware loop on the second core");
+        println!(
+            "hardware loop on the second core ({} B of state, {} KiB stack)",
+            core::mem::size_of::<hardware::Hardware>(),
+            APP_CORE_STACK / 1024
+        );
     }
     #[cfg(not(feature = "dual-core"))]
     spawner

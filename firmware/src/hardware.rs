@@ -17,7 +17,8 @@ use gps_proto::packet;
 use midair_proto::beacon::{Planner, Step};
 use midair_proto::ble::{self, Mode};
 use midair_proto::bulk;
-use midair_proto::posture::{Card, Effect, Posture, Radio, Request};
+use midair_proto::posture::{Card, Effect, Effects, Posture, Radio, Request};
+use midair_proto::session::Stored;
 use midair_proto::radiocfg::{self, RadioConfig};
 use midair_proto::roster::Report;
 use midair_proto::{link, lora};
@@ -188,35 +189,33 @@ pub struct Hardware {
 }
 
 impl Hardware {
-    /// Take the peripherals and raise what `boot` raises.
+    /// Take the peripherals. Synchronous, and the struct literal is the
+    /// return value, so the state is built once, in place: an `async fn`
+    /// that owned the peripherals and returned `Self` kept them twice over
+    /// in its future - the arguments and the value under construction -
+    /// and the task's future, which is built on the second core's stack
+    /// before it is moved into the arena, overflowed that stack.
     ///
     /// The card starts deferred and comes up on the first effect that
     /// mounts it, which a wake check never issues: it exists to ask whether
     /// anyone wants the board back, and that question needs BLE and
     /// nothing else. `cold` is whether this is a cold boot rather than a
-    /// deep-sleep wake.
-    pub async fn boot(
+    /// deep-sleep wake; `posture` is what [`Posture::at_boot`] said the boot
+    /// raises, whose effects [`boot`](Self::boot) then carries out.
+    pub fn new(
         lora: Sx1262Driver<'static>,
         gps: Gps<'static>,
         mut sdlog: SdLog<'static>,
         j5: Option<J5>,
         d5: Output<'static>,
         d2: Output<'static>,
-        boot: Mode,
+        posture: Posture,
         cold: bool,
     ) -> Self {
         sdlog.defer();
         let cfg = RadioConfig::default();
         let now_ms = Instant::now().as_millis();
-        let stored = settings::get();
-        // What this boot raises, which is the whole difference between the
-        // flavors: a wake check nothing, idle the card, tracking and
-        // listening everything - and the two override flags on top of
-        // that, which are the settings that survive a deep sleep re-applied
-        // because the wake that restored them is a fresh boot to everything
-        // else.
-        let (posture, boot_fx) = Posture::at_boot(boot, &stored);
-        let mut hw = Self {
+        Self {
             node: Node::new(lora, &cfg),
             gps,
             sdlog,
@@ -243,9 +242,19 @@ impl Hardware {
             idle_at_ms: now_ms,
             prev_pass_ms: now_ms,
             turn_warned: [0; 32],
-        };
+        }
+    }
+
+    /// Raise what the boot raises: the effects [`Posture::at_boot`] named,
+    /// which is the whole difference between the flavors - a wake check
+    /// nothing, idle the card, tracking and listening everything, and the
+    /// two override flags on top of that, which are the settings that
+    /// survive a deep sleep re-applied because the wake that restored them
+    /// is a fresh boot to everything else.
+    pub async fn boot(&mut self, boot: Mode, boot_fx: Effects, stored: &Stored) {
+        let now_ms = Instant::now().as_millis();
         for e in boot_fx {
-            hw.effect(e, now_ms).await;
+            self.effect(e, now_ms).await;
         }
 
         // The isolation build asks unconditionally, because the point is
@@ -262,7 +271,7 @@ impl Hardware {
             // answer too - and it costs a power cycle rather than a board
             // that cannot be recovered without one.
             const ISO_GPS_BACKUP_MS: u32 = 20_000;
-            hw.gps.sleep_for(ISO_GPS_BACKUP_MS);
+            self.gps.sleep_for(ISO_GPS_BACKUP_MS);
             status_println!(
                 "iso-gps-backup: GPS in backup for {} s - watch the meter, then the nmea count",
                 ISO_GPS_BACKUP_MS / 1000
@@ -272,11 +281,11 @@ impl Hardware {
         match boot {
             Mode::Tracking => status_println!(
                 "tracking: node {} ({}), {} Hz SF{} BW{}",
-                hw.cfg.address,
-                hw.cfg.role.as_str(),
-                hw.cfg.frequency_hz,
-                hw.cfg.spreading_factor,
-                hw.cfg.bandwidth_khz
+                self.cfg.address,
+                self.cfg.role.as_str(),
+                self.cfg.frequency_hz,
+                self.cfg.spreading_factor,
+                self.cfg.bandwidth_khz
             ),
             Mode::Idle => match (stored.idle_timeout(), stored.sleep_interval_s) {
                 // No timeout, or no cadence to sleep on, so there is
@@ -296,7 +305,7 @@ impl Hardware {
             ),
             Mode::Listening => status_println!(
                 "listening: node {} receiving, nothing transmitted, ble up throughout",
-                hw.cfg.address
+                self.cfg.address
             ),
         }
 
@@ -306,13 +315,12 @@ impl Hardware {
         // and the panel keeps its own state across the sleep, so lighting
         // it here would put the display's current back into every wake.
         if boot != Mode::Stored
-            && let Some(j) = hw.j5.as_mut()
+            && let Some(j) = self.j5.as_mut()
             && let Some(o) = j.oled.as_mut()
         {
-            oled::render(o, None, hw.cfg.address);
+            oled::render(o, None, self.cfg.address);
             o.flush(&mut j.i2c).await;
         }
-        hw
     }
 
     /// One effect the posture named, carried out.
@@ -1045,7 +1053,10 @@ pub async fn hardware_task(
     boot: Mode,
     cold: bool,
 ) {
-    let mut hw = Hardware::boot(lora, gps, sdlog, j5, d5, d2, boot, cold).await;
+    let stored = settings::get();
+    let (posture, boot_fx) = Posture::at_boot(boot, &stored);
+    let mut hw = Hardware::new(lora, gps, sdlog, j5, d5, d2, posture, cold);
+    hw.boot(boot, boot_fx, &stored).await;
     loop {
         let wait = hw.pass().await;
         Timer::after(wait).await;
