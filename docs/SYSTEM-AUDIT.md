@@ -287,12 +287,12 @@ real answer.
 
 ### 2.7 The app's `MyApp`
 
-4,688 lines with 22 BLE-related fields and a 300-line event drain inside
+4,688 lines with 27 BLE-related fields and a 300-line event drain inside
 `drain_sources`. Every page reads and writes those fields directly. The
 worker model's UI half (`press`, `drain`, the fence) is a model of this
 code rather than the code, for the same reason as the transports.
 
-**Recommendation.** A `BoardLink` struct in `src/board.rs` owning the 22
+**Recommendation.** A `BoardLink` struct in `src/board.rs` owning the 27
 fields with `fn on_event(&mut self, BleEvent)` and `fn press(&mut self,
 Intent)`, testable without egui. The model then drives it, and
 `app.rs` shrinks by a page.
