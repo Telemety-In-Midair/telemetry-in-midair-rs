@@ -29,16 +29,16 @@ Keep a USB cable on the first one.
 
 ## The two measurements the mode work is waiting on
 
-`docs/STATES-PLAN.md` is implemented except for its step 2, and step 2 is
-what decides whether the Stored mode is worth anything. Both readings need a
-board on a meter:
+The mode work (its plan is retired into `TODO_complete.md`) is implemented
+except for its measurements, and they are what decide whether the Stored
+mode is worth anything. Both readings need a board on a meter:
 
 1. **The GPS in backup, on its own.** `--features iso-gps-backup` puts the
    receiver into a timed PMREQ 20 s after boot; read the meter across the
    gap. That is the number the whole mode hangs on, because `V_BCKP` is
    unfed here and backup-on-`VCC`-alone has never been priced.
-2. **The Stored floor.** Set a cadence and let it sleep: `wio-set sleep 60`,
-   then `wio-set mode stored`. The park path now takes the receiver into
+2. **The Stored floor.** Set a cadence and let it sleep: `board-set sleep 60`,
+   then `board-set mode stored`. The park path now takes the receiver into
    backup, the radio into cold sleep and the card off the bus, and holds
    both NSS and UART TX across the sleep - so this reading is the floor
    itself rather than the old ~30 mA of ungated GPS. Low single-digit
@@ -68,12 +68,17 @@ Two things the first bench run of the modes changed (2026-08-31):
 
 ## Bench work
 
-**Flash the state space work.** `docs/STATESPACE.md` lists nine changes the
-exhaustive models forced, none of them run on a board: the serve loop and
-the hardware task now drive `session::Serve` and `posture::Posture`, the
-request queue is a coalescing set, the receiver no longer retunes on the
-one-channel default, and a mode commanded over an override flag lands on
-the flag. Watch for: `tracking: node N (leaf), gps up, radio up` after a
+**Flash the state space work and the audit's rework.** `docs/STATESPACE.md`
+lists the changes the exhaustive models forced and `docs/SYSTEM-AUDIT.md`
+the fourteen items that followed, none of them run on a board: the serve
+loop and the hardware task drive `session::Serve` and `posture::Posture`,
+the beacon is planned by `beacon::Planner`, the serve loop takes its
+commands from one channel, the settings are one knob table, the hardware
+loop is a struct in `hardware.rs`, and time is 64-bit throughout. Watch
+for: beacons landing in the node's own turn every second (`beacon
+position` on the verbose console, `rx` climbing by one a second on the
+other board); `serve: command queue full` never printing; `parks missed 0`
+on every wake line; `board-set` and `board-config` still answering. Then: `tracking: node N (leaf), gps up, radio up` after a
 `CFG_MODE tracking` - and `gps in backup` or `radio standby` in that line
 when the matching override flag is set; `radio: standby` / `gps: backup
 mode` only while tracking; a wake check that a phone connects to coming
@@ -95,7 +100,7 @@ ESP-IDF's sequence into the vendored esp-radio, since upstream ships the
 callbacks as `todo!()` - and not a milliamp of it has been read. Flash the
 default build and `--features iso-ble-no-modem-sleep`, and take both
 advertising and with a phone connected and idle. The difference is the
-answer to the largest open question in `docs/POWER-S3.md`, it is the number
+answer to the largest open question in `docs/POWER.md`, it is the number
 Idle's ~90 mA estimate rests on, and it is the one lever that works while a
 phone is attached. Watch that a connection survives it, too: the wake path
 that hands the controller an HCI packet is the part with the least margin.
@@ -112,8 +117,8 @@ returned-but-failed handshake is now held open for the retry
 (`Window::after_connect_attempt`); this one needs the host stack to say
 that a connection is being made.
 
-Then work the rest of `docs/POWER-AUDIT.md`, which is ordered by what it is
-worth. The board is measured - ~126 mA awake, a 60 mA floor with BLE dark -
+Then work the levers list at the end of `docs/POWER.md`, which is ordered
+by what it is worth. The board is measured - ~126 mA awake, a 60 mA floor with BLE dark -
 so the open items are levers, not unknowns. The next one is restoring the
 Wi-Fi clock and power-down bits after the BLE connector drops.
 

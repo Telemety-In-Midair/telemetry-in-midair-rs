@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Ask the board what it is, over its USB port.
 
-    pixi run wio-info
+    pixi run board-info
 
 Prints the firmware's protocol version, the board's BLE address and the
 name it advertises under. The address is the one thing about a board that is
@@ -11,13 +11,13 @@ instead.
 
 Nothing here is a scan: both are properties of the board, and reading them
 from the board is what makes it possible to tell two of them apart without
-connecting to either. `wio-set name` is what changes the name.
+connecting to either. `board-set name` is what changes the name.
 """
 
 import argparse
 import sys
 
-import wio_link as link
+import board_link as link
 
 
 def main() -> int:

@@ -3,11 +3,11 @@
 
 Sets this node's address without editing a file by hand:
 
-    pixi run wio-config --address 3
+    pixi run board-config --address 3
 
 Other keys go through --set, repeatably:
 
-    pixi run wio-config --address 3 --set role=tx_only --set interval_s=30
+    pixi run board-config --address 3 --set role=tx_only --set interval_s=30
 
 The board applies the config immediately and writes it to the SD card as
 RADIO.CFG, which is where it survives a power cycle. Nothing is reflashed.
@@ -26,7 +26,7 @@ pins to the firmware defaults - so with no --set the board ends up on stock
 settings plus the address given. If the board is running tuned radio
 settings, pass the file holding them with --file and edit that instead:
 
-    pixi run wio-config --file mynet.toml --address 3
+    pixi run board-config --file mynet.toml --address 3
 
 --file also takes the SD card's own RADIO.CFG, which is the same format.
 
@@ -36,14 +36,14 @@ several times the 1024-byte ceiling the firmware enforces, so this is
 what makes a push fit at all. To produce a card-ready RADIO.CFG without
 sending anything:
 
-    pixi run wio-config --address 3 --dry-run --save ../RADIO.CFG
+    pixi run board-config --address 3 --dry-run --save ../RADIO.CFG
 """
 
 import argparse
 import sys
 from pathlib import Path
 
-import wio_link as link
+import board_link as link
 
 DEFAULT_CONFIG = link.ROOT / "RADIO.example.toml"
 

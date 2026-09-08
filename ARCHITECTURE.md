@@ -29,9 +29,10 @@ classDiagram
     class HostTools {
         <<pixi, USB serial>>
         cargo run flashes
-        wio-config pushes a radio config
-        wio-ota pushes a firmware image
-        wio-info reads the BLE address
+        board-config pushes a radio config
+        board-set writes one setting
+        board-ota pushes a firmware image
+        board-info reads the BLE address
     }
     class RemoteNode {
         <<other board, 915 MHz>>
@@ -44,11 +45,18 @@ classDiagram
         BLE, LoRa, GPS, SD
     }
     class ServeTask {
+        <<ble.rs, duty_cycle and serve>>
         advertise()
         accept one central()
-        enter_deep_sleep()
+        one command channel in
+    }
+    class DeepSleep {
+        <<sleep.rs>>
+        park, wait twice, count a miss
+        hold NSS and UART TX
     }
     class GattSession {
+        <<ble.rs>>
         publish settings and radio config
         replay the roster on connect
         notify position, telemetry, remotes, log
@@ -59,11 +67,16 @@ classDiagram
         PING INFO BULK
     }
     class HardwareTask {
-        <<second core, own executor>>
+        <<hardware.rs, second core>>
+        Hardware: effect() pass()
         owns radio, gps, card and panel
-        beacon() poll() repeat() log()
+        beacon() receive() repeat() panel()
         applies a pushed config
-        blanks the panel for sleep
+    }
+    class GpsWatch {
+        <<gpsctl.rs>>
+        settings retry, fix and presence
+        self-wake detection
     }
     class GpsPump {
         <<first core>>
@@ -88,7 +101,8 @@ classDiagram
         <<snapshot, not a channel>>
         set_position() take_position()
         radio_busy() transfer_active()
-        roster, log lines, request queue
+        roster, log lines
+        posture requests, serve commands
     }
     class Xfer {
         <<one transfer, either transport>>
@@ -103,14 +117,28 @@ classDiagram
     class Settings {
         <<RTC RAM + nvs mirror>>
         survives deep sleep and a flat cell
+        the five durations from KNOBS
         name() advertised label
+        parks_missed()
     }
 
     class MidairProto {
         <<no_std, cargo test on host>>
     }
     class SessionPolicy {
+        KNOBS, the one duration table
         apply(write) Outcome
+        Serve: pass() on_accept() Next Then
+        dispatch() request, command
+    }
+    class BeaconPlanner {
+        <<beacon, proto>>
+        pass(now, allowed, rx busy, clock, plan) Step
+        sent(span)
+    }
+    class Dedup {
+        <<dedup, proto>>
+        SeenTable, RepeatQueue
     }
     class Roster {
         newest report per node
@@ -131,7 +159,9 @@ classDiagram
         turns by address
     }
     class RadioConfig {
+        KEYS, the one key table
         parse_bytes() encode()
+        write_example()
     }
     class LinkCodec {
         USB bulk framing only
@@ -143,12 +173,12 @@ classDiagram
 
     class Node {
         address, role, max hops
-        dedup by (src, id)
-        jittered repeat queue
+        broadcast() poll() send_due_repeat()
     }
     class Sx1262Driver {
         init() send() poll_recv()
         looks_reset() hop_tick()
+        schedule() the clock and the plan
     }
     class Sx1262Cmds {
         <<SPI + NSS + BUSY + DIO1 + NRST>>
@@ -169,6 +199,8 @@ classDiagram
     HostTools ..> Firmware : USB serial
 
     Firmware *-- ServeTask
+    Firmware *-- DeepSleep
+    ServeTask --> DeepSleep
     Firmware *-- GattSession
     Firmware *-- UsbTask
     Firmware *-- HardwareTask
@@ -177,6 +209,9 @@ classDiagram
     ServeTask --> Settings : sleep interval, window, name
     GattSession <--> State
     HardwareTask <--> State
+    HardwareTask --> GpsWatch
+    HardwareTask --> BeaconPlanner : once a pass
+    BeaconPlanner --> HopClock
     HardwareTask --> StatusOled : render(telemetry)
     HardwareTask --> Magnetometer : sample()
     Magnetometer --> StatusOled : heading, else GPS course
@@ -192,6 +227,8 @@ classDiagram
     GattSession --> Settings
 
     MidairProto *-- SessionPolicy
+    MidairProto *-- BeaconPlanner
+    MidairProto *-- Dedup
     MidairProto *-- Roster
     MidairProto *-- LoraCodec
     MidairProto *-- HopClock
@@ -203,6 +240,7 @@ classDiagram
     GattSession --> SessionPolicy
     State --> Roster
     HardwareTask --> Node
+    Node --> Dedup
     GpsPump --> HardwareTask : bytes
     GpsPump --> MaxM10
     HardwareTask --> MaxM10 : UBX commands
@@ -223,7 +261,10 @@ classDiagram
 `State` is a snapshot, not a channel, and deliberately: every consumer wants
 the latest position and never a backlog. It is also what removed the link
 protocol - the BLE session never touches hardware, it reads what the
-hardware task published and signals back through a `Request`.
+hardware task published and asks through a `Request`. The other direction
+is one channel: a config write on either transport sends the serve loop a
+`ServeCommand` - a nap, a moved mode - which whichever wait the loop is in
+picks up.
 
 ## The RF path, and why two registers are not tunable
 
@@ -482,7 +523,7 @@ straight to flash as it arrives.
 ```mermaid
 flowchart TB
     App["gps-gui-rs<br/>(BLE)"] --> Xfer
-    Host["wio-config / wio-ota<br/>(USB)"] --> Xfer
+    Host["board-config / board-ota<br/>(USB)"] --> Xfer
 
     Xfer{{"bulk::Transfer<br/>ops, sequencing, crc32<br/>owned by one transport"}}
 
@@ -605,9 +646,10 @@ board-changes list.
 The two commanded transitions exist because the timed ones only fire when a
 window expires with nobody connected - so without them the only way to sleep
 a board in front of you is to disconnect and wait. Sleeping is asked for
-through `state::SLEEP_NOW_SIGNAL` rather than done where it is requested:
-`apply_config` runs inside the GATT session with the ack still unbuilt, and
-the loop that owns the `Rtc` is the one that can wait for the link to finish.
+through the serve loop's command channel (`state::command`) rather than
+done where it is requested: `apply_config` runs inside the GATT session
+with the ack still unbuilt, and the loop that owns the `Rtc` is the one
+that can wait for the link to finish.
 
 Settings live in RTC fast RAM so a wake check costs no flash read, and are
 mirrored into the `nvs` partition so they also survive a flat cell. Only the
@@ -730,7 +772,7 @@ What the floor actually is has never been measured. The chip is microamps
 and the radio is 9.3 uA; the M10 in backup on `VCC` alone is unknown, since
 `V_BCKP` is unfed on this board and the timed-PMREQ experiment proves the
 domain survives rather than what it costs. That measurement is the one this
-whole mode hangs on - see `docs/STATES-PLAN.md`.
+whole mode hangs on - see `docs/POWER.md`.
 
 ```mermaid
 gantt
@@ -906,13 +948,13 @@ state the board is in:
 
 | Overlay | Set by | What it changes |
 |-|-|-|
-| **Radio standby** (`PFLAG_WIO_SLEEP`) | `CFG_WIO_SLEEP`, survives deep sleep | The hardware loop skips the GPS, the beacon and the receiver and polls at 20 Hz. The card, the panel, telemetry and the status line keep running, because a board that is idle rather than asleep is one somebody may be looking at. |
+| **Radio standby** (`PFLAG_RADIO_STANDBY`) | `CFG_RADIO_STANDBY`, survives deep sleep | The hardware loop skips the beacon and the receiver and polls at 20 Hz. The receiver, the card, the panel, telemetry and the status line keep running, because a board that is idle rather than asleep is one somebody may be looking at. |
 | **GPS backup** (`PFLAG_GPS_SLEEP`) | `CFG_GPS_SLEEP`, survives deep sleep | The receiver is parked with `UBX-RXM-PMREQ`. It loses its settings, so the loop re-pushes them when sentences resume. |
 | **Transfer active** | a bulk op over BLE or USB | Beacon held off, console quiet, and the transfer is bounded so a host that walks away cannot hold the board. |
 
-And one that does nothing here: `PFLAG_PWR_OFF` and `Action::Rail` are the
-old board's GPS/LoRa rail switch. This carrier has no such rail, so the
-firmware logs the request and honors nothing.
+The old board's GPS/LoRa rail switch (config id `0x10`) is gone from the
+policy: this carrier has no such rail, and the id is reserved and refused
+rather than accepted and ignored.
 
 ## The state space, walked
 
@@ -957,7 +999,7 @@ classDiagram
 
     class Serve {
         <<session, proto>>
-        pass(now, stored) Pass
+        pass(now, stored) Next
         on_accept(now, Accepted) Step
         on_session_end(now, sleep_now) Then
     }
@@ -977,7 +1019,15 @@ classDiagram
     class Dispatch {
         <<session, proto>>
         dispatch(Action, stored)
-        request, sleep_now, mode_signal
+        request, command
+    }
+    class BeaconPlanner {
+        <<beacon, proto>>
+        pass() Step
+    }
+    class Dedup {
+        <<dedup, proto>>
+        SeenTable, RepeatQueue
     }
     class RxGate {
         <<rxgate, proto>>
@@ -991,8 +1041,18 @@ classDiagram
     class FirmwareModel {
         <<proto tests>>
         Serve x Posture x Requests
-        x signals x transfer x tx x sleep
-        693k states
+        x commands x transfer x tx x sleep
+        605k states
+    }
+    class BeaconModel {
+        <<proto tests>>
+        every phase of every slot
+        x gates x frames x late passes
+    }
+    class DedupModel {
+        <<proto tests>>
+        every frame, path and repeat
+        against a ledger
     }
     class GateModel {
         <<proto tests>>
@@ -1005,26 +1065,35 @@ classDiagram
     class WorkerModel {
         <<gps-gui-rs tests>>
         presses x link x worker x UI
-        Inbox, Wanted, ConfigPush, stale()
+        the real Session over a FakeLink
+    }
+    class BoardLinkModel {
+        <<gps-gui-rs tests>>
+        presses x fresh events x the stale tail
     }
 
     FirmwareModel ..|> Machine
+    BeaconModel ..|> Machine
+    DedupModel ..|> Machine
     GateModel ..|> Machine
     RosterModel ..|> Machine
     WorkerModel ..|> Machine
+    BoardLinkModel ..|> Machine
     FirmwareModel --> Serve
     FirmwareModel --> Posture
     FirmwareModel --> Requests
     FirmwareModel --> Dispatch
+    BeaconModel --> BeaconPlanner
+    DedupModel --> Dedup
     GateModel --> RxGate
     RosterModel --> Roster
 
     class ServeTask {
-        <<firmware main.rs>>
+        <<firmware ble.rs>>
     }
     class HardwareTask {
-        <<firmware main.rs>>
-        carries out Effects
+        <<firmware hardware.rs>>
+        Hardware::effect carries out Effects
     }
     class ConfigWrite {
         <<firmware config.rs>>
@@ -1032,16 +1101,23 @@ classDiagram
     class Sx1262Driver {
         <<firmware radio.rs>>
     }
-    class BleWorker {
-        <<gps-gui-rs ble/>>
+    class Session {
+        <<gps-gui-rs ble/session.rs>>
+        step(link, inbox, report, now)
+    }
+    class BoardLink {
+        <<gps-gui-rs board.rs>>
+        press() on_event()
     }
     ServeTask --> Serve : drives
     HardwareTask --> Posture : drives
     HardwareTask --> Requests : drains
+    HardwareTask --> BeaconPlanner : once a pass
     ConfigWrite --> Dispatch
     Sx1262Driver --> RxGate
     Sx1262Driver --> HopClock
-    BleWorker --> WorkerModel : same Inbox and Wanted
+    Session --> WorkerModel : stepped with a FakeLink
+    BoardLink --> BoardLinkModel : pressed and fed
 ```
 
 What the composed firmware model holds in every state, and what it
@@ -1093,8 +1169,8 @@ how "the board is never left dark for good" is stated as a test.
 ## What the board forces on the firmware
 
 Board facts that firmware cannot work around, from the carrier design:
-there is no rail to cut (GPS and SD sit on +3V3, so `Action::Rail` logs and
-does nothing), GPS `EXTINT` is not routed (backup mode wakes on UART traffic
+there is no rail to cut (GPS and SD sit on +3V3, and the config id the old
+board switched one with is refused), GPS `EXTINT` is not routed (backup mode wakes on UART traffic
 instead), `TIMEPULSE` is unconnected so there is no PPS discipline, and
 there is no battery sense divider so telemetry cannot report cell voltage.
 

@@ -1,6 +1,6 @@
 //! The USB console: firmware text out, framed commands in.
 //!
-//! The host tools (`pixi run wio-config`) speak the same framed protocol
+//! The host tools (`pixi run board-config`) speak the same framed protocol
 //! over this port that an app speaks over BLE - see `midair_proto::link`,
 //! module `usb`. That framing was the ESP32-C6's UART link to the WIO-E5 as
 //! well as its console; one module has nothing to link to, so what survives

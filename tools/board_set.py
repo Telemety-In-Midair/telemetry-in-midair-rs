@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 """Write one board setting over USB, the same way the app writes it over BLE.
 
-    pixi run wio-set mode tracking   # gps up, beacons out, card logging
-    pixi run wio-set mode idle       # reachable, gps in backup, radio down
-    pixi run wio-set mode stored     # ack, then deep sleep on the cadence
-    pixi run wio-set mode listening  # gps and receiver up, nothing sent, ble up
-    pixi run wio-set ble-off 30      # BLE modem down 30 s between windows
-    pixi run wio-set ble-off 0       # never take it down (the default)
-    pixi run wio-set ble-on 20       # BLE up 20 s between those, while tracking
-    pixi run wio-set adv-window 10   # each wake check advertises 10 s
-    pixi run wio-set sleep 60
-    pixi run wio-set idle-timeout 600
-    pixi run wio-set idle-timeout 0  # idle never stores itself (the default)
-    pixi run wio-set gps-sleep 1
-    pixi run wio-set name sky-1      # advertises as ws3gps-sky-1
-    pixi run wio-set name ""         # back to the address-derived name
+    pixi run board-set mode tracking   # gps up, beacons out, card logging
+    pixi run board-set mode idle       # reachable, gps in backup, radio down
+    pixi run board-set mode stored     # ack, then deep sleep on the cadence
+    pixi run board-set mode listening  # gps and receiver up, nothing sent, ble up
+    pixi run board-set ble-off 30      # BLE modem down 30 s between windows
+    pixi run board-set ble-off 0       # never take it down (the default)
+    pixi run board-set ble-on 20       # BLE up 20 s between those, while tracking
+    pixi run board-set adv-window 10   # each wake check advertises 10 s
+    pixi run board-set sleep 60
+    pixi run board-set idle-timeout 600
+    pixi run board-set idle-timeout 0  # idle never stores itself (the default)
+    pixi run board-set gps-sleep 1
+    pixi run board-set name sky-1      # advertises as ws3gps-sky-1
+    pixi run board-set name ""         # back to the address-derived name
 
 `mode` is the one that means something on its own; the rest are knobs it
 scopes. Tracking and listening survive a power cycle, so a board put down in
@@ -22,7 +22,7 @@ either comes back in it - which is the point, since a brownout on the object
 is exactly when it must. Everything else comes back reachable, and stays so
 unless an idle timeout has been set.
 
-`mode stored` drops the USB port, exactly as `wio-sleep` does. That is the
+`mode stored` drops the USB port, exactly as `board-sleep` does. That is the
 command working.
 
 The board clamps every value and the ack carries what it actually stored,
@@ -47,7 +47,7 @@ import argparse
 import struct
 import sys
 
-import wio_link as link
+import board_link as link
 
 # name -> (config id, value width in bytes; 0 means an ASCII label). The
 # ids come from the protocol crate through wire_consts.json: the five

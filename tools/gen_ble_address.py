@@ -10,7 +10,7 @@ validates:
 
 Only needed to pin a board to a fixed address. Left unset, each board
 derives its own from its eFuse MAC, so two boards are already distinct out
-of the box; `pixi run wio-info` reads back whichever it ended up with.
+of the box; `pixi run board-info` reads back whichever it ended up with.
 
 Static-random (Bluetooth Core Spec): the two most-significant bits of the
 address are 1, and the remaining 46 bits are neither all-zero nor all-one.

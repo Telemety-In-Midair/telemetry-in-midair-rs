@@ -4,6 +4,17 @@
 end to end: every source file, the tools, the docs. Nothing here is a
 change; it is the list to work from, ranked at the end.*
 
+> **Status: all fourteen done, the same day.** Proto in `2b32cb5` (items
+> 3-6, 8-10), firmware in `f2e1383` (2, 7, 11, 14), the app in
+> gps-gui-rs `62e4888` (1, 13), the docs and the tool rename in the commit
+> after. `TODO_complete.md` has the summary; the names below are the ones
+> the audit found, not the ones the code has now - `Action::WioSleep` is
+> `RadioStandby`, `Pass`/`Then::Return` are `Next`/`Then::BleDown`, the
+> `effect!` macro is `Hardware::effect`, `main.rs` is the boot alone. Two
+> things the work added that the list did not ask for: the app's link
+> model found an ack left pending across a dropped link, and the vendored
+> crate's patch is checked by a script rather than by eye.
+
 The system has grown by accretion since the two-MCU board: a port that
 kept the old vocabulary, three modes added over a pair of sleep flags,
 hopping added over a fixed carrier and then defaulted back to one channel,

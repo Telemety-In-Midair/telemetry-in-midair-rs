@@ -6,7 +6,7 @@ without reading the whole log.
 ## Port to the Wio-S3
 
 Port parity with the two-MCU pair. The bulk transfer handler and the USB
-console `wio-config` needs; deep sleep with settings in RTC RAM and an nvs
+console `board-config` needs; deep sleep with settings in RTC RAM and an nvs
 mirror; the remote-node roster replay on connect; OTA through the ESP-IDF
 bootloader's two slots; per-board BLE addresses from the eFuse MAC with a
 `BLE_ADDRESS` build override.
@@ -44,7 +44,7 @@ controller.
 On by default, `--features iso-ble-no-modem-sleep` for the A/B. What it
 saves is not measured yet, which is why the bench list starts with it.
 
-## The three modes (docs/STATES-PLAN.md)
+## The three modes
 
 Stored / idle / tracking as one `CFG_MODE` setting, persisted in RTC RAM and
 mirrored to nvs (record version 5, settings blob version 5), replacing the
@@ -70,7 +70,7 @@ backup, and UART TX pad-held across the sleep alongside NSS so a floating
 edge cannot wake the receiver out of it. Wake checks no longer run
 `gps.configure`, which was waking the receiver on every single wake.
 
-`wio-set mode` and `wio-set idle-timeout` on the USB console; `idle_timeout_s`
+`board-set mode` and `board-set idle-timeout` on the USB console; `idle_timeout_s`
 in the card's `[power]` section.
 
 ## Listening, the tracker's own on period, and idle that stays idle
@@ -93,7 +93,7 @@ wanted.
 ## Board names
 
 Boards advertise as `ws3gps-<label>`, set by config id `0x19` over BLE or
-`wio-set name` over USB, with an unnamed board falling back to the tail of
+`board-set name` over USB, with an unnamed board falling back to the tail of
 its BLE address so two out of the same box are still told apart. The label
 is stored with the settings that decide reachability - RTC RAM mirrored to
 `nvs`, record version 6 - rather than on the card, because a wake check
@@ -154,3 +154,41 @@ came out of it (`docs/STATESPACE.md`), all unflashed.
 The app's Radio page band rule keys on `channels > 1` rather than on a
 plan existing, so the one-channel default reads as the single carrier it
 is. Done in `gps-gui-rs`.
+
+## The system audit, all fourteen items (2026-09-08)
+
+`docs/SYSTEM-AUDIT.md` read both repos end to end and ranked fourteen
+items; all fourteen are done, tests first.
+
+- **proto** (`2b32cb5`): one knob table (`session::KNOBS`) that the flash
+  record, the BLE blob, the config write, the `[power]` section and the RTC
+  copy are all laid out from; one key table (`radiocfg::KEYS`) that the
+  parser, the generated `RADIO.example.toml` and the app's editor agree by;
+  the serve loop's commands as one channel; `Next` and `Then` in place of
+  three enums; the rail and the two-MCU vocabulary gone (`CFG_RADIO_STANDBY`,
+  `Action::Knob`); `hop_channels = 0` retired so every config has a plan
+  and the second scheduler is gone; the dedup table and the repeat queue
+  in `proto::dedup`, walked; the mode x role matrix written down once
+  (`posture::on_air`); the tools' wire constants generated
+  (`tools/wire_consts.json`).
+- **firmware** (`f2e1383`): `main.rs` is the boot; the BLE side is
+  `ble.rs`, the hardware loop a `Hardware` struct in `hardware.rs` whose
+  `effect` method replaces the macro, the deep sleep `sleep.rs`, the
+  receiver's bookkeeping `gpsctl.rs`; the beacon planner is
+  `proto::beacon::Planner`, unit-tested for the regression it once had and
+  walked over every phase of every slot; the radio's hop is never an
+  `Option`; time is `u64` everywhere the loop keeps it; a sleep whose park
+  did not finish is retried once and counted (`parks_missed`); the vendored
+  esp-radio is `vendor/esp-radio.patch` against the 0.17.0 release with a
+  script that regenerates, applies and checks it.
+- **app** (`62e4888`): one `Session` over a `Link` trait for both
+  transports, with a characteristic table in place of two UUID dispatch
+  chains, and the state space model driving the real `Session`; the app's
+  link in `board::BoardLink` with `press` and `on_event`, walked over every
+  ordering of presses, fresh events and the stale tail of the session
+  before - which found an ack left pending across a dropped link keeping
+  the controls disabled after the reconnect.
+- **docs**: the README cut to a page, with `docs/RADIO.md`, `docs/BLE.md`
+  and `docs/HARDWARE.md` carrying what it held; `docs/POWER-S3.md` and
+  `docs/POWER-AUDIT.md` folded into `docs/POWER.md`; `docs/STATES-PLAN.md`
+  retired here; the tools renamed `board-*`.

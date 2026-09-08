@@ -207,9 +207,10 @@ gantt
 | Fix | Where |
 |---|---|
 | Turns by address; slot of the interval by address; `turns()` capacity; inter-turn guard | `proto/src/hop.rs` (`Plan::sub_slots`, `turn_slot`, `sub_slot_of`, `start_range_for`, `Clock::turn_due`, `tx_start`, `wait_for_window_ms`), `RadioConfig::hop_unit_airtime_us` |
-| Driver: turns, `tx_wait_ms`, staged hold, late-poll guard, warm oscillator, RF-start stamp, `shares_turn` | `firmware/src/radio.rs` |
-| Notifier waits | `firmware/src/bin/main.rs`, `gatt_session` |
-| Beacon re-plan, late-pass guard on GPS marks, shared-turn warning | `firmware/src/bin/main.rs`, `hardware_task` |
+| Driver: staged hold, late-poll guard, warm oscillator, RF-start stamp, `shares_turn`, `repeat_start` | `firmware/src/radio.rs` |
+| The beacon planned into the turn, re-planned when stale, kept across other nodes' slots | `proto/src/beacon.rs` (`Planner`), driven from `firmware/src/hardware.rs` |
+| Notifier waits | `firmware/src/ble.rs`, `gatt_session` |
+| Late-pass guard on GPS marks, shared-turn warning | `firmware/src/hardware.rs`, `firmware/src/gpsctl.rs` |
 | GPS byte pump | `firmware/src/gps.rs` (`pump`, `RX` pipe), spawned in `main` |
 | Second core | `firmware/src/bin/main.rs`, `dual-core` feature in `firmware/Cargo.toml` |
 | Radio page: turn fit and address capacity | `gps-gui-rs/src/radio.rs`, `src/app/ui/pages/radio.rs` |

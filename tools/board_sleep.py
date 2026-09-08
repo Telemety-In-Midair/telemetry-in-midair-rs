@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Put the board into deep sleep now, over its USB port.
 
-    pixi run wio-sleep                 # for the board's configured cadence
-    pixi run wio-sleep --seconds 30
+    pixi run board-sleep                 # for the board's configured cadence
+    pixi run board-sleep --seconds 30
 
 Every other route into deep sleep is indirect: the board sleeps when a
 wake-check advertising window expires with nobody connected, so proving on
@@ -21,7 +21,7 @@ including advertising continuously.
 import argparse
 import sys
 
-import wio_link as link
+import board_link as link
 
 
 def main() -> int:

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Push a firmware image to the board over its USB port, without a reflash.
 
-    pixi run wio-ota
+    pixi run board-ota
 
 With no arguments this builds the firmware in ../firmware, converts it to an
 ESP-IDF application image, and streams it into whichever OTA slot the board
@@ -10,7 +10,7 @@ the new slot and reboots into it.
 
 To send an image you already have:
 
-    pixi run wio-ota --image firmware.bin
+    pixi run board-ota --image firmware.bin
 
 That file must be an *application image*, not the ELF cargo produces -
 `espflash save-image --chip esp32s3 --flash-size 16mb <elf> <bin>` is the
@@ -24,7 +24,7 @@ built with rollback enabled reverts to the previous slot if that never
 happens, so an image that cannot start costs a reboot rather than a board.
 
 The transfer shares its protocol and its one-at-a-time guarantee with the
-config push, so this cannot run while `wio-config` is mid-transfer, over
+config push, so this cannot run while `board-config` is mid-transfer, over
 USB or over BLE.
 """
 
@@ -35,7 +35,7 @@ import sys
 import time
 from pathlib import Path
 
-import wio_link as link
+import board_link as link
 
 FIRMWARE = link.ROOT / "firmware"
 ELF = FIRMWARE / "target" / "xtensa-esp32s3-none-elf" / "release" / "wio-s3-gps"
