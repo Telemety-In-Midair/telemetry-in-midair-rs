@@ -48,6 +48,16 @@ board-set = "python board_set.py"
 # port disappears while it sleeps; that is the command working.
 board-sleep = "python board_sleep.py"
 
+# Reset a board to its defaults - the settings, the name and the radio
+# config backup gone, then a restart - or, with --flash, erase every byte of
+# flash and reflash the firmware:
+#   pixi run board-wipe
+#   pixi run board-wipe --flash
+# `espflash erase-flash` alone is not enough, because the settings also sit
+# in RTC RAM, which survives every reset short of a power cycle. The card
+# is never touched: pull it, or delete RADIO.CFG, to reset that too.
+board-wipe = "python board_wipe.py"
+
 # Simulate a few boards on the hop plan - the clock, the receiver, the GPS
 # UART, the card and the BLE notifier - and report what a receiver and a
 # phone see, before and after the fixes in docs/RADIO-AUDIT.md:

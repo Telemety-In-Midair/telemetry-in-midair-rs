@@ -33,6 +33,7 @@ classDiagram
         board-set writes one setting
         board-ota pushes a firmware image
         board-info reads the BLE address
+        board-wipe forgets the settings
     }
     class RemoteNode {
         <<other board, 915 MHz>>

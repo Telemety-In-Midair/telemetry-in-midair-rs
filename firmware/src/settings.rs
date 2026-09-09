@@ -13,7 +13,13 @@
 //!   whenever a write changes something that decides reachability.
 //!
 //! The magic word is what separates a real RTC RAM copy from whatever was
-//! in that memory at a cold boot; only a cold boot pays for the flash read.
+//! in that memory at a cold boot. The copy is trusted across a deep sleep
+//! and nothing else: RTC RAM also survives every reset short of a power
+//! cycle - the reset button, a panic, the reset a flashing tool issues -
+//! so a boot that is not a deep-sleep wake reads flash and takes what it
+//! finds, including nothing. Otherwise a board whose flash had just been
+//! erased came back up on the copy, name and all, and wrote it straight
+//! back into the flash that had been cleared.
 
 use midair_proto::ble::Mode;
 use midair_proto::session::{Stored, KNOBS};
@@ -197,21 +203,63 @@ pub fn parks_missed() -> u32 {
     }
 }
 
-/// Whether RTC RAM holds no copy, i.e. this is a cold boot rather than a
-/// deep-sleep wake.
-pub fn is_cold() -> bool {
+/// Whether RTC RAM holds no copy.
+fn is_cold() -> bool {
     MAGIC_WORD.load(Ordering::Relaxed) != MAGIC
 }
 
-/// On a cold boot, adopt whatever reached flash last. Returns what was
-/// restored, if anything.
-pub async fn restore() -> Option<Stored> {
-    if !is_cold() {
-        return None;
+/// Drop the RTC RAM copy. The next `get` reads defaults and the next `set`
+/// stamps a fresh copy, instrumentation zeroed.
+fn clear() {
+    MAGIC_WORD.store(0, Ordering::Relaxed);
+}
+
+/// What [`restore`] found to start the boot from.
+#[derive(Clone, Copy, Debug)]
+pub enum Restored {
+    /// A deep-sleep wake with its RTC RAM copy intact: nothing was read.
+    Kept,
+    /// Flash held a record, and it is the settings now.
+    Flash(Stored),
+    /// Flash held nothing, so the settings are defaults. `dropped_rtc` says
+    /// an RTC RAM copy from before the reset was there and was discarded
+    /// with them - which is what a flash erase followed by a reset looks
+    /// like from here.
+    Defaults { dropped_rtc: bool },
+}
+
+/// Adopt whatever reached flash last, unless this is a deep-sleep wake
+/// with its RTC RAM copy intact - the one case the copy is trusted over
+/// flash, since it may hold a mode an app set live that never goes to
+/// flash. Any other boot is a cold one as far as the settings go, whatever
+/// RTC RAM happens to remember.
+pub async fn restore(woke_from_sleep: bool) -> Restored {
+    if woke_from_sleep && !is_cold() {
+        return Restored::Kept;
     }
-    let saved = crate::flash::with_flash(|f| f.load_settings()).await??;
-    set(saved);
-    Some(saved)
+    let had_rtc = !is_cold();
+    match crate::flash::with_flash(|f| f.load_settings()).await.flatten() {
+        Some(saved) => {
+            set(saved);
+            Restored::Flash(saved)
+        }
+        None => {
+            clear();
+            Restored::Defaults {
+                dropped_rtc: had_rtc,
+            }
+        }
+    }
+}
+
+/// Forget everything this board stores about itself: the RTC RAM copy,
+/// and the settings record and the config backup in flash. Returns
+/// whether the flash records were erased; the RTC copy is gone either
+/// way. The caller restarts the board, which is what makes the loops
+/// forget what they had read.
+pub async fn wipe() -> bool {
+    clear();
+    crate::flash::with_flash(|f| f.wipe()).await.unwrap_or(false)
 }
 
 /// Mirror the current settings to flash. Best effort: see

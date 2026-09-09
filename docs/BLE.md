@@ -11,7 +11,8 @@ Same service UUID as the ESP32-C3 beacon this firmware grew out of, so
 gps-gui-rs discovers it unchanged - the app filters scans by service UUID,
 so a board's name is display text and renaming one cannot lose it. On top
 of the gps-proto position / config / ack characteristics the firmware adds
-telemetry (LoRa RSSI/SNR, counters, SD and fix flags, parks missed), remote
+telemetry (LoRa RSSI/SNR, counters, SD and fix flags, parks missed, the BLE
+link's own RSSI), remote
 node positions and pings, a status/log characteristic (notify + read), the
 board's name (read + notify), the current radio config (read + notify), and
 a bulk write characteristic carrying either a TOML config or a firmware
@@ -126,9 +127,10 @@ and `_`; anything else is rejected rather than sanitized.
 
 The label is stored with the settings that decide reachability - RTC RAM,
 mirrored to the `nvs` partition - rather than on the card, because a wake
-check advertises before anything has mounted one. It survives a deep sleep
-and a flat cell, and a board updated from firmware that predates names
-reads back as unnamed rather than as unreadable.
+check advertises before anything has mounted one. It survives a deep sleep,
+a reflash and a flat cell, and a board updated from firmware that predates
+names reads back as unnamed rather than as unreadable. `pixi run board-wipe`
+is what removes it, along with the rest of the settings; see below.
 
 Three surfaces carry it, and they catch up at different speeds:
 
@@ -261,8 +263,28 @@ identical boot banner.
 
 The mode, the five durations, the two flags and the name are held in RTC
 fast RAM and mirrored to the `nvs` flash partition, so they survive deep
-sleep *and* a flat battery. Flash is read only on a cold boot; wake checks
-run from the RTC RAM copy.
+sleep *and* a flat battery. Wake checks run from the RTC RAM copy; every
+other boot reads flash and takes what it finds.
+
+That second half matters more than it sounds. RTC RAM survives every reset
+short of a power cycle - the reset button, a panic, the reset a flashing
+tool issues - so an earlier firmware that trusted the copy whenever it was
+there came back from `espflash erase-flash` still named, and wrote the
+name straight back into the flash that had just been erased. Now only a
+deep-sleep wake keeps the copy. A boot after an erase prints `nvs: nothing
+stored, settings are defaults (an rtc copy from before the reset is
+dropped)`, which is the erase having stuck.
+
+### Wiping a board
+
+`pixi run board-wipe` sends the USB console's `WIPE` command: the board
+erases its settings record, its name and its radio config backup, drops the
+RTC RAM copy, acks, and restarts on its defaults. The firmware, the OTA
+slots and the card are untouched. `pixi run board-wipe --flash` erases every
+byte of flash instead and rebuilds and reflashes the firmware - the reset
+for a board that has been through several firmwares. Neither touches the SD
+card: a `RADIO.CFG` there is read at the next boot and wins, `[power]`
+section included.
 
 **Deep sleep has no wake source but the timer.** Nothing over the air can
 interrupt it: the radio is off, and there is no GPIO or button wake. The

@@ -42,6 +42,7 @@ USB_BULK_ACK = _WIRE["usb"]["bulk_ack"]
 USB_INFO = _WIRE["usb"]["info"]
 USB_SLEEP = _WIRE["usb"]["sleep"]
 USB_CFG = _WIRE["usb"]["cfg"]
+USB_WIPE = _WIRE["usb"]["wipe"]
 
 OP_BEGIN = _WIRE["bulk"]["begin"]
 OP_DATA = _WIRE["bulk"]["data"]
@@ -348,6 +349,30 @@ def sleep_now(ser: serial.Serial, secs: int, timeout: float = 2.0) -> int | None
     if len(payload) < 3 or payload[0] != USB_SLEEP:
         return None
     return int(struct.unpack("<H", payload[1:3])[0])
+
+
+def wipe(ser: serial.Serial, timeout: float = 3.0) -> bool | None:
+    """Tell the board to forget everything it stores about itself.
+
+    The settings record, the name and the radio config backup in flash, and
+    the RTC RAM copy of the settings that a reset alone never clears. The
+    board acks with whether the flash records were erased and then
+    restarts, which drops the USB device; the port coming back is the board
+    on its defaults. `None` means the board never acked.
+
+    The card is not touched. A `RADIO.CFG` on it is read again at the boot
+    that follows, so a board that keeps its radio config there keeps it.
+    """
+    ser.reset_input_buffer()
+    ser.write(build_frame(USB_WIPE, b""))
+    ser.flush()
+    frame, _ = read_frame(ser, {RESP_ACK}, timeout)
+    if frame is None:
+        return None
+    payload = frame[1]
+    if len(payload) < 2 or payload[0] != USB_WIPE:
+        return None
+    return payload[1] == 1
 
 
 def set_config(ser: serial.Serial, cfg_id: int, value: bytes,

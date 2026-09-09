@@ -235,16 +235,26 @@ async fn main(spawner: Spawner) -> ! {
         }
         _ => println!("ota: no update slots (single-app partition table)"),
     }
-    // Only a cold boot pays for the flash read - a wake check still holds
-    // its RTC RAM copy.
-    if let Some(saved) = settings::restore().await {
-        println!(
+    // Only a deep-sleep wake keeps its RTC RAM copy; every other boot reads
+    // flash and takes what it finds, so an erased flash is a board on
+    // defaults rather than one that remembers its name through the erase.
+    match settings::restore(woke_from_sleep).await {
+        settings::Restored::Kept => {}
+        settings::Restored::Flash(saved) => println!(
             "nvs: restored mode {}, sleep {} s, adv window {} s, flags {:#x}",
             saved.mode.as_str(),
             saved.sleep_interval_s,
             saved.adv_window(),
             saved.flags
-        );
+        ),
+        settings::Restored::Defaults { dropped_rtc } => println!(
+            "nvs: nothing stored, settings are defaults{}",
+            if dropped_rtc {
+                " (an rtc copy from before the reset is dropped)"
+            } else {
+                ""
+            }
+        ),
     }
 
     // What this boot raises. Three flavors and one decision, taken here

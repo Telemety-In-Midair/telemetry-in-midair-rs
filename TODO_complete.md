@@ -192,3 +192,20 @@ items; all fourteen are done, tests first.
   and `docs/HARDWARE.md` carrying what it held; `docs/POWER-S3.md` and
   `docs/POWER-AUDIT.md` folded into `docs/POWER.md`; `docs/STATES-PLAN.md`
   retired here; the tools renamed `board-*`.
+
+## The name that would not erase, and the app's scan (2026-09-09)
+
+- **RTC RAM is trusted only across a deep sleep.** `settings::restore`
+  takes the wake cause; a reset or a reflash reads flash and drops an RTC
+  copy that flash does not back. `espflash erase-flash` resets a board now.
+- **`pixi run board-wipe`** (`link::usb::WIPE`): settings, name and config
+  backup erased, RTC copy dropped, restart. `--flash` erases every byte and
+  reflashes. The card is left alone and the tool says so.
+- **The BLE link's RSSI in telemetry** (`Telemetry::ble_rssi`, a trailing
+  `i8`, older blobs still decode): the board asks its controller once per
+  notify tick, so the app can show a signal for a node that no longer
+  advertises. Done in `gps-gui-rs` alongside: the picker's scan runs beside
+  the link instead of ending it, "Any node" on the desktop matches live
+  sightings rather than the adapter's memory, Android scan refusals and the
+  five-starts-per-30-s limit are visible and waited out, and "Forget nodes"
+  clears the list plus bluez's records / Android's cached service table.

@@ -273,5 +273,4 @@ Confirm in app for stored mode.
 - Boot into idle.
 - Quick double flash on rx.
 - Log gps data to flash. Can load from usb or over BLE.
-- Show RSSI for BLE even when connected?
 - Link in status should reflect current BLE status.

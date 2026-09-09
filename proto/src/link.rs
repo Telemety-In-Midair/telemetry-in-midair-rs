@@ -64,6 +64,19 @@ pub mod usb {
     /// nothing but a USB cable, which is what a power measurement needs -
     /// the alternative is a phone for every knob.
     pub const CFG: u8 = 0x55;
+    /// Host -> board, no payload. The board forgets everything it stores
+    /// about itself - the settings record, the name and the radio config
+    /// backup in `nvs`, and the RTC RAM copy of the settings that a reset
+    /// alone does not clear - answers [`super::resp::ACK`]
+    /// (`[WIPE, ok u8]`, 1 when the flash records were erased) and then
+    /// restarts, which drops the USB device. The card is not touched: a
+    /// `RADIO.CFG` on it is read again at the boot that follows, as it is
+    /// at every cold boot.
+    ///
+    /// Exists because a full flash erase is not a full reset on this chip:
+    /// the settings live in RTC RAM as well as flash, and RTC RAM survives
+    /// every reset short of a power cycle. This command clears both.
+    pub const WIPE: u8 = 0x56;
 }
 
 /// Responses, following a command.
@@ -119,13 +132,17 @@ pub const TELEM_HOP_ON: u8 = 0x80;
 /// Mask of the stratum in [`Telemetry::hop`].
 pub const TELEM_HOP_STRATUM: u8 = 0x0F;
 
-pub const TELEMETRY_LEN: usize = 19;
+/// Length of the telemetry blob before [`Telemetry::ble_rssi`] was
+/// appended: the least a decoder accepts, so a board on that firmware still
+/// reports everything it has.
+pub const TELEMETRY_LEN_V1: usize = 19;
+pub const TELEMETRY_LEN: usize = TELEMETRY_LEN_V1 + 1;
 
 /// Periodic radio/GPS status, served over BLE (see [`crate::ble`]).
 ///
 /// Layout (little-endian): `last_rssi: i16, last_snr_cb: i16,
 /// secs_since_rx: u16, rx_count: u32, tx_count: u32, flags: u8, sats: u8,
-/// hop: u8, hop_channel: u8, parks_missed: u8`.
+/// hop: u8, hop_channel: u8, parks_missed: u8, ble_rssi: i8`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Telemetry {
     /// RSSI of the last received LoRa packet (dBm), 0 if none yet.
@@ -152,6 +169,11 @@ pub struct Telemetry {
     /// spent with the receiver, or the radio, still drawing - the one
     /// power failure that is otherwise invisible from the far side.
     pub parks_missed: u8,
+    /// The BLE link's signal as the board's controller measures it, in
+    /// dBm; 0 when there is no reading. A connected board stops
+    /// advertising, so this is the only signal reading a central can have
+    /// of it - a scan sees nothing.
+    pub ble_rssi: i8,
 }
 
 impl Telemetry {
@@ -172,12 +194,15 @@ impl Telemetry {
         b[16] = self.hop;
         b[17] = self.hop_channel;
         b[18] = self.parks_missed;
+        b[19] = self.ble_rssi as u8;
         b
     }
 
-    /// Extra trailing bytes are tolerated; short input is rejected.
+    /// Extra trailing bytes are tolerated; input shorter than
+    /// [`TELEMETRY_LEN_V1`] is rejected. A blob of exactly that length is
+    /// firmware from before the link RSSI, which reads back as no reading.
     pub fn decode(b: &[u8]) -> Option<Self> {
-        if b.len() < TELEMETRY_LEN {
+        if b.len() < TELEMETRY_LEN_V1 {
             return None;
         }
         Some(Self {
@@ -191,6 +216,7 @@ impl Telemetry {
             hop: b[16],
             hop_channel: b[17],
             parks_missed: b[18],
+            ble_rssi: b.get(19).map(|&v| v as i8).unwrap_or(0),
         })
     }
 }
@@ -449,13 +475,20 @@ mod tests {
             sats: 11,
             hop: TELEM_HOP_ON | 3,
             hop_channel: 27,
-                    parks_missed: 3,
+            parks_missed: 3,
+            ble_rssi: -63,
         };
         let b = t.encode();
         assert_eq!(Telemetry::decode(&b), Some(t));
         assert_eq!(t.hop_stratum(), Some(3));
         assert_eq!(Telemetry { hop: 0, ..t }.hop_stratum(), None);
-        assert_eq!(Telemetry::decode(&b[..TELEMETRY_LEN - 1]), None);
+        assert_eq!(Telemetry::decode(&b[..TELEMETRY_LEN_V1 - 1]), None);
+        // A board from before the link RSSI sends the shorter blob, and
+        // everything it does send still arrives.
+        assert_eq!(
+            Telemetry::decode(&b[..TELEMETRY_LEN_V1]),
+            Some(Telemetry { ble_rssi: 0, ..t })
+        );
         let mut longer = b.to_vec();
         longer.push(0xAB);
         assert_eq!(Telemetry::decode(&longer), Some(t));

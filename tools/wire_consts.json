@@ -1,6 +1,6 @@
 {
 "link": {"sync": 170, "max_payload": 256, "ack": 129},
-"usb": {"ping": 80, "bulk": 81, "bulk_ack": 82, "info": 83, "sleep": 84, "cfg": 85},
+"usb": {"ping": 80, "bulk": 81, "bulk_ack": 82, "info": 83, "sleep": 84, "cfg": 85, "wipe": 86},
 "bulk": {"begin": 1, "data": 2, "end": 3, "abort": 4, "kind_toml": 1, "kind_ota": 3, "data_max": 192, "config_max": 1024, "ack_id": 32},
 "ack": {"ok": 0, "unknown_id": 1, "bad_value": 2, "board_error": 16, "bad_state": 18},
 "cfg": {"notify_interval_ms": 1, "radio_standby": 17, "gps_sleep": 18, "sleep_now": 21, "mode": 23, "name": 25},

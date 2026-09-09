@@ -141,6 +141,26 @@ impl Flash {
         .unwrap_or(false)
     }
 
+    /// Erase the settings record and the config backup, so the next boot
+    /// finds nothing stored. Returns whether both landed.
+    ///
+    /// Written as erased flash rather than erased as sectors: `write` is
+    /// the one operation the region offers, it is an erase-and-rewrite of
+    /// the sector underneath, and a record of `0xFF` is exactly what an
+    /// erased partition reads as - `load_settings` and `load_config` refuse
+    /// it by its magic word, the same way they refuse a blank part.
+    pub fn wipe(&mut self) -> bool {
+        self.with_nvs(|region| {
+            let settings = region.write(0, &[0xFF; RECORD_LEN]).is_ok();
+            let config = !config_fits(region)
+                || region
+                    .write(CONFIG_AT, &[0xFF; cfgstore::HEADER_LEN])
+                    .is_ok();
+            settings && config
+        })
+        .unwrap_or(false)
+    }
+
     /// Read the backed-up config text into `buf`, returning its length.
     ///
     /// `None` when there is nothing to read, which is every reason a record

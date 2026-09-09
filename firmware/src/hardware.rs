@@ -718,6 +718,9 @@ impl Hardware {
             hop: link::TELEM_HOP_ON | stratum,
             hop_channel,
             parks_missed: settings::parks_missed().min(u32::from(u8::MAX)) as u8,
+            // Filled in by the notifier, which holds the connection this
+            // measures; nothing on this side of the board can read it.
+            ble_rssi: 0,
         });
     }
 

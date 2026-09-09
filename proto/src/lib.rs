@@ -62,7 +62,7 @@ pub fn wire_consts_json() -> String {
     format!(
         "{{\n\
   \"link\": {{\"sync\": {}, \"max_payload\": {}, \"ack\": {}}},\n\
-  \"usb\": {{\"ping\": {}, \"bulk\": {}, \"bulk_ack\": {}, \"info\": {}, \"sleep\": {}, \"cfg\": {}}},\n\
+  \"usb\": {{\"ping\": {}, \"bulk\": {}, \"bulk_ack\": {}, \"info\": {}, \"sleep\": {}, \"cfg\": {}, \"wipe\": {}}},\n\
   \"bulk\": {{\"begin\": {}, \"data\": {}, \"end\": {}, \"abort\": {}, \"kind_toml\": {}, \"kind_ota\": {}, \"data_max\": {}, \"config_max\": {}, \"ack_id\": {}}},\n\
   \"ack\": {{\"ok\": {}, \"unknown_id\": {}, \"bad_value\": {}, \"board_error\": {}, \"bad_state\": {}}},\n\
   \"cfg\": {{\"notify_interval_ms\": {}, \"radio_standby\": {}, \"gps_sleep\": {}, \"sleep_now\": {}, \"mode\": {}, \"name\": {}}},\n\
@@ -77,6 +77,7 @@ pub fn wire_consts_json() -> String {
         link::usb::INFO,
         link::usb::SLEEP,
         link::usb::CFG,
+        link::usb::WIPE,
         ble::OP_BEGIN,
         ble::OP_DATA,
         ble::OP_END,

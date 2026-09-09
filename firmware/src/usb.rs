@@ -150,6 +150,24 @@ pub async fn usb_task(
                     out.build(link::usb::BULK_ACK, &ack[..alen]);
                     send_frame(&mut tx, out.as_bytes()).await;
                 }
+                link::usb::WIPE => {
+                    // The records first, then the restart: the ack goes
+                    // out in between so the tool hears whether the flash
+                    // took it, and the pause is what lets the frame leave
+                    // the FIFO before the peripheral is reset under it.
+                    // The restart is what completes the wipe - the loops
+                    // hold settings they have already read, and a settings
+                    // write from a central could otherwise re-mirror them.
+                    let ok = crate::settings::wipe().await;
+                    out.build(link::resp::ACK, &[link::usb::WIPE, u8::from(ok)]);
+                    send_frame(&mut tx, out.as_bytes()).await;
+                    status_println!(
+                        "wipe: settings, name and config backup {}, restarting",
+                        if ok { "erased" } else { "NOT erased (flash?)" }
+                    );
+                    embassy_time::Timer::after(Duration::from_millis(300)).await;
+                    esp_hal::system::software_reset();
+                }
                 _ => {}
             }
         }

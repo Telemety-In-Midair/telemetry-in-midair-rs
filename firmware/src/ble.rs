@@ -6,7 +6,8 @@
 //! here is the advertising, the waiting and the effects: the trouble-host
 //! stack, the characteristics, and the `Rtc` a deep sleep needs.
 
-use bt_hci::controller::ExternalController;
+use bt_hci::cmd::status::ReadRssi;
+use bt_hci::controller::{ControllerCmdSync, ExternalController};
 use embassy_futures::select::{select, select3, Either, Either3};
 use embassy_time::{with_timeout, Duration, Instant, Timer};
 use esp_hal::rtc_cntl::Rtc;
@@ -293,7 +294,7 @@ pub async fn duty_cycle(rtc: &mut Rtc<'_>, addr_bytes: [u8; 6]) -> ! {
                         }
                     }
                 },
-                serve(&mut peripheral, &server, rtc),
+                serve(&stack, &mut peripheral, &server, rtc),
             )
             .await
             {
@@ -359,11 +360,15 @@ pub async fn duty_cycle(rtc: &mut Rtc<'_>, addr_bytes: [u8; 6]) -> ! {
 /// With no cadence to sleep on (`sleep_interval_s = 0`) the first two
 /// simply keep advertising, which is what a bench board and an unconfigured
 /// board both want.
-async fn serve<C: Controller>(
+async fn serve<C>(
+    stack: &Stack<'_, C, DefaultPacketPool>,
     peripheral: &mut Peripheral<'_, C, DefaultPacketPool>,
     server: &Server<'_>,
     rtc: &mut Rtc<'_>,
-) -> u32 {
+) -> u32
+where
+    C: Controller + ControllerCmdSync<ReadRssi>,
+{
     let mut adv_data = [0u8; 31];
     let adv_len = AdStructure::encode_slice(
         &[
@@ -499,7 +504,7 @@ async fn serve<C: Controller>(
             continue;
         };
         qprintln!("central connected");
-        let nap = gatt_session(&conn, server).await;
+        let nap = gatt_session(stack, &conn, server).await;
         qprintln!("central disconnected");
 
         // A transfer the phone was midway through does not outlive it.
@@ -578,7 +583,15 @@ enum Wrote {
 /// One connection: publish what an app needs on arrival, then stream.
 /// Returns the nap a `CFG_SLEEP_NOW` asked for during the session, which
 /// is what ended it.
-async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &Server<'_>) -> Option<u32> {
+async fn gatt_session<C, P>(
+    stack: &Stack<'_, C, P>,
+    conn: &GattConnection<'_, '_, P>,
+    server: &Server<'_>,
+) -> Option<u32>
+where
+    C: Controller + ControllerCmdSync<ReadRssi>,
+    P: PacketPool,
+{
     // Drop status lines buffered while disconnected so the central sees
     // live events, not a stale backlog.
     state::drain_log();
@@ -716,7 +729,16 @@ async fn gatt_session<P: PacketPool>(conn: &GattConnection<'_, '_, P>, server: &
                     break;
                 }
             }
-            if let Some(t) = state::telemetry() {
+            if let Some(mut t) = state::telemetry() {
+                // The link's own signal, asked of the controller for this
+                // connection. A connected board no longer advertises, so
+                // this is the one reading of the link a central can have,
+                // and the notify tick is the cadence it wants it at. 127
+                // is the controller saying it has no reading.
+                t.ble_rssi = match conn.raw().rssi(stack).await {
+                    Ok(127) | Err(_) => 0,
+                    Ok(dbm) => dbm,
+                };
                 let v = t.encode();
                 let _ = server.gps.telemetry.set(server, &v);
                 let _ = server.gps.telemetry.notify(conn, &v).await;

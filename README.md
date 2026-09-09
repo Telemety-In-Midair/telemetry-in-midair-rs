@@ -28,8 +28,13 @@ cd firmware && cargo run --release     # build, flash over USB Serial/JTAG, stay
 
 The console is the USB Serial/JTAG port. A reflash erases only `otadata`,
 so a board keeps its address, name and settings. For a fixed BLE address:
-`BLE_ADDRESS=FF:C6:A1:53:50:47 cargo run --release` (`pixi run
+`cd tools && BLE_ADDRESS=FF:C6:A1:53:50:47 cargo run --release` (`pixi run
 gen-ble-address` makes one).
+
+Reset a board: `pixi run board-wipe` clears the settings, the name and the
+config backup and restarts; `pixi run board-wipe --flash` erases every byte
+of flash and reflashes. The card is never touched, so a `RADIO.CFG` on it
+comes back at the next boot.
 
 ## Talking to a board
 
@@ -41,6 +46,7 @@ From `tools/`, over USB; the app does the same over BLE.
 | `pixi run board-set mode tracking` | Write one setting. The ack says what the board stored. |
 | `pixi run board-info` | Protocol version, BLE address, name. |
 | `pixi run board-sleep --seconds 60` | Deep sleep now. |
+| `pixi run board-wipe` | Forget the settings, the name and the config backup, then restart. `--flash` erases the whole part and reflashes. |
 | `pixi run board-ota` | Build and push a firmware image into the other slot. |
 | `pixi run radio-sim` | Simulate a few boards on the hop plan. |
 
