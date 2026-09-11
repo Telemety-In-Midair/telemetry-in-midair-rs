@@ -68,6 +68,20 @@ Two things the first bench run of the modes changed (2026-08-31):
 
 ## Bench work
 
+**Flash the watchdog, the panic path and the event log, and provoke
+each once.** None of it has run on a board. `docs/STATESPACE.md` bench
+items 8 and 9 are the recipe: a clean boot's `board-log`, a deliberate
+`panic!` after the attribute server attaches with a phone connecting, a
+deliberate `loop {}` in the hardware loop's pass. Each must come back as a
+reset within its bound with the right record - `panic` with file and line,
+`stall` with `hardware loop` and the phase - and never as a board that
+stays down. Then the readings that matter: a tracker left beaconing with
+a phone connecting now and then shows one `boot` record a day, and no
+`stall` in `card` or `ble init` at the same uptime on every boot (a
+bound too short for what the hardware takes). Finally the freeze itself:
+a phone connecting to a beaconing tracker, repeatedly, until the log says
+what it was. The freeze is not diagnosed - the log is what diagnoses it.
+
 **Flash the state space work and the audit's rework.** `docs/STATESPACE.md`
 lists the changes the exhaustive models forced and `docs/SYSTEM-AUDIT.md`
 the fourteen items that followed, none of them run on a board: the serve

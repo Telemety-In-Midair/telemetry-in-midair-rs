@@ -209,3 +209,40 @@ items; all fourteen are done, tests first.
   sightings rather than the adapter's memory, Android scan refusals and the
   five-starts-per-30-s limit are visible and waited out, and "Forget nodes"
   clears the list plus bluez's records / Android's cached service table.
+
+## Watchdogs, the panic path and the event log (2026-09-11)
+
+The report: a beaconing tracker, a phone trying to connect, the transmit
+LED stuck on, nothing answering. The state space had not found it and
+could not have: a loop that stops is the absence of an event, and the
+models walk what the policy decides, not the platform under it.
+
+- **Why both cores stopped** (`firmware/src/panic.rs`): the backtrace
+  crate's panic handler spun the panicking core forever with its critical
+  section held; the other core stopped at its next one. Replaced with a
+  handler that writes the message, location and the top of the backtrace
+  to RTC RAM with atomics alone, prints, and resets. CPU exceptions arrive
+  through the same path.
+- **Heartbeats and a monitor** (`proto/src/supervise.rs`,
+  `firmware/src/watchdog.rs`): both loops beat with the phase they are in;
+  waits that may last are beaten across, waits that may not are left to
+  look like the stall they are; a monitor feeds a TIMG1 watchdog while
+  every task is inside its bound and otherwise writes the stall to RTC
+  RAM, then flash, then resets. The watchdog covers the monitor.
+- **The event log** (`proto/src/evlog.rs`, `firmware/src/evlog.rs`,
+  `tools/board_log.py`): 128-byte records in a `coredump` partition, a
+  sector erased as the ring enters it; boots with their reset reason,
+  panics, stalls, and the faults worth a line. The boot prints the tail;
+  `pixi run board-log` reads it; it survives a reflash.
+- **A latent deadlock in the flash driver's core parking**
+  (`firmware/src/flash.rs`): the other core was parked before the
+  driver's own lock and unparked after it, so an interrupt in the gap
+  needing the spinlock the parked core held spun forever. Every program
+  and erase now holds the critical section.
+- **The supervision model** (`proto/tests/statespace_supervise.rs`):
+  every stall of either loop, of the monitor, and of the monitor's flash
+  write, against the real policy; and the same model with nothing
+  watching, dark in one event. `Explored::trap` is the harness's
+  non-asserting liveness check, for a model that expects to find one.
+- Not done: flashing any of it. `TODO.md` has the bench recipe, and the
+  freeze's cause is what the log is for.

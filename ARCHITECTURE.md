@@ -122,6 +122,31 @@ classDiagram
         name() advertised label
         parks_missed()
     }
+    class Monitor {
+        <<watchdog.rs, first core>>
+        beat(task, phase) from both loops
+        guarded() beats across a wait that may last
+        feeds the TIMG1 watchdog while all are in bound
+        stall: crumb, log, reset
+    }
+    class PanicHandler {
+        <<panic.rs>>
+        message, location, backtrace to RTC RAM
+        print, then reset
+        CPU exceptions arrive here too
+    }
+    class Crumb {
+        <<crumb.rs, RTC RAM, atomics only>>
+        what a dying board leaves
+        the next boot logs it
+    }
+    class EventLog {
+        <<evlog.rs, coredump partition>>
+        ring of 128-byte records
+        boot, panic, stall, ble, radio, gps, sleep, transfer
+        queue drained by the monitor
+        tail printed at boot, read by board-log
+    }
 
     class MidairProto {
         <<no_std, cargo test on host>>
@@ -131,6 +156,16 @@ classDiagram
         apply(write) Outcome
         Serve: pass() on_accept() Next Then
         dispatch() request, command
+    }
+    class Supervisor {
+        <<supervise, proto>>
+        Task bounds, Phase names
+        beat() check() Verdict
+    }
+    class EvlogCodec {
+        <<evlog, proto>>
+        Record encode() decode()
+        Ring locate() newest()
     }
     class BeaconPlanner {
         <<beacon, proto>>
@@ -226,8 +261,21 @@ classDiagram
     Settings --> FlashStore : nvs mirror
     HardwareTask --> FlashStore : config backup
     GattSession --> Settings
+    Firmware *-- Monitor
+    HardwareTask ..> Monitor : beat, every pass
+    ServeTask ..> Monitor : beat, every wait
+    Monitor --> Supervisor
+    Monitor --> Crumb : a stall
+    Monitor --> EventLog : queue to flash
+    PanicHandler --> Crumb : a panic
+    Crumb ..> EventLog : at the next boot
+    EventLog --> FlashStore : coredump partition
+    EventLog --> EvlogCodec
+    HostTools ..> EventLog : board-log
 
     MidairProto *-- SessionPolicy
+    MidairProto *-- Supervisor
+    MidairProto *-- EvlogCodec
     MidairProto *-- BeaconPlanner
     MidairProto *-- Dedup
     MidairProto *-- Roster
@@ -266,6 +314,16 @@ hardware task published and asks through a `Request`. The other direction
 is one channel: a config write on either transport sends the serve loop a
 `ServeCommand` - a nap, a moved mode - which whichever wait the loop is in
 picks up.
+
+`Monitor` is the one thing that watches the two loops rather than serving
+them. Both beat into its atomics with the phase they are in; it reads them
+every half second and feeds a timer-group watchdog only while every task
+is inside its bound. A task past its bound, or a panic on either core, is
+written to RTC RAM with atomics alone, then to the event log, then the
+board resets - and if the write to flash blocks, the watchdog resets the
+board with the RTC copy intact for the next boot to log. Before this a
+panic on either core stopped both, silently: the panicking core spun with
+its critical section held and the other core stopped at its next one.
 
 ## The RF path, and why two registers are not tunable
 

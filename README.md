@@ -48,6 +48,7 @@ From `tools/`, over USB; the app does the same over BLE.
 | `pixi run board-sleep --seconds 60` | Deep sleep now. |
 | `pixi run board-wipe` | Forget the settings, the name and the config backup, then restart. `--flash` erases the whole part and reflashes. |
 | `pixi run board-ota` | Build and push a firmware image into the other slot. |
+| `pixi run board-log` | What the board wrote down about itself: every boot and why, every panic, every stall and its phase. `--last 10`, `--clear`. |
 | `pixi run radio-sim` | Simulate a few boards on the hop plan. |
 
 `RADIO.example.toml` documents every config key. It is generated from the
@@ -67,6 +68,11 @@ Every node broadcasts and listens; a repeater forwards. Nodes take turns
 on a slot clock kept on GPS time or a heard frame, so two nodes beaconing
 every second never overlap. SF12 at 500 kHz on one carrier by default;
 hopping is a setting. Awake, the board draws about 126 mA, 71 of them BLE.
+
+A board that stops comes back on its own. Both loops report what they are
+doing; a monitor feeds a hardware watchdog while they do, and a loop that
+goes quiet, or a panic on either core, is written to the board's own flash
+with its name and phase before the reset. `pixi run board-log` reads it.
 
 ## Read more
 

@@ -286,6 +286,18 @@ for a board that has been through several firmwares. Neither touches the SD
 card: a `RADIO.CFG` there is read at the next boot and wins, `[power]`
 section included.
 
+### What the board wrote down
+
+`pixi run board-log` sends the USB console's `EVLOG` command, one record
+per round trip, newest first. The board keeps a ring of records about
+itself in its own flash: every boot with its reset reason and what the
+boot before it left, every panic with its message and location, every
+task the monitor found past its heartbeat bound with the phase it stopped
+in, and the faults worth a line - a radio that restarted underneath the
+firmware, a BLE controller that would not come up, a park that did not
+finish before a sleep. A board found dark in a field is plugged in and
+asked. The log outlives a reflash and a wipe; `--clear` erases it.
+
 **Deep sleep has no wake source but the timer.** Nothing over the air can
 interrupt it: the radio is off, and there is no GPIO or button wake. The
 5 min ceiling on `0x13` is what bounds that - the longest the board can
