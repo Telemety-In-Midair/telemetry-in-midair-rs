@@ -16,9 +16,11 @@ use embassy_time::{with_timeout, Duration};
 use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
 use esp_hal::rtc_cntl::Rtc;
 use esp_println::println;
+use midair_proto::evlog::Kind;
 use midair_proto::posture::Request;
+use midair_proto::supervise::{Phase, Task};
 
-use crate::{settings, state};
+use crate::{event, evlog, settings, state, watchdog};
 
 /// What the park is given on top of a transmit already in flight, ms.
 ///
@@ -43,8 +45,18 @@ pub async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
     // re-inits the radio anyway. The hardware loop also declines to start
     // a beacon while a sleep is pending, so this only has to cover one
     // already in flight.
+    // The wait is bounded, but the bound can run past the serve loop's
+    // heartbeat bound at the slowest settings, and it is a wait the loop
+    // is meant to be in - so it is guarded rather than left to look like
+    // a stall.
     let park = Duration::from_millis(u64::from(state::tx_worst_case_ms()) + PARK_SLACK_MS);
-    let mut parked = with_timeout(park, state::SLEEP_READY.wait()).await.is_ok();
+    let mut parked = watchdog::guarded(
+        Task::Serve,
+        Phase::Park,
+        with_timeout(park, state::SLEEP_READY.wait()),
+    )
+    .await
+    .is_ok();
     if !parked {
         // Once more before giving up on it. What is still awake is
         // whatever the hardware task had not reached: `PrepareSleep`
@@ -52,7 +64,13 @@ pub async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
         // touches the card, so a first expiry is most likely the card
         // alone, mid-flush, and a second budget is what it needs.
         println!("sleep: park not finished, waiting once more");
-        parked = with_timeout(park, state::SLEEP_READY.wait()).await.is_ok();
+        parked = watchdog::guarded(
+            Task::Serve,
+            Phase::Park,
+            with_timeout(park, state::SLEEP_READY.wait()),
+        )
+        .await
+        .is_ok();
     }
     if !parked {
         // Worth saying and worth counting: it means the sleep is about to
@@ -60,11 +78,16 @@ pub async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
         // the far side. The count survives the sleep in RTC RAM and goes
         // out on the boot line and in the telemetry.
         settings::note_park_missed();
-        println!(
+        event!(
+            Kind::Sleep,
             "sleep: park did not finish in time, sleeping over it ({} missed since cold boot)",
             settings::parks_missed()
         );
     }
+    // Whatever was noted and not yet written goes down now; the monitor
+    // that would have written it is about to lose its RAM with the rest.
+    watchdog::beat(Task::Serve, Phase::Sleep);
+    evlog::flush().await;
 
     // Hold what the sleeping board still needs held.
     //

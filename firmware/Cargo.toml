@@ -61,9 +61,14 @@ esp-rtos = { version = "0.2.0", features = [
 esp-bootloader-esp-idf = { version = "0.4.0", features = ["esp32s3"] }
 
 esp-alloc = "0.9.0"
-esp-backtrace = { version = "0.18.1", features = [
+# For the backtrace alone. Its panic handler is not used: it spins the
+# panicking core forever, which on a two-core board stops the other core
+# at its next critical section and freezes the board with nothing written
+# down. The firmware's own handler (src/panic.rs) records the panic in RTC
+# RAM, prints it, and resets.
+esp-backtrace = { version = "0.18.1", default-features = false, features = [
   "esp32s3",
-  "panic-handler",
+  # Its build script insists on a print backend even with the handler off.
   "println",
 ] }
 # The console lives on the USB Serial/JTAG port (GPIO19/20 to the USB-C

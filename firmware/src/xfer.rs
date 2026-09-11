@@ -94,12 +94,18 @@ pub async fn handle(owner: Owner, now_ms: u64, data: &[u8]) -> Ack {
                 // host retries an END whose ack went missing, and a retry
                 // has to keep reading as a rejection.
                 t.mark_rejected();
-                crate::status_println!("config: rejected, {:?}", e);
+                crate::event!(midair_proto::evlog::Kind::Transfer, "config: rejected, {:?}", e);
                 packet::encode_ack(ble::ACK_ID_BULK, packet::ACK_BAD_VALUE, &[])
             }
         },
         Event::Firmware => {
-            crate::status_println!("ota: image installed, rebooting into it");
+            crate::event!(
+                midair_proto::evlog::Kind::Transfer,
+                "ota: image installed, rebooting into it"
+            );
+            // The reboot is half a second away, in the hardware loop; the
+            // monitor may not get to the queue first.
+            crate::evlog::flush().await;
             state::request(Request::Reboot);
             ack
         }
@@ -140,6 +146,9 @@ pub async fn expire(now_ms: u64) {
         .unwrap_or_else(|| t.expire(now_ms, &mut NoFirmware));
     if expired {
         state::set_transfer_active(false);
-        crate::status_println!("bulk: transfer timed out, abandoned");
+        crate::event!(
+            midair_proto::evlog::Kind::Transfer,
+            "bulk: transfer timed out, abandoned"
+        );
     }
 }

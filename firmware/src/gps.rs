@@ -420,6 +420,10 @@ impl<'d> Gps<'d> {
         let deadline = Duration::from_millis(ACK_TIMEOUT_MS);
         let mut chunk = [0u8; 64];
         while Instant::now() - start < deadline {
+            crate::watchdog::beat(
+                midair_proto::supervise::Task::Loop,
+                midair_proto::supervise::Phase::GpsCtl,
+            );
             if RX_OVERRUN.swap(false, Ordering::Relaxed) {
                 matched = 0;
             }

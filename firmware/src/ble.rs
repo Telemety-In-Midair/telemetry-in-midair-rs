@@ -17,12 +17,14 @@ use midair_proto::bulk::Owner;
 use midair_proto::posture::Request;
 use midair_proto::radiocfg;
 use midair_proto::roster::Value;
+use midair_proto::evlog::Kind;
 use midair_proto::session::{self, Accepted, Next, ServeCommand, Then};
 use midair_proto::link;
+use midair_proto::supervise::{Phase, Task};
 use trouble_host::prelude::*;
 
 use crate::sleep::enter_deep_sleep;
-use crate::{settings, state, xfer};
+use crate::{event, settings, state, watchdog, xfer};
 
 const CONNECTIONS_MAX: usize = 1;
 const L2CAP_CHANNELS_MAX: usize = 2;
@@ -199,6 +201,10 @@ pub async fn duty_cycle(rtc: &mut Rtc<'_>, addr_bytes: [u8; 6]) -> ! {
 
     let mut announced_modem_sleep = false;
     loop {
+        // The controller and host coming up is not a wait the loop may
+        // spend any length of time in, so it is beaten across rather than
+        // guarded: a controller that hangs in its init is a stall.
+        watchdog::beat(Task::Serve, Phase::BleInit);
         let down = {
             // TX power is 0 dBm rather than the +9 dBm default. Nine buys
             // nothing here: the module's 2.4 GHz pin goes to a test point
@@ -233,7 +239,7 @@ pub async fn duty_cycle(rtc: &mut Rtc<'_>, addr_bytes: [u8; 6]) -> ! {
             let radio = match esp_radio::init() {
                 Ok(radio) => radio,
                 Err(e) => {
-                    qprintln!("radio init failed ({:?}), retrying", e);
+                    event!(Kind::Ble, "radio init failed ({:?}), retrying", e);
                     Timer::after(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -242,7 +248,7 @@ pub async fn duty_cycle(rtc: &mut Rtc<'_>, addr_bytes: [u8; 6]) -> ! {
                 match esp_radio::ble::controller::BleConnector::new(&radio, bt, ble_config) {
                     Ok(t) => t,
                     Err(e) => {
-                        qprintln!("ble connector failed ({:?}), retrying", e);
+                        event!(Kind::Ble, "ble connector failed ({:?}), retrying", e);
                         Timer::after(Duration::from_secs(1)).await;
                         continue;
                     }
@@ -289,7 +295,7 @@ pub async fn duty_cycle(rtc: &mut Rtc<'_>, addr_bytes: [u8; 6]) -> ! {
                 async {
                     loop {
                         if runner.run().await.is_err() {
-                            qprintln!("ble host error, restarting");
+                            event!(Kind::Ble, "ble host error, restarting");
                             Timer::after(Duration::from_millis(200)).await;
                         }
                     }
@@ -315,9 +321,13 @@ pub async fn duty_cycle(rtc: &mut Rtc<'_>, addr_bytes: [u8; 6]) -> ! {
         // console must not have to wait out the whole dark period first.
         // The console is alive throughout, and while the modem is down it is
         // the only way in.
-        if let Either::Second(command) = select(
-            Timer::after(Duration::from_secs(off_s as u64)),
-            state::next_command(),
+        if let Either::Second(command) = watchdog::guarded(
+            Task::Serve,
+            Phase::BleDown,
+            select(
+                Timer::after(Duration::from_secs(off_s as u64)),
+                state::next_command(),
+            ),
         )
         .await
         {
@@ -383,6 +393,7 @@ where
     let mut serve = session::Serve::new(Instant::now().as_millis(), &settings::get());
 
     loop {
+        watchdog::beat(Task::Serve, Phase::Advertise);
         let stored = settings::get();
         let (rebudgeted, next) = serve.pass(Instant::now().as_millis(), &stored);
         if rebudgeted {
@@ -422,7 +433,7 @@ where
         {
             Ok(a) => a,
             Err(_) => {
-                qprintln!("advertise failed, retrying");
+                event!(Kind::Ble, "advertise failed, retrying");
                 Timer::after(Duration::from_secs(1)).await;
                 continue;
             }
@@ -442,7 +453,15 @@ where
                 Some(advertiser.accept().await)
             }
         };
-        let accepted = select(accept, state::next_command()).await;
+        // Waiting for a central is a wait the loop may spend forever in,
+        // so the heartbeat is kept up on its behalf for as long as it
+        // lasts.
+        let accepted = watchdog::guarded(
+            Task::Serve,
+            Phase::Advertise,
+            select(accept, state::next_command()),
+        )
+        .await;
 
         let outcome = match &accepted {
             Either::First(Some(Ok(_))) => Accepted::Connected,
@@ -491,6 +510,7 @@ where
             (_, Then::Continue | Then::Serve) => continue,
         };
 
+        watchdog::beat(Task::Serve, Phase::Attach);
         let Ok(conn) = conn.with_attribute_server(server) else {
             // A central connected and the attribute server did not attach -
             // the link dropped in between, or the stack is out of room.
@@ -599,11 +619,19 @@ where
     // whatever is cached now.
     state::RADIO_CONFIG_SIGNAL.reset();
 
+    // Nothing from the last session is in flight; every operation below
+    // that must finish is bracketed, and the session's heartbeat stops on
+    // its behalf when one does not.
+    watchdog::session_free();
+    watchdog::beat(Task::Serve, Phase::Session);
+
     // Publish before anything else, so an app can populate its controls
     // without waiting for a notify interval.
+    watchdog::session_busy();
     publish_settings(server, conn).await;
     publish_name(server, conn).await;
     publish_radio_config(server, conn).await;
+    watchdog::session_free();
 
     // Hand the new central every node heard from recently. Their ages go
     // out with them, so a report from before this connection cannot be
@@ -654,11 +682,13 @@ where
                             };
                         }
                     }
+                    watchdog::session_busy();
                     if let Ok(reply) = event.accept() {
                         reply.send().await;
                     }
                     match wrote {
                         Wrote::Config => {
+                            watchdog::beat(Task::Serve, Phase::Write);
                             let (ack, _) = crate::config::apply_config(&data[..len]).await;
                             let _ = server.gps.ack.notify(conn, &ack).await;
                             // The write may have changed something the
@@ -671,6 +701,7 @@ where
                             publish_name(server, conn).await;
                         }
                         Wrote::Bulk => {
+                            watchdog::beat(Task::Serve, Phase::Write);
                             let (ack, _) =
                                 xfer::handle(Owner::Ble, Instant::now().as_millis(), &data[..len])
                                     .await;
@@ -678,6 +709,7 @@ where
                         }
                         Wrote::Other => {}
                     }
+                    watchdog::session_free();
                 }
                 _ => {}
             }
@@ -719,6 +751,7 @@ where
             //
             // A failed `set` is not a failed link, so unlike a failed position
             // notify it does not end the notifier.
+            watchdog::session_busy();
             let (position, dirty) = state::take_position();
             if let Some(p) = position
                 && dirty
@@ -743,6 +776,7 @@ where
                 let _ = server.gps.telemetry.set(server, &v);
                 let _ = server.gps.telemetry.notify(conn, &v).await;
             }
+            watchdog::session_free();
         }
     };
 
@@ -815,13 +849,23 @@ where
 
     // Any arm ending (disconnect, a position notify that failed, or a
     // commanded sleep) ends the session.
-    match select3(
-        select3(events, notifier, logger),
-        select(config_pub, commanded_sleep),
-        remotes,
+    //
+    // A connected phone with nothing to say is a wait the loop may spend
+    // any length of time in, so the heartbeat is kept up for the session
+    // as a whole - except while something the session started has not
+    // finished, which is what a stack that stopped answering looks like.
+    let ended = watchdog::guarded(
+        Task::Serve,
+        Phase::Session,
+        select3(
+            select3(events, notifier, logger),
+            select(config_pub, commanded_sleep),
+            remotes,
+        ),
     )
-    .await
-    {
+    .await;
+    watchdog::session_free();
+    match ended {
         Either3::Second(Either::Second(secs)) => Some(secs),
         _ => None,
     }

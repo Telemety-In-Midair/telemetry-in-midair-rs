@@ -203,18 +203,38 @@ impl Record {
         })
     }
 
-    /// The sequence and boot numbers of the record in `bytes`, if there is
-    /// one. What the boot scan reads from every slot: the header is
-    /// checked and the crc is, so a partial record does not decide where
-    /// the head is.
-    pub fn info_of(bytes: &[u8]) -> Option<(u32, u16)> {
-        Self::decode(bytes).map(|r| (r.seq, r.boot))
+    /// What a slot holds, as the boot scan needs to know it. The header
+    /// is checked and the crc is, so a partial record does not decide
+    /// where the head is.
+    pub fn probe(bytes: &[u8]) -> Slot {
+        if Self::is_blank(bytes) {
+            return Slot::Blank;
+        }
+        match Self::decode(bytes) {
+            Some(r) => Slot::Record {
+                seq: r.seq,
+                boot: r.boot,
+            },
+            None => Slot::Junk,
+        }
     }
 
     /// Whether a slot's bytes are erased flash.
     pub fn is_blank(bytes: &[u8]) -> bool {
         bytes.iter().all(|&b| b == 0xFF)
     }
+}
+
+/// What one slot of the ring holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Slot {
+    /// Erased flash: writable.
+    Blank,
+    /// Bytes that are not a record - a program a reset cut short, or
+    /// another program's - and not writable, since flash bits only clear.
+    Junk,
+    /// A record.
+    Record { seq: u32, boot: u16 },
 }
 
 /// Where the next record goes.
@@ -273,25 +293,19 @@ impl Ring {
         slot % self.per_sector == 0
     }
 
-    /// Find the head from what the slots hold. `info_of(slot)` is the
-    /// record's sequence and boot numbers, or `None` for a blank or
-    /// invalid slot; `blank(slot)` says whether the slot is erased flash.
-    /// Both are read per slot rather than taken as a table so the caller
-    /// need not hold the whole region in RAM.
+    /// Find the head from what the slots hold. `probe(slot)` reads one
+    /// slot; it is called per slot rather than handed a table so the
+    /// caller need not hold the whole region in RAM.
     ///
     /// The head is the slot after the newest record, moved forward past
     /// anything not blank in the same sector - an interrupted program, or
     /// another program's bytes - up to the next sector boundary, where an
     /// erase makes the question moot.
-    pub fn locate(
-        &self,
-        info_of: impl Fn(usize) -> Option<(u32, u16)>,
-        blank: impl Fn(usize) -> bool,
-    ) -> Head {
+    pub fn locate(&self, mut probe: impl FnMut(usize) -> Slot) -> Head {
         let mut newest: Option<(usize, u32, u16)> = None;
         let mut count = 0usize;
         for slot in 0..self.slots {
-            if let Some((seq, boot)) = info_of(slot) {
+            if let Slot::Record { seq, boot } = probe(slot) {
                 count += 1;
                 if newest.is_none_or(|(_, s, _)| seq > s) {
                     newest = Some((slot, seq, boot));
@@ -307,7 +321,7 @@ impl Ring {
             };
         };
         let mut head = (slot + 1) % self.slots;
-        while !self.erase_before(head) && !blank(head) {
+        while !self.erase_before(head) && probe(head) != Slot::Blank {
             head = (head + 1) % self.slots;
         }
         Head {
@@ -348,7 +362,7 @@ mod tests {
         assert_eq!(back.seq, 9);
         assert_eq!(back.uptime_s, 1234);
         assert_eq!(back.boot, 3);
-        assert_eq!(Record::info_of(&bytes), Some((9, 3)));
+        assert_eq!(Record::probe(&bytes), Slot::Record { seq: 9, boot: 3 });
     }
 
     #[test]
@@ -369,9 +383,11 @@ mod tests {
         let blank = [0xFFu8; RECORD_LEN];
         assert!(Record::is_blank(&blank));
         assert!(Record::decode(&blank).is_none());
+        assert_eq!(Record::probe(&blank), Slot::Blank);
         let mut bytes = rec(5, "hello").encode();
         bytes[20] ^= 1;
         assert!(Record::decode(&bytes).is_none());
+        assert_eq!(Record::probe(&bytes), Slot::Junk);
         let mut bytes = rec(5, "hello").encode();
         bytes[2] = 0x7F;
         assert!(Record::decode(&bytes).is_none());
@@ -411,10 +427,11 @@ mod tests {
 
     impl Slots {
         fn head(&self, ring: &Ring) -> Head {
-            ring.locate(
-                |s| self.seq[s].map(|seq| (seq, 4)),
-                |s| self.seq[s].is_none() && !self.garbage.contains(&s),
-            )
+            ring.locate(|s| match self.seq[s] {
+                Some(seq) => Slot::Record { seq, boot: 4 },
+                None if self.garbage.contains(&s) => Slot::Junk,
+                None => Slot::Blank,
+            })
         }
     }
 

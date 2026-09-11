@@ -48,6 +48,16 @@ board-set = "python board_set.py"
 # port disappears while it sleeps; that is the command working.
 board-sleep = "python board_sleep.py"
 
+# Read what the board wrote down about itself - every boot with its reset
+# reason, every panic with its message and location, every stall with the
+# task and the phase it stopped in, and the faults worth a line:
+#   pixi run board-log
+#   pixi run board-log --last 10
+#   pixi run board-log --clear
+# The log lives in the board's own flash and survives a reflash, so a board
+# found dark can be plugged in and asked what happened.
+board-log = "python board_log.py"
+
 # Reset a board to its defaults - the settings, the name and the radio
 # config backup gone, then a restart - or, with --flash, erase every byte of
 # flash and reflash the firmware:

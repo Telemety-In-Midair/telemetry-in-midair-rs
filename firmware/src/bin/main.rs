@@ -39,7 +39,6 @@
 use embassy_executor::Spawner;
 #[cfg(feature = "iso-no-ble")]
 use embassy_time::{Duration, Timer};
-use esp_backtrace as _;
 use esp_hal::clock::CpuClock;
 use esp_hal::delay::Delay;
 use esp_hal::gpio::interconnect::{InputSignal, PeripheralInput};
@@ -160,6 +159,22 @@ async fn main(spawner: Spawner) -> ! {
     // the same `waiti`, just without counting it.
     esp_rtos::start_with_idle_hook(timg0.timer0, wio_s3_gps::idle::hook);
 
+    // The hardware watchdog, armed here so it covers the boot as well as
+    // everything after: a flash that does not answer, a second core that
+    // never comes up, a controller that hangs in its init. From the moment
+    // the monitor task runs it is fed only while every supervised task is
+    // inside its bound. Its timeout is generous enough for the whole boot;
+    // what it must never do is fire on a board that is merely busy.
+    let timg1 = TimerGroup::new(peripherals.TIMG1);
+    let mut wdt = timg1.wdt;
+    wio_s3_gps::watchdog::arm(&mut wdt);
+    // An isolation build leaves a loop out on purpose; a loop that never
+    // starts must not read as one that stalled.
+    #[cfg(feature = "iso-no-app")]
+    wio_s3_gps::watchdog::unwatch(midair_proto::supervise::Task::Loop);
+    #[cfg(feature = "iso-no-ble")]
+    wio_s3_gps::watchdog::unwatch(midair_proto::supervise::Task::Serve);
+
     // D5 and D2. Both start dark so the first blink is visibly the
     // firmware's, not a leftover level from the ROM bootloader driving
     // UART0_TX - and so an unconfigured pin does not leave an LED biased
@@ -256,6 +271,10 @@ async fn main(spawner: Spawner) -> ! {
             }
         ),
     }
+    // Why this boot happened and what the last one left - a panic, a
+    // stall - go into the event log now, before anything that could fail
+    // again is started, and the tail of the log goes to the console.
+    wio_s3_gps::evlog::boot().await;
 
     // What this boot raises. Three flavors and one decision, taken here
     // because everything below - which peripherals are spoken to, whether
@@ -523,6 +542,13 @@ async fn main(spawner: Spawner) -> ! {
     spawner
         .spawn(wio_s3_gps::usb::usb_task(usb_rx, usb_tx))
         .expect("spawn usb task");
+
+    // The monitor: reads the heartbeats, feeds the watchdog while every
+    // task is inside its bound, writes the event queue to flash, and
+    // resets the board with the stall written down when a task is not.
+    spawner
+        .spawn(wio_s3_gps::watchdog::monitor_task(wdt))
+        .expect("spawn monitor task");
 
     // `iso-no-ble` skips all of this: no `esp_radio::init`, so no PHY, no
     // controller and no advertising. The difference against the baseline is

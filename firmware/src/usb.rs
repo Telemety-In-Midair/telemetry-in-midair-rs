@@ -166,7 +166,35 @@ pub async fn usb_task(
                         if ok { "erased" } else { "NOT erased (flash?)" }
                     );
                     embassy_time::Timer::after(Duration::from_millis(300)).await;
+                    crate::crumb::mark_reset(crate::crumb::Reason::Wipe);
                     esp_hal::system::software_reset();
+                }
+                link::usb::EVLOG => {
+                    // One record per round trip, newest first, so a tool
+                    // reads until the reply comes back without one. The
+                    // erase index erases instead.
+                    let index = payload
+                        .get(..2)
+                        .and_then(|b| <[u8; 2]>::try_from(b).ok())
+                        .map(u16::from_le_bytes)
+                        .unwrap_or(0);
+                    let mut reply = [0u8; 5 + midair_proto::evlog::RECORD_LEN];
+                    reply[0] = link::usb::EVLOG;
+                    let mut n = 5;
+                    let count = if index == link::usb::EVLOG_ERASE {
+                        let _ = crate::evlog::erase().await;
+                        0
+                    } else {
+                        if let Some(r) = crate::evlog::read(usize::from(index)).await {
+                            reply[5..].copy_from_slice(&r.encode());
+                            n = reply.len();
+                        }
+                        crate::evlog::count().await.min(usize::from(u16::MAX)) as u16
+                    };
+                    reply[1..3].copy_from_slice(&count.to_le_bytes());
+                    reply[3..5].copy_from_slice(&index.to_le_bytes());
+                    out.build(link::resp::ACK, &reply[..n]);
+                    send_frame(&mut tx, out.as_bytes()).await;
                 }
                 _ => {}
             }

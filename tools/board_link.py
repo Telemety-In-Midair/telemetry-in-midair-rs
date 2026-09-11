@@ -43,6 +43,15 @@ USB_INFO = _WIRE["usb"]["info"]
 USB_SLEEP = _WIRE["usb"]["sleep"]
 USB_CFG = _WIRE["usb"]["cfg"]
 USB_WIPE = _WIRE["usb"]["wipe"]
+USB_EVLOG = _WIRE["usb"]["evlog"]
+
+# The event log's record, as the board stores it and sends it back.
+EVLOG_RECORD_LEN = _WIRE["evlog"]["record_len"]
+EVLOG_HEADER_LEN = _WIRE["evlog"]["header_len"]
+EVLOG_TEXT_MAX = _WIRE["evlog"]["text_max"]
+EVLOG_MAGIC = _WIRE["evlog"]["magic"]
+EVLOG_ERASE_INDEX = _WIRE["evlog"]["erase_index"]
+EVLOG_KINDS = {v: k for k, v in _WIRE["evlog"]["kinds"].items()}
 
 OP_BEGIN = _WIRE["bulk"]["begin"]
 OP_DATA = _WIRE["bulk"]["data"]
@@ -373,6 +382,49 @@ def wipe(ser: serial.Serial, timeout: float = 3.0) -> bool | None:
     if len(payload) < 2 or payload[0] != USB_WIPE:
         return None
     return payload[1] == 1
+
+
+def decode_evlog_record(raw: bytes) -> dict | None:
+    """One event log record as a dict, or None for bytes that are not one.
+
+    Layout (proto/src/evlog.rs): magic u16, kind u8, text length u8, seq
+    u32, uptime seconds u32, boot u16, reserved u16, then the text, then a
+    crc32 the board already checked before sending.
+    """
+    if len(raw) < EVLOG_RECORD_LEN:
+        return None
+    magic, kind, tlen, seq, uptime, boot = struct.unpack_from("<HBBIIH", raw, 0)
+    if magic != EVLOG_MAGIC or tlen > EVLOG_TEXT_MAX:
+        return None
+    text = raw[EVLOG_HEADER_LEN:EVLOG_HEADER_LEN + tlen].decode("utf-8", "replace")
+    return {
+        "seq": seq,
+        "boot": boot,
+        "uptime_s": uptime,
+        "kind": EVLOG_KINDS.get(kind, f"kind{kind}"),
+        "text": text,
+    }
+
+
+def read_evlog(ser: serial.Serial, index: int, timeout: float = 2.0):
+    """Read the `index`-th newest event log record, 0 being the newest.
+
+    Returns `(count, index, record)` where `record` is None past the end of
+    the log, or None when the board never acked. `EVLOG_ERASE_INDEX` erases
+    the log instead and comes back with a count of 0.
+    """
+    ser.reset_input_buffer()
+    ser.write(build_frame(USB_EVLOG, struct.pack("<H", index)))
+    ser.flush()
+    frame, _ = read_frame(ser, {RESP_ACK}, timeout)
+    if frame is None:
+        return None
+    payload = frame[1]
+    if len(payload) < 5 or payload[0] != USB_EVLOG:
+        return None
+    count, echoed = struct.unpack_from("<HH", payload, 1)
+    record = decode_evlog_record(payload[5:]) if len(payload) >= 5 + EVLOG_RECORD_LEN else None
+    return count, echoed, record
 
 
 def set_config(ser: serial.Serial, cfg_id: int, value: bytes,

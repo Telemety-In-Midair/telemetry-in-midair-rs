@@ -34,6 +34,28 @@
 //! A board flashed with a single-app partition table has no OTA slots. That
 //! is not an error - the firmware runs identically - so every OTA entry
 //! point degrades to "not available" and the bulk transfer refuses the kind.
+//!
+//! **Event log.** The fourth user, and the fourth region: the `coredump`
+//! data partition holds the ring of [`midair_proto::evlog`] records the
+//! board keeps about itself. Unlike the other three it is appended to, a
+//! record at a time, with a sector erased only as the ring enters it -
+//! see [`Flash::evlog_append`]. A board whose table has no such partition
+//! keeps its events on the console only.
+//!
+//! **Every program and erase holds this core's critical section.** The
+//! flash driver parks the other core for the duration of a write, because
+//! that core would otherwise fetch instructions through a cache the write
+//! has to disable. It parks it *before* taking its own lock and unparks it
+//! *after* releasing, which leaves two gaps in which an interrupt on this
+//! core can run while the other core is stalled. If that interrupt needs
+//! the critical-section spinlock and the stalled core was holding it - it
+//! holds one every time it touches the shared state, and it is stalled at
+//! a random instruction - the interrupt spins on a lock that will never be
+//! released, this core never reaches the unpark, and the board is two
+//! stopped cores. Holding the critical section around the whole operation
+//! closes both gaps: the other core cannot hold the spinlock when it is
+//! parked, since this core holds it, and no interrupt runs on this core
+//! until the other core is running again.
 
 use esp_bootloader_esp_idf::ota::{Ota, OtaImageState};
 use esp_bootloader_esp_idf::ota_updater::OtaUpdater;
@@ -45,7 +67,26 @@ use esp_println::println;
 use esp_storage::FlashStorage;
 use midair_proto::bulk::Sink;
 use midair_proto::cfgstore;
+use midair_proto::evlog::{self, Head, Record, Ring, Slot};
 use midair_proto::session::{Stored, RECORD_LEN};
+
+/// Run a flash program or erase with this core's critical section held,
+/// so the other core is not parked holding the spinlock and no interrupt
+/// on this core runs while it is parked. See the module doc.
+///
+/// Reads need none of this - they go through the cache like any other
+/// access - so the comparisons that decide whether a write is needed at
+/// all stay outside, with interrupts on.
+fn exclusive<R>(f: impl FnOnce() -> R) -> R {
+    critical_section::with(|_| f())
+}
+
+/// Where the event log's ring is, once opened.
+#[derive(Clone, Copy, Debug)]
+struct EventLog {
+    ring: Ring,
+    head: Head,
+}
 
 /// Flash sector size: the unit an erase works in, and so the unit an image
 /// is staged in.
@@ -82,22 +123,24 @@ pub struct Flash {
     /// of it. Held rather than re-derived per sector so the destination
     /// cannot move under an image that is half written.
     target: Option<AppPartitionSubType>,
+    /// The event log, once [`evlog_open`](Self::evlog_open) has found it.
+    evlog: Option<EventLog>,
 }
 
 impl Flash {
     /// Claim the flash. Call once.
     pub fn new(flash: esp_hal::peripherals::FLASH<'static>) -> Self {
         Self {
-            // The S3 is dual core. Only core 0 runs here, so the default
-            // strategy (fail while another core is up) would already pass -
-            // but a future second core would turn every settings save into
-            // a silent failure, and parking is what makes that safe.
+            // The hardware loop runs on the second core, so every write
+            // has to park it: it would otherwise fetch through the cache
+            // the write disables. `exclusive` is what makes the park safe.
             storage: FlashStorage::new(flash).multicore_auto_park(),
             table: [0; partitions::PARTITION_TABLE_MAX_LEN],
             staged: [0; SECTOR],
             staged_at: 0,
             staged_len: 0,
             target: None,
+            evlog: None,
         }
     }
 
@@ -136,7 +179,7 @@ impl Flash {
             if region.read(0, &mut current).is_ok() && current == rec {
                 return true;
             }
-            region.write(0, &rec).is_ok()
+            exclusive(|| region.write(0, &rec)).is_ok()
         })
         .unwrap_or(false)
     }
@@ -151,11 +194,9 @@ impl Flash {
     /// it by its magic word, the same way they refuse a blank part.
     pub fn wipe(&mut self) -> bool {
         self.with_nvs(|region| {
-            let settings = region.write(0, &[0xFF; RECORD_LEN]).is_ok();
+            let settings = exclusive(|| region.write(0, &[0xFF; RECORD_LEN])).is_ok();
             let config = !config_fits(region)
-                || region
-                    .write(CONFIG_AT, &[0xFF; cfgstore::HEADER_LEN])
-                    .is_ok();
+                || exclusive(|| region.write(CONFIG_AT, &[0xFF; cfgstore::HEADER_LEN])).is_ok();
             settings && config
         })
         .unwrap_or(false)
@@ -234,9 +275,153 @@ impl Flash {
             if region_holds(region, CONFIG_AT, rec) {
                 return true;
             }
-            region.write(CONFIG_AT, rec).is_ok()
+            exclusive(|| region.write(CONFIG_AT, rec)).is_ok()
         })
         .unwrap_or(false)
+    }
+
+    // -- The event log ------------------------------------------------------
+
+    fn with_evlog<R>(
+        &mut self,
+        f: impl FnOnce(&mut partitions::FlashRegion<'_, FlashStorage<'static>>) -> R,
+    ) -> Option<R> {
+        let Self { storage, table, .. } = self;
+        let pt = partitions::read_partition_table(storage, table).ok()?;
+        let entry = pt
+            .find_partition(PartitionType::Data(DataPartitionSubType::Coredump))
+            .ok()??;
+        let mut region = entry.as_embedded_storage(storage);
+        Some(f(&mut region))
+    }
+
+    /// One slot's bytes.
+    fn evlog_slot(
+        region: &mut partitions::FlashRegion<'_, FlashStorage<'static>>,
+        ring: &Ring,
+        slot: usize,
+    ) -> Option<[u8; evlog::RECORD_LEN]> {
+        let mut buf = [0u8; evlog::RECORD_LEN];
+        region.read(ring.offset(slot), &mut buf).ok()?;
+        Some(buf)
+    }
+
+    /// What a slot holds. A slot that cannot be read counts as junk: not
+    /// a record, and not something to program over.
+    fn evlog_probe(
+        region: &mut partitions::FlashRegion<'_, FlashStorage<'static>>,
+        ring: &Ring,
+        slot: usize,
+    ) -> Slot {
+        Self::evlog_slot(region, ring, slot).map_or(Slot::Junk, |b| Record::probe(&b))
+    }
+
+    /// Erase the sector a slot begins.
+    fn evlog_erase_sector(
+        region: &mut partitions::FlashRegion<'_, FlashStorage<'static>>,
+        ring: &Ring,
+        slot: usize,
+    ) -> bool {
+        let from = ring.offset(slot);
+        exclusive(|| {
+            embedded_storage::nor_flash::NorFlash::erase(region, from, from + SECTOR as u32)
+        })
+        .is_ok()
+    }
+
+    /// Find the log and where its next record goes. `None` on a board
+    /// whose partition table has no log partition. Called once at boot;
+    /// the head is then kept here and moved by every append.
+    pub fn evlog_open(&mut self) -> Option<Head> {
+        let found = self.with_evlog(|region| {
+            let ring = Ring::new(region.capacity(), SECTOR)?;
+            let head = ring.locate(|slot| Self::evlog_probe(region, &ring, slot));
+            Some(EventLog { ring, head })
+        })??;
+        self.evlog = Some(found);
+        Some(found.head)
+    }
+
+    /// Append one record. Returns its sequence number, or `None` if the
+    /// log is not open or the write did not land.
+    ///
+    /// The record's slot is programmed once, on erased flash: the sector
+    /// is erased as the ring enters it, which takes the oldest records
+    /// with it, and a slot that turns out not to be blank - a program a
+    /// reset interrupted - is skipped rather than programmed over, since
+    /// flash bits only clear and no crc would pass the result.
+    pub fn evlog_append(&mut self, kind: evlog::Kind, uptime_s: u32, text: &str) -> Option<u32> {
+        let mut log = self.evlog?;
+        let seq = log.head.next_seq;
+        let record = Record::new(kind, seq, uptime_s, log.head.next_boot, text).encode();
+        let landed = self.with_evlog(|region| {
+            let ring = log.ring;
+            let mut slot = log.head.slot;
+            // Skip forward over anything already programmed, up to the
+            // next sector boundary, which is erased on entry.
+            while !ring.erase_before(slot) && Self::evlog_probe(region, &ring, slot) != Slot::Blank
+            {
+                slot = (slot + 1) % ring.slots;
+            }
+            if ring.erase_before(slot) && !Self::evlog_erase_sector(region, &ring, slot) {
+                return false;
+            }
+            let at = ring.offset(slot);
+            if exclusive(|| embedded_storage::nor_flash::NorFlash::write(region, at, &record))
+                .is_err()
+            {
+                return false;
+            }
+            log.head.slot = (slot + 1) % ring.slots;
+            true
+        })?;
+        if !landed {
+            return None;
+        }
+        log.head.next_seq = seq.wrapping_add(1).max(1);
+        log.head.count = (log.head.count + 1).min(log.ring.slots);
+        self.evlog = Some(log);
+        Some(seq)
+    }
+
+    /// The `i`-th newest record: 0 is the last one written.
+    pub fn evlog_read(&mut self, i: usize) -> Option<Record> {
+        let log = self.evlog?;
+        if i >= log.head.count {
+            return None;
+        }
+        let slot = log.ring.newest(log.head.slot, i)?;
+        self.with_evlog(|region| {
+            Self::evlog_slot(region, &log.ring, slot).and_then(|b| Record::decode(&b))
+        })?
+    }
+
+    /// How many records the log holds.
+    pub fn evlog_count(&mut self) -> usize {
+        self.evlog.map_or(0, |log| log.head.count)
+    }
+
+    /// Erase the whole log. The next append starts from the first slot.
+    pub fn evlog_erase(&mut self) -> bool {
+        let Some(mut log) = self.evlog else {
+            return false;
+        };
+        let ok = self
+            .with_evlog(|region| {
+                let len = region.capacity() as u32;
+                exclusive(|| embedded_storage::nor_flash::NorFlash::erase(region, 0, len)).is_ok()
+            })
+            .unwrap_or(false);
+        if ok {
+            log.head = Head {
+                slot: 0,
+                next_seq: 1,
+                next_boot: log.head.next_boot,
+                count: 0,
+            };
+            self.evlog = Some(log);
+        }
+        ok
     }
 
     fn with_nvs<R>(
@@ -343,7 +528,7 @@ impl Flash {
                 // not the case being fixed.
                 _ => return false,
             }
-            ota.set_current_app_partition(booted).is_ok()
+            exclusive(|| ota.set_current_app_partition(booted)).is_ok()
         })
         .unwrap_or(false)
     }
@@ -369,7 +554,7 @@ impl Flash {
             if !matches!(state, OtaImageState::New | OtaImageState::PendingVerify) {
                 return false;
             }
-            u.set_current_ota_state(OtaImageState::Valid).is_ok()
+            exclusive(|| u.set_current_ota_state(OtaImageState::Valid)).is_ok()
         })
         .unwrap_or(false)
     }
@@ -419,7 +604,7 @@ impl Flash {
             match pt.find_partition(PartitionType::App(slot)) {
                 Ok(Some(entry)) => {
                     let mut region = entry.as_embedded_storage(storage);
-                    region.write(at, &staged[..len]).is_ok()
+                    exclusive(|| region.write(at, &staged[..len])).is_ok()
                 }
                 _ => false,
             }
@@ -559,11 +744,13 @@ impl Sink for OtaSink<'_> {
                     Ok((_, next)) if next == slot => {}
                     _ => return false,
                 }
-                if u.activate_next_partition().is_err() {
-                    return false;
-                }
-                let _ = u.set_current_ota_state(OtaImageState::New);
-                true
+                exclusive(|| {
+                    if u.activate_next_partition().is_err() {
+                        return false;
+                    }
+                    let _ = u.set_current_ota_state(OtaImageState::New);
+                    true
+                })
             })
             .unwrap_or(false)
     }

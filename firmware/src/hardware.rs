@@ -20,7 +20,9 @@ use midair_proto::bulk;
 use midair_proto::posture::{Card, Effect, Effects, Posture, Radio, Request};
 use midair_proto::session::Stored;
 use midair_proto::radiocfg::{self, RadioConfig};
+use midair_proto::evlog::Kind;
 use midair_proto::roster::Report;
+use midair_proto::supervise::{Phase, Task};
 use midair_proto::{link, lora};
 
 use crate::gps::Gps;
@@ -28,7 +30,7 @@ use crate::gpsctl::GpsWatch;
 use crate::node::Node;
 use crate::radio::Sx1262Driver;
 use crate::sdlog::{SdLog, CONFIG_MAX};
-use crate::{flash, oled, settings, state, xfer};
+use crate::{crumb, event, flash, oled, settings, state, watchdog, xfer};
 
 /// Status LEDs, cathodes on GPIO43 and GPIO14. Active low: the anodes sit
 /// on +3V3 through R21/R20, so driving the pin low is what lights them.
@@ -327,14 +329,22 @@ impl Hardware {
     async fn effect(&mut self, e: Effect, now_ms: u64) {
         match e {
             Effect::MountCard => {
+                watchdog::beat(Task::Loop, Phase::ConfigLoad);
                 self.cfg_loaded = self.adopt_stored_config(now_ms).await;
                 self.cold = false;
                 self.node.reconfigure(&self.cfg);
                 self.planner = Planner::new(self.first_beacon_ms(now_ms));
             }
-            Effect::ParkCard => self.sdlog.park(now_ms),
-            Effect::GpsUp => self.watch.configure(&mut self.gps, &self.cfg.gps).await,
+            Effect::ParkCard => {
+                watchdog::beat(Task::Loop, Phase::Card);
+                self.sdlog.park(now_ms)
+            }
+            Effect::GpsUp => {
+                watchdog::beat(Task::Loop, Phase::GpsCtl);
+                self.watch.configure(&mut self.gps, &self.cfg.gps).await
+            }
             Effect::GpsPark => {
+                watchdog::beat(Task::Loop, Phase::GpsCtl);
                 self.gps.park().await;
                 self.watch.parked();
                 status_println!("gps: backup mode");
@@ -350,9 +360,10 @@ impl Hardware {
                 self.watch.parked();
             }
             Effect::RadioInit => {
+                watchdog::beat(Task::Loop, Phase::RadioInit);
                 self.node.radio_mut().init(&self.cfg).await;
                 if !self.node.radio_mut().print_diagnostics() {
-                    println!("radio did not answer - check the pin map in main");
+                    event!(Kind::Radio, "radio did not answer - check the pin map in main");
                 }
             }
             Effect::RadioStandby => {
@@ -373,6 +384,7 @@ impl Hardware {
                 }
             }
             Effect::ApplyConfig => {
+                watchdog::beat(Task::Loop, Phase::ConfigApply);
                 if self.apply_radio_config(now_ms).await {
                     self.cfg_loaded = true;
                     self.watch.rearm(now_ms + 2_000);
@@ -389,7 +401,7 @@ impl Hardware {
                 let before = self.gps.rx_bytes();
                 self.gps.poll();
                 if self.gps.rx_bytes() != before {
-                    status_println!("gps: talking at park - the last park did not hold");
+                    event!(Kind::Gps, "gps: talking at park - the last park did not hold");
                 }
             }
             Effect::SleepReady => state::SLEEP_READY.signal(()),
@@ -397,6 +409,7 @@ impl Hardware {
                 // Long enough for the ack that asked for this to leave the
                 // USB FIFO or the BLE connection.
                 Timer::after(Duration::from_millis(500)).await;
+                crumb::mark_reset(crumb::Reason::Ota);
                 esp_hal::system::software_reset();
             }
         }
@@ -418,6 +431,9 @@ impl Hardware {
         self.rx_led.update(now_ms);
         self.tx_led.update(now_ms);
 
+        // The heartbeat: this pass is happening, and what it is doing is
+        // set as it goes, so a stall names the stage it stopped in.
+        watchdog::beat(Task::Loop, Phase::Requests);
         self.requests(now_ms).await;
 
         // A bulk transfer whose host walked away must not hold the board
@@ -440,16 +456,22 @@ impl Hardware {
         // on a wake check, where the card is off the bus and the panel is
         // dark.
         if self.posture.gps_awake() {
+            watchdog::beat(Task::Loop, Phase::Gps);
             self.gps(now_ms, late_pass).await;
         }
         if self.posture.radio_up() {
+            watchdog::beat(Task::Loop, Phase::Beacon);
             self.beacon(now_ms).await;
+            watchdog::beat(Task::Loop, Phase::Receive);
             self.receive(now_ms);
             self.repeat(now_ms).await;
         }
         self.telemetry(now_ms);
+        watchdog::beat(Task::Loop, Phase::Card);
         self.sdlog.poll(now_ms);
+        watchdog::beat(Task::Loop, Phase::Panel);
         self.panel(now_ms).await;
+        watchdog::beat(Task::Loop, Phase::Status);
         self.status(now_ms);
 
         Duration::from_millis(if self.posture.busy() { 10 } else { 50 })
@@ -556,10 +578,11 @@ impl Hardware {
         // wrong from the counters, so this is the only place it can be
         // caught.
         if self.node.radio_mut().looks_reset() {
-            status_println!("radio restarted underneath us, re-initializing");
+            event!(Kind::Radio, "radio restarted underneath us, re-initializing");
             self.node.radio_mut().init(&self.cfg).await;
         }
         state::set_radio_busy(true);
+        watchdog::beat(Task::Loop, Phase::TxSend);
         self.tx_led.pulse(now_ms);
         let sent = if has_fix {
             let (pos, n) = lora::encode_position(&self.gps.packet(), self.cfg.beacon_fields);
@@ -680,6 +703,7 @@ impl Hardware {
             return;
         }
         state::set_radio_busy(true);
+        watchdog::beat(Task::Loop, Phase::TxSend);
         self.tx_led.pulse(now_ms);
         let went = self.node.send_due_repeat(now_ms).await;
         state::set_radio_busy(false);
@@ -763,8 +787,12 @@ impl Hardware {
         self.next_status_ms = now_ms + STATUS_MS;
         let (mode, err) = self.node.radio_mut().health();
         let (hop_stratum, hop_ch) = self.node.radio().hop_status(now_ms);
+        // The heap beside the idle rate: the BLE duty cycle builds and
+        // tears the whole stack down every window, and a free figure that
+        // drifts down across a day is fragmentation - the failure that
+        // shows up as a connect that never completes, hours in.
         status_println!(
-            "t={}s radio {} err {:04x} rx {} tx {} hop ch {} s {} | gps {} nmea fix {} sats {} | sd {} | nodes {} | idle {} Hz",
+            "t={}s radio {} err {:04x} rx {} tx {} hop ch {} s {} | gps {} nmea fix {} sats {} | sd {} | nodes {} | idle {} Hz | heap {} B free",
             now_ms / 1000,
             mode,
             err,
@@ -777,7 +805,8 @@ impl Hardware {
             self.gps.packet().sats,
             if self.sdlog.ready() { "mounted" } else { "absent" },
             state::remote_count(),
-            idle_hz
+            idle_hz,
+            esp_alloc::HEAP.free()
         );
         // Verbose only: break down what the radio heard but did not
         // deliver, so "a couple of random RXs" can be read as mostly CRC
@@ -926,7 +955,8 @@ impl Hardware {
             status_println!("SD: disabled by config");
             self.sdlog.disable(now_ms);
         }
-        status_println!(
+        event!(
+            Kind::Transfer,
             "config applied, node {} ({}), {}",
             self.cfg.address,
             self.cfg.role.as_str(),

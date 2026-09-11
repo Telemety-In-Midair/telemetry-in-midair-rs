@@ -43,10 +43,12 @@
 
 use embassy_time::{Duration, Instant, Timer};
 use esp_println::println;
+use midair_proto::evlog::Kind;
 use midair_proto::hop::{self, Offer, SyncWord};
 use midair_proto::lora::FRAME_MAX;
 use midair_proto::radiocfg::RadioConfig;
 use midair_proto::rxgate::{Irq, RxGate, Seen};
+use midair_proto::supervise::{Phase, Task};
 
 use crate::sx1262::{dev_err, irq, mode, reg, FallbackMode, StandbyClk, Sx1262, RX_CONTINUOUS};
 
@@ -910,8 +912,15 @@ impl<'d> Sx1262Driver<'d> {
         let start = Instant::now();
         let deadline = Duration::from_millis(self.tx_poll_timeout_ms as u64);
         let result = loop {
+            // A transmit is the one place the loop legitimately sits for
+            // seconds, so it says so once a millisecond.
+            crate::watchdog::beat(Task::Loop, Phase::TxSend);
             if Instant::now() - start > deadline {
-                println!("TX timeout (no TxDone after {} ms)", self.tx_poll_timeout_ms);
+                crate::event!(
+                    Kind::Radio,
+                    "TX timeout (no TxDone after {} ms)",
+                    self.tx_poll_timeout_ms
+                );
                 self.radio.clear_irq_status(irq::ALL);
                 break Err(Sx1262Error::Timeout);
             }

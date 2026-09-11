@@ -98,7 +98,10 @@ impl GpsWatch {
         if self.was_sleeping && !gps.sleeping {
             self.cfg_tries = 0;
             self.next_cfg_ms = now_ms;
-            status_println!("gps: woke itself from backup, reconfiguring");
+            crate::event!(
+                midair_proto::evlog::Kind::Gps,
+                "gps: woke itself from backup, reconfiguring"
+            );
         }
         self.was_sleeping = gps.sleeping;
         let fix = gps.has_fix();
@@ -146,7 +149,10 @@ impl GpsWatch {
             if gps.configure(cfg).await {
                 status_println!("gps: settings applied");
             } else if self.cfg_tries == CFG_TRIES {
-                status_println!("gps: settings still not accepted, giving up");
+                crate::event!(
+                    midair_proto::evlog::Kind::Gps,
+                    "gps: settings still not accepted, giving up"
+                );
             }
         }
         // Not while the receiver is in a backup this firmware asked for:
@@ -157,9 +163,16 @@ impl GpsWatch {
             self.checked = true;
             if !gps.present() {
                 if gps.rx_bytes() == 0 {
-                    status_println!("gps: silent on UART1 (power/wiring?)");
+                    crate::event!(
+                        midair_proto::evlog::Kind::Gps,
+                        "gps: silent on UART1 (power/wiring?)"
+                    );
                 } else {
-                    status_println!("gps: {} bytes but no NMEA (baud?)", gps.rx_bytes());
+                    crate::event!(
+                        midair_proto::evlog::Kind::Gps,
+                        "gps: {} bytes but no NMEA (baud?)",
+                        gps.rx_bytes()
+                    );
                 }
             }
         }

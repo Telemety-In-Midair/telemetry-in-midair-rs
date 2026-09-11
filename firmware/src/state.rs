@@ -313,6 +313,10 @@ pub fn command(c: ServeCommand) {
     }
     if COMMANDS.try_send(c).is_err() {
         crate::qprintln!("serve: command queue full, {:?} dropped", c);
+        crate::evlog::note(
+            midair_proto::evlog::Kind::Note,
+            format_args!("serve: command queue full, {:?} dropped", c),
+        );
     }
 }
 
