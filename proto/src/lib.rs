@@ -29,8 +29,12 @@
 //!   be repeated, which is what keeps a repeater from becoming a storm.
 //! - [`beacon`]: when the next beacon goes out - the planner the hardware
 //!   loop runs once a pass.
+//! - [`supervise`]: which tasks are watched, how long each may go quiet,
+//!   and what is written down when one stops - the monitor's policy.
+//! - [`evlog`]: the record the board writes about itself into its own
+//!   flash, and the ring it is kept in.
 //!
-//! The last three, with `hop` and `roster`, are the machines the state
+//! The last five, with `hop` and `roster`, are the machines the state
 //! space tests in `tests/` walk exhaustively; `midair-explore` is the
 //! harness.
 //!
@@ -59,13 +63,22 @@ pub fn wire_consts_json() -> String {
             matches!(spec.zero, session::Zero::Off)
         ));
     }
+    let mut kinds = Vec::new();
+    for kind in evlog::Kind::ALL {
+        kinds.push(format!("\"{}\": {}", kind.as_str(), kind.as_wire()));
+    }
+    let mut tasks = Vec::new();
+    for task in supervise::Task::ALL {
+        tasks.push(format!("\"{}\": {}", task.as_str(), task.as_wire()));
+    }
     format!(
         "{{\n\
   \"link\": {{\"sync\": {}, \"max_payload\": {}, \"ack\": {}}},\n\
-  \"usb\": {{\"ping\": {}, \"bulk\": {}, \"bulk_ack\": {}, \"info\": {}, \"sleep\": {}, \"cfg\": {}, \"wipe\": {}}},\n\
+  \"usb\": {{\"ping\": {}, \"bulk\": {}, \"bulk_ack\": {}, \"info\": {}, \"sleep\": {}, \"cfg\": {}, \"wipe\": {}, \"evlog\": {}}},\n\
   \"bulk\": {{\"begin\": {}, \"data\": {}, \"end\": {}, \"abort\": {}, \"kind_toml\": {}, \"kind_ota\": {}, \"data_max\": {}, \"config_max\": {}, \"ack_id\": {}}},\n\
   \"ack\": {{\"ok\": {}, \"unknown_id\": {}, \"bad_value\": {}, \"board_error\": {}, \"bad_state\": {}}},\n\
   \"cfg\": {{\"notify_interval_ms\": {}, \"radio_standby\": {}, \"gps_sleep\": {}, \"sleep_now\": {}, \"mode\": {}, \"name\": {}}},\n\
+  \"evlog\": {{\"record_len\": {}, \"header_len\": {}, \"text_max\": {}, \"magic\": {}, \"erase_index\": {}, \"kinds\": {{{}}}, \"tasks\": {{{}}}}},\n\
   \"knobs\": [\n{}\n  ]\n\
 }}\n",
         link::SYNC,
@@ -78,6 +91,7 @@ pub fn wire_consts_json() -> String {
         link::usb::SLEEP,
         link::usb::CFG,
         link::usb::WIPE,
+        link::usb::EVLOG,
         ble::OP_BEGIN,
         ble::OP_DATA,
         ble::OP_END,
@@ -98,6 +112,13 @@ pub fn wire_consts_json() -> String {
         ble::CFG_SLEEP_NOW,
         ble::CFG_MODE,
         ble::CFG_NAME,
+        evlog::RECORD_LEN,
+        evlog::HEADER_LEN,
+        evlog::TEXT_MAX,
+        evlog::MAGIC,
+        link::usb::EVLOG_ERASE,
+        kinds.join(", "),
+        tasks.join(", "),
         knobs.join(",\n")
     )
 }
@@ -107,6 +128,7 @@ pub mod ble;
 pub mod bulk;
 pub mod cfgstore;
 pub mod dedup;
+pub mod evlog;
 pub mod geo;
 pub mod hop;
 pub mod link;
@@ -116,6 +138,7 @@ pub mod radiocfg;
 pub mod roster;
 pub mod rxgate;
 pub mod session;
+pub mod supervise;
 
 #[cfg(test)]
 mod tests {

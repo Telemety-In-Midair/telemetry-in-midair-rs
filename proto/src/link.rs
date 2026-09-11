@@ -77,6 +77,17 @@ pub mod usb {
     /// the settings live in RTC RAM as well as flash, and RTC RAM survives
     /// every reset short of a power cycle. This command clears both.
     pub const WIPE: u8 = 0x56;
+    /// Host -> board, `[index u16le]` - read one record of the event log
+    /// (see [`crate::evlog`]), newest first: index 0 is the last thing
+    /// the board wrote down. The board answers [`super::resp::ACK`]
+    /// (`[EVLOG, count u16le, index u16le, record...]`) with the record's
+    /// bytes, or with no record bytes past the end of the log, so a tool
+    /// reads until the reply comes back short. `count` is how many
+    /// records the log holds. An index of [`EVLOG_ERASE`] erases the log
+    /// instead, and the reply carries a count of 0.
+    pub const EVLOG: u8 = 0x57;
+    /// The [`EVLOG`] index that erases the log rather than reading it.
+    pub const EVLOG_ERASE: u16 = 0xFFFF;
 }
 
 /// Responses, following a command.

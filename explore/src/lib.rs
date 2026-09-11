@@ -428,6 +428,22 @@ impl<M: Machine> Explored<M> {
         pred: impl Fn(&M::State) -> bool,
         what: &str,
     ) -> &Self {
+        if let Some(i) = self.trap(pred) {
+            panic!(
+                "state space violation: from here nothing can reach a state where {what}\n  after {} events:\n{}",
+                self.depth[i],
+                self.format_trace(machine, i)
+            );
+        }
+        self
+    }
+
+    /// The shallowest state from which no state satisfying `pred` can be
+    /// reached, if there is one: what [`assert_always_reachable`] fails on,
+    /// for a model that expects to find one.
+    ///
+    /// [`assert_always_reachable`]: Self::assert_always_reachable
+    pub fn trap(&self, pred: impl Fn(&M::State) -> bool) -> Option<usize> {
         assert!(
             !self.truncated,
             "exploration truncated at {} states: liveness cannot be judged on a walk that stopped early",
@@ -458,14 +474,7 @@ impl<M: Machine> Explored<M> {
                 }
             }
         }
-        if let Some(i) = (0..n).find(|&i| self.expanded[i] && !can[i]) {
-            panic!(
-                "state space violation: from here nothing can reach a state where {what}\n  after {} events:\n{}",
-                self.depth[i],
-                self.format_trace(machine, i)
-            );
-        }
-        self
+        (0..n).find(|&i| self.expanded[i] && !can[i])
     }
 }
 
