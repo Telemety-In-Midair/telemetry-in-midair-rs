@@ -108,8 +108,7 @@ pub enum Phase {
     TxSend = 4,
     /// Polling the radio for a frame.
     Receive = 5,
-    /// The card: a flush, a mount, a config write.
-    Card = 6,
+    // 6 was the SD card, which the firmware no longer drives.
     /// The J5 panel and the magnetometer.
     Panel = 7,
     /// The status line.
@@ -150,7 +149,6 @@ impl Phase {
             Phase::Beacon => "beacon",
             Phase::TxSend => "tx send",
             Phase::Receive => "receive",
-            Phase::Card => "card",
             Phase::Panel => "panel",
             Phase::Status => "status",
             Phase::RadioInit => "radio init",
@@ -180,7 +178,6 @@ impl Phase {
             3 => Phase::Beacon,
             4 => Phase::TxSend,
             5 => Phase::Receive,
-            6 => Phase::Card,
             7 => Phase::Panel,
             8 => Phase::Status,
             9 => Phase::RadioInit,

@@ -124,13 +124,6 @@ embedded-io-async = "0.7.0"
 esp-storage      = { version = "0.8.1", features = ["esp32s3"] }
 embedded-storage = "0.3.1"
 
-# FAT filesystem so the SD card logs are readable on a phone/computer.
-# Unlike the WIO-E5 build this uses the crate's own SPI-mode SD driver:
-# esp-hal implements embedded-hal 1.0, so the in-repo driver that existed
-# to work around stm32wlxx-hal's 0.2 is not needed.
-embedded-sdmmc = { version = "0.8", default-features = false }
-embedded-hal-bus = "0.3"
-
 # Board link protocol, BLE extensions and radio config. Host-tested.
 midair-proto = { path = "../proto" }
 # Shared BLE position protocol and NMEA parsing.

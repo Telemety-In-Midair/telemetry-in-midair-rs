@@ -210,8 +210,7 @@ impl Flash {
     /// understand, or a text the crc rejects. The caller then falls back to
     /// the card or to defaults rather than acting on garbage.
     ///
-    /// A text longer than `buf` is refused rather than truncated, for the
-    /// reason [`crate::sdlog::SdLog::read_config`] refuses one: the parser
+    /// A text longer than `buf` is refused rather than truncated: the parser
     /// accepts any prefix that ends on a line boundary, so a truncated read
     /// would be adopted as whatever fitted and reported as loaded.
     pub fn load_config(&mut self, buf: &mut [u8]) -> Option<usize> {

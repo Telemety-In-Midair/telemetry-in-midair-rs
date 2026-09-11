@@ -1,6 +1,6 @@
 //! What the hardware task raises and lowers, and the requests that move it.
 //!
-//! The hardware task owns the radio, the GPS and the card. Everything else
+//! The hardware task owns the radio, the GPS and the panel. Everything else
 //! - the BLE session, the USB console, the serve loop - asks it to change
 //! what is up and what is down through a [`Request`], and the task answers
 //! on its next pass. What each request does depends on where the board
@@ -43,10 +43,9 @@ pub enum Request {
     /// from the side that owns the sleep.
     Mode(Mode),
     /// A new radio config was pushed and verified. Re-init the radio and
-    /// the node from it, write it back to the card and to flash.
+    /// the node from it, write it back to flash.
     ApplyConfig,
-    /// A firmware image landed in the inactive slot. Flush the card and
-    /// reboot into it.
+    /// A firmware image landed in the inactive slot. Reboot into it.
     Reboot,
     /// The board is about to deep sleep. Park everything a sleeping board
     /// cannot use and say when it is done.
@@ -64,8 +63,8 @@ pub enum Request {
 /// [`take`](Requests::take) hands them out in a fixed order rather than in
 /// arrival order, because the order that is correct does not depend on who
 /// asked first: a mode decides the posture the overrides apply inside, a
-/// config wants the card the mode may have just mounted, and a park has to
-/// come after anything that raises or the board sleeps with it up.
+/// config wants the stored one the mode may have just read, and a park has
+/// to come after anything that raises or the board sleeps with it up.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Requests {
     mode: Option<Mode>,
@@ -163,25 +162,22 @@ pub enum Gps {
     Awake,
 }
 
-/// Where the card is.
+/// Whether the stored radio config has been read and adopted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Card {
-    /// Left off the bus: a wake check has not read it and may never.
-    Deferred,
-    /// Mounted, or trying to mount, and logging.
-    Mounted,
-    /// Flushed and unmounted for a deep sleep.
-    Parked,
+pub enum Config {
+    /// Not yet: a wake check does not read it and may never need to.
+    Unread,
+    /// Read from the board's flash and adopted, or found absent and the
+    /// defaults adopted in its place.
+    Read,
 }
 
 /// One thing the hardware task has to do for a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Effect {
-    /// Read the card and adopt the stored config, then reconfigure the
-    /// node from it.
-    MountCard,
-    /// Flush the buffered log lines and unmount the card.
-    ParkCard,
+    /// Read the stored config from flash and adopt it, then reconfigure
+    /// the node from it.
+    LoadConfig,
     /// Bring the receiver up: wake it from backup, or configure a receiver
     /// that is already running, and re-arm the settings retry.
     GpsUp,
@@ -223,7 +219,7 @@ pub struct Effects {
 
 impl Effects {
     fn push(&mut self, e: Effect) {
-        // The longest sequence is a park, which is six; the array is sized
+        // The longest sequence is a park, which is five; the array is sized
         // with room, so this cannot overflow short of a new effect being
         // added to the longest arm without the constant following.
         if self.len < EFFECTS_MAX {
@@ -266,15 +262,18 @@ pub struct Posture {
     pub live: Mode,
     pub radio: Radio,
     pub gps: Gps,
-    pub card: Card,
+    pub config: Config,
+    /// Parked for a deep sleep: everything down, and staying down
+    /// whatever arrives until the chip goes.
+    pub parked: bool,
 }
 
 impl Posture {
     /// What a boot into `boot` raises, and the effects that raise it.
     ///
-    /// Three flavors. A wake check raises nothing and reads no card: it
+    /// Three flavors. A wake check raises nothing and reads no config: it
     /// exists to ask whether anyone wants the board back, which needs BLE
-    /// only. Idle mounts the card so config reads and log pulls work, and
+    /// only. Idle reads the config so a config read-back answers, and
     /// parks the receiver a cold boot left acquiring. Tracking and
     /// listening raise everything, then honor the two overrides the
     /// settings carry.
@@ -287,29 +286,32 @@ impl Posture {
                     live: boot,
                     radio: Radio::Asleep,
                     gps: Gps::Parked,
-                    card: Card::Deferred,
+                    config: Config::Unread,
+                    parked: false,
                 }
             }
             Mode::Idle => {
-                fx.push(Effect::MountCard);
+                fx.push(Effect::LoadConfig);
                 fx.push(Effect::GpsPark);
                 fx.push(Effect::RadioSleep);
                 Self {
                     live: boot,
                     radio: Radio::Asleep,
                     gps: Gps::Parked,
-                    card: Card::Mounted,
+                    config: Config::Read,
+                    parked: false,
                 }
             }
             Mode::Tracking | Mode::Listening => {
-                fx.push(Effect::MountCard);
+                fx.push(Effect::LoadConfig);
                 fx.push(Effect::RadioInit);
                 fx.push(Effect::GpsUp);
                 Self {
                     live: boot,
                     radio: Radio::Up,
                     gps: Gps::Awake,
-                    card: Card::Mounted,
+                    config: Config::Read,
+                    parked: false,
                 }
             }
         };
@@ -328,11 +330,11 @@ impl Posture {
         self.move_radio(want_radio, fx);
     }
 
-    /// Bring up a card a wake check left off the bus.
-    fn mount(&mut self, fx: &mut Effects) {
-        if self.card == Card::Deferred {
-            fx.push(Effect::MountCard);
-            self.card = Card::Mounted;
+    /// Read the stored config a wake check left unread.
+    fn load(&mut self, fx: &mut Effects) {
+        if self.config == Config::Unread {
+            fx.push(Effect::LoadConfig);
+            self.config = Config::Read;
         }
     }
 
@@ -380,7 +382,7 @@ impl Posture {
         // override that arrives in that window - from the console, since
         // the session that could have sent one is gone - would raise the
         // receiver or the radio for the sleep to happen over.
-        if self.card == Card::Parked && !matches!(r, Request::PrepareSleep | Request::Reboot) {
+        if self.parked && !matches!(r, Request::PrepareSleep | Request::Reboot) {
             return fx;
         }
         match r {
@@ -403,9 +405,9 @@ impl Posture {
             }
             Request::Mode(m) => {
                 self.live = m;
-                // The card first: a config that has not been read yet is
-                // the one the radio is about to be initialized from.
-                self.mount(&mut fx);
+                // The config first: one that has not been read yet is the
+                // one the radio is about to be initialized from.
+                self.load(&mut fx);
                 if m.tracks() {
                     self.apply_overrides(stored, &mut fx);
                 } else {
@@ -414,7 +416,7 @@ impl Posture {
                 }
             }
             Request::ApplyConfig => {
-                self.mount(&mut fx);
+                self.load(&mut fx);
                 fx.push(Effect::ApplyConfig);
                 // The apply re-initializes the radio, which is the one
                 // thing that brings it up. A board that was not using it
@@ -429,8 +431,8 @@ impl Posture {
             Request::PrepareSleep => {
                 // Everything a sleeping board cannot use, in the order that
                 // loses the least when the sequence does not finish: the
-                // three that cost current first, each bounded work, and
-                // the card last because it alone can stall.
+                // two that cost current first, each bounded work, then the
+                // panel.
                 if self.gps == Gps::Parked {
                     fx.push(Effect::CheckParkHeld);
                 }
@@ -440,19 +442,13 @@ impl Posture {
                 fx.push(Effect::GpsPark);
                 fx.push(Effect::RadioSleep);
                 fx.push(Effect::PanelBlank);
-                fx.push(Effect::ParkCard);
                 fx.push(Effect::SleepReady);
                 self.gps = Gps::Parked;
                 self.radio = Radio::Asleep;
-                self.card = Card::Parked;
+                self.parked = true;
             }
-            Request::Reboot => {
-                // The same hole as a deep sleep and the same fix: the
-                // pending log buffer is RAM, and a reset is a reset. The
-                // posture is not moved because the reset follows.
-                fx.push(Effect::ParkCard);
-                fx.push(Effect::Reboot);
-            }
+            // The posture is not moved because the reset follows.
+            Request::Reboot => fx.push(Effect::Reboot),
         }
         fx
     }
@@ -526,10 +522,10 @@ impl Posture {
     /// A parked board has everything down whatever its mode; a wake check
     /// and an idle board have the receiver and the radio down; a tracking
     /// board has each of them exactly where its override flag says, and
-    /// its card mounted.
+    /// its config read.
     pub fn consistent(&self, stored: &Stored) -> Result<(), &'static str> {
         let down = self.radio == Radio::Asleep && self.gps == Gps::Parked;
-        if self.card == Card::Parked {
+        if self.parked {
             return if down { Ok(()) } else { Err("parked for sleep with something still up") };
         }
         match self.live {
@@ -543,15 +539,15 @@ impl Posture {
             Mode::Idle => {
                 if !down {
                     Err("idle with the receiver or the radio up")
-                } else if self.card != Card::Mounted {
-                    Err("idle without the card")
+                } else if self.config != Config::Read {
+                    Err("idle without the config read")
                 } else {
                     Ok(())
                 }
             }
             Mode::Tracking | Mode::Listening => {
-                if self.card != Card::Mounted {
-                    return Err("tracking without the card");
+                if self.config != Config::Read {
+                    return Err("tracking without the config read");
                 }
                 let want_gps = if stored.gps_sleep() { Gps::Parked } else { Gps::Awake };
                 if self.gps != want_gps {
@@ -643,19 +639,19 @@ mod tests {
     // -- boot ---------------------------------------------------------------
 
     #[test]
-    fn a_wake_check_raises_nothing_and_reads_no_card() {
+    fn a_wake_check_raises_nothing_and_reads_no_config() {
         let (p, e) = Posture::at_boot(Mode::Stored, &Stored::new());
         assert_eq!(fx(e), vec![Effect::GpsAssumeParked]);
-        assert_eq!(p.card, Card::Deferred);
+        assert_eq!(p.config, Config::Unread);
         assert!(!p.busy());
         assert_eq!(p.consistent(&Stored::new()), Ok(()));
     }
 
     #[test]
-    fn idle_mounts_the_card_and_parks_the_rest() {
+    fn idle_reads_the_config_and_parks_the_rest() {
         let (p, e) = Posture::at_boot(Mode::Idle, &Stored::new());
-        assert_eq!(fx(e), vec![Effect::MountCard, Effect::GpsPark, Effect::RadioSleep]);
-        assert_eq!((p.radio, p.gps, p.card), (Radio::Asleep, Gps::Parked, Card::Mounted));
+        assert_eq!(fx(e), vec![Effect::LoadConfig, Effect::GpsPark, Effect::RadioSleep]);
+        assert_eq!((p.radio, p.gps, p.config), (Radio::Asleep, Gps::Parked, Config::Read));
         assert!(!p.busy());
     }
 
@@ -664,7 +660,7 @@ mod tests {
     #[test]
     fn tracking_raises_everything_then_honors_the_overrides() {
         let (p, e) = Posture::at_boot(Mode::Tracking, &Stored::new());
-        assert_eq!(fx(e), vec![Effect::MountCard, Effect::RadioInit, Effect::GpsUp]);
+        assert_eq!(fx(e), vec![Effect::LoadConfig, Effect::RadioInit, Effect::GpsUp]);
         assert!(p.radio_up() && p.gps_awake());
 
         let s = flags(PFLAG_GPS_SLEEP | PFLAG_RADIO_STANDBY);
@@ -672,7 +668,7 @@ mod tests {
         assert_eq!(
             fx(e),
             vec![
-                Effect::MountCard,
+                Effect::LoadConfig,
                 Effect::RadioInit,
                 Effect::GpsUp,
                 Effect::GpsPark,
@@ -742,20 +738,20 @@ mod tests {
         }
     }
 
-    /// A promotion mounts the card the wake check deferred, and only the
-    /// card.
+    /// A promotion reads the config the wake check left unread, and only
+    /// that.
     #[test]
-    fn a_promotion_mounts_the_deferred_card() {
+    fn a_promotion_reads_the_unread_config() {
         let s = Stored::new();
         let (mut p, _) = Posture::at_boot(Mode::Stored, &s);
-        assert_eq!(fx(p.on(Request::Mode(Mode::Idle), &s)), vec![Effect::MountCard]);
-        assert_eq!(p.card, Card::Mounted);
+        assert_eq!(fx(p.on(Request::Mode(Mode::Idle), &s)), vec![Effect::LoadConfig]);
+        assert_eq!(p.config, Config::Read);
         assert_eq!(p.consistent(&s), Ok(()));
         // And a tracking command straight from a wake check raises the lot.
         let (mut p, _) = Posture::at_boot(Mode::Stored, &s);
         assert_eq!(
             fx(p.on(Request::Mode(Mode::Tracking), &s)),
-            vec![Effect::MountCard, Effect::GpsUp, Effect::RadioInit]
+            vec![Effect::LoadConfig, Effect::GpsUp, Effect::RadioInit]
         );
         assert_eq!(p.consistent(&s), Ok(()));
     }
@@ -772,12 +768,12 @@ mod tests {
         let st = flags(PFLAG_RADIO_STANDBY);
         let (mut p, _) = Posture::at_boot(Mode::Tracking, &st);
         assert_eq!(fx(p.on(Request::ApplyConfig, &st)), vec![Effect::ApplyConfig, Effect::RadioStandby]);
-        // On a wake check the card comes up first, so the file has a card
-        // to be written to.
+        // On a wake check the stored config is read first, so the apply
+        // lands on a node that knows what it had.
         let (mut p, _) = Posture::at_boot(Mode::Stored, &s);
         assert_eq!(
             fx(p.on(Request::ApplyConfig, &s)),
-            vec![Effect::MountCard, Effect::ApplyConfig, Effect::RadioSleep]
+            vec![Effect::LoadConfig, Effect::ApplyConfig, Effect::RadioSleep]
         );
     }
 
@@ -793,24 +789,24 @@ mod tests {
                 Effect::GpsPark,
                 Effect::RadioSleep,
                 Effect::PanelBlank,
-                Effect::ParkCard,
                 Effect::SleepReady
             ]
         );
-        assert_eq!(p.card, Card::Parked);
+        assert!(p.parked);
         assert_eq!(p.consistent(&s), Ok(()));
         // A receiver that should already be parked is probed first.
         let (mut p, _) = Posture::at_boot(Mode::Stored, &s);
         let e = p.on(Request::PrepareSleep, &s);
         assert_eq!(e.iter().next(), Some(Effect::CheckParkHeld));
-        assert_eq!(e.len(), 6);
+        assert_eq!(e.len(), 5);
     }
 
     #[test]
-    fn a_reboot_flushes_the_card_first() {
+    fn a_reboot_is_only_a_reboot() {
         let s = Stored::new();
         let (mut p, _) = Posture::at_boot(Mode::Tracking, &s);
-        assert_eq!(fx(p.on(Request::Reboot, &s)), vec![Effect::ParkCard, Effect::Reboot]);
+        assert_eq!(fx(p.on(Request::Reboot, &s)), vec![Effect::Reboot]);
+        assert!(!p.parked);
     }
 
     #[test]
@@ -846,7 +842,7 @@ mod tests {
             assert!(p.on(r, &s).is_empty(), "{r:?}");
             assert_eq!(p.consistent(&s), Ok(()), "{r:?}");
         }
-        assert_eq!(p.card, Card::Parked);
+        assert!(p.parked);
     }
 
     /// The whole mode x role matrix, written down: each half of the air is

@@ -40,7 +40,6 @@ use embassy_executor::Spawner;
 #[cfg(feature = "iso-no-ble")]
 use embassy_time::{Duration, Timer};
 use esp_hal::clock::CpuClock;
-use esp_hal::delay::Delay;
 use esp_hal::gpio::interconnect::{InputSignal, PeripheralInput};
 use esp_hal::gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull};
 use esp_hal::rtc_cntl::Rtc;
@@ -58,18 +57,12 @@ use static_cell::StaticCell;
 use wio_s3_gps::gps::{Gps, BAUD as GPS_BAUD};
 use wio_s3_gps::hardware::{self, LED_OFF};
 use wio_s3_gps::radio::Sx1262Driver;
-use wio_s3_gps::sdlog::SdLog;
 use wio_s3_gps::sx1262::Sx1262;
 use wio_s3_gps::{flash, settings, state, status_println};
 
 /// The SX1262 SPI clock. The chip takes up to 16 MHz; the bus here is
 /// entirely inside the module, so this is conservative rather than tuned.
 const LORA_SPI_HZ: u32 = 8_000_000;
-
-/// SD card SPI clock. Cards must be initialized at 400 kHz or under, and
-/// this never raises it afterwards - a flush is about a kilobyte every five
-/// seconds, so the 25 ms it costs is not worth the reconfiguration.
-const SD_SPI_HZ: u32 = 400_000;
 
 /// Stack for the second core's executor thread. The hardware task's own
 /// state lives in the task arena, but its future is built on this stack
@@ -424,23 +417,22 @@ async fn main(spawner: Spawner) -> ! {
         esp_hal::gpio::RtcPin::rtcio_pad_hold(&esp_hal::peripherals::GPIO2::steal(), false);
     }
 
-    // microSD on SPI3. Three of these four lines are ESP32-S3 strapping
-    // pins - see BOARD-REVIEW.md in the board repo; R17 on GPIO45 is DNP
-    // for that reason.
-    let sd_spi = Spi::new(
-        peripherals.SPI3,
-        SpiConfig::default()
-            .with_frequency(Rate::from_hz(SD_SPI_HZ))
-            .with_mode(SpiMode::_0),
-    )
-    .expect("sd spi")
-    .with_sck(peripherals.GPIO46)
-    .with_mosi(peripherals.GPIO45)
-    .with_miso(miso_with_pullup(peripherals.GPIO3));
-    let sd_cs = Output::new(peripherals.GPIO44, Level::High, OutputConfig::default());
-    let sd_dev = embedded_hal_bus::spi::ExclusiveDevice::new(sd_spi, sd_cs, Delay::new())
-        .expect("sd spi device");
-    let sdlog = SdLog::new(embedded_sdmmc::SdCard::new(sd_dev, Delay::new()));
+    // The microSD slot's four lines. The firmware does not drive the card
+    // any more, so they are parked like the other unused pins: the three
+    // the card drives or listens on pulled down, and its chip select
+    // pulled up, which is a card deselected - a card in the slot then
+    // leaves its data line in high impedance rather than driving it. All
+    // three strapping pins among them are sampled at reset only, so a pull
+    // after boot changes nothing about the next one.
+    let _card_pins = (
+        Input::new(peripherals.GPIO46, idle),
+        Input::new(peripherals.GPIO45, idle),
+        Input::new(peripherals.GPIO3, idle),
+        Input::new(
+            peripherals.GPIO44,
+            InputConfig::default().with_pull(Pull::Up),
+        ),
+    );
 
     // The status display on J5. Optional hardware: a board with nothing on
     // that connector gets `None` and never mentions it again.
@@ -493,20 +485,18 @@ async fn main(spawner: Spawner) -> ! {
 
         let sw = SoftwareInterruptControl::new(peripherals.SW_INTERRUPT);
         let cold = !woke_from_sleep;
-        let carried = ToAppCore((lora, gps, sdlog, j5, d5, d2));
+        let carried = ToAppCore((lora, gps, j5, d5, d2));
         esp_rtos::start_second_core(
             peripherals.CPU_CTRL,
             sw.software_interrupt0,
             sw.software_interrupt1,
             APP_STACK.init(Stack::new()),
             move || {
-                let (lora, gps, sdlog, j5, d5, d2) = carried.into_inner();
+                let (lora, gps, j5, d5, d2) = carried.into_inner();
                 let executor = APP_EXECUTOR.init(esp_rtos::embassy::Executor::new());
                 executor.run(|app| {
-                    app.spawn(hardware::hardware_task(
-                        lora, gps, sdlog, j5, d5, d2, boot, cold,
-                    ))
-                    .expect("spawn hardware task");
+                    app.spawn(hardware::hardware_task(lora, gps, j5, d5, d2, boot, cold))
+                        .expect("spawn hardware task");
                 })
             },
         );
@@ -521,7 +511,6 @@ async fn main(spawner: Spawner) -> ! {
         .spawn(hardware::hardware_task(
             lora,
             gps,
-            sdlog,
             j5,
             d5,
             d2,

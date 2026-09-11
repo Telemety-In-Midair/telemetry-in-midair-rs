@@ -38,7 +38,7 @@
 use midair_explore::{explore, Machine};
 use midair_proto::ble::{self, Mode};
 use midair_proto::bulk::Owner;
-use midair_proto::posture::{Card, Effect, Gps, Posture, Radio, Request, Requests};
+use midair_proto::posture::{Config, Effect, Gps, Posture, Radio, Request, Requests};
 use midair_proto::radiocfg::Role;
 use midair_proto::session::{
     apply, boot_mode, dispatch, during_ble_down, Accepted, Next, Serve, ServeCommand, Stored,
@@ -274,7 +274,7 @@ impl Board {
     fn loop_pass(&mut self) {
         self.ignored_while_parked = false;
         while let Some(r) = self.requests.take() {
-            let parked = self.posture.card == Card::Parked;
+            let parked = self.posture.parked;
             let fx = self.posture.on(r, &self.stored);
             if parked && fx.is_empty() && !matches!(r, Request::PrepareSleep | Request::Reboot) {
                 self.ignored_while_parked = true;
@@ -460,24 +460,22 @@ impl Machine for Firmware {
                 .consistent(&b.stored)
                 .map_err(|e| format!("posture: {e}"))?;
         }
-        if b.posture.card == Card::Parked
-            && (b.posture.radio != Radio::Asleep || b.posture.gps != Gps::Parked)
-        {
+        if b.posture.parked && (b.posture.radio != Radio::Asleep || b.posture.gps != Gps::Parked) {
             return Err("parked for sleep with something still up".into());
         }
         if b.ble == Ble::Asleep {
             if !b.sleep_ready {
                 return Err("asleep without the park having finished".into());
             }
-            if b.posture.card != Card::Parked
+            if !b.posture.parked
                 || b.posture.radio != Radio::Asleep
                 || b.posture.gps != Gps::Parked
             {
                 return Err("asleep with something still up".into());
             }
         }
-        if b.sleep_ready && b.posture.card != Card::Parked {
-            return Err("the park signaled done with the card not parked".into());
+        if b.sleep_ready && !b.posture.parked {
+            return Err("the park signaled done with the board not parked".into());
         }
         if b.tx && !(b.posture.live.transmits() && b.posture.radio_up()) {
             return Err("transmitting in a posture that must not".into());
@@ -521,14 +519,15 @@ impl Machine for Firmware {
 
     fn describe(&self, b: &Board) -> String {
         format!(
-            "ble {:?} | settings {:?} flags {:#x} | hw {:?} radio {:?} gps {:?} card {:?} | queue {} nap {:?} asked {} ready {} transfer {:?} tx {}",
+            "ble {:?} | settings {:?} flags {:#x} | hw {:?} radio {:?} gps {:?} config {:?} parked {} | queue {} nap {:?} asked {} ready {} transfer {:?} tx {}",
             b.ble,
             b.stored.mode,
             b.stored.flags,
             b.posture.live,
             b.posture.radio,
             b.posture.gps,
-            b.posture.card,
+            b.posture.config,
+            b.posture.parked,
             if b.requests.is_empty() { "empty" } else { "pending" },
             b.pending_sleep,
             b.sleep_asked,
@@ -589,8 +588,8 @@ fn every_reachable_board_state_is_sound() {
         "a wake check is connected to before the promotion lands",
     );
     x.assert_some(
-        |b| b.serve.mode() == Mode::Idle && b.stored.mode == Mode::Idle && b.posture.card == Card::Deferred,
-        "a promoted wake check whose card is not up yet",
+        |b| b.serve.mode() == Mode::Idle && b.stored.mode == Mode::Idle && b.posture.config == Config::Unread,
+        "a promoted wake check whose config is not read yet",
     );
     x.assert_some(
         |b| b.tx && b.ble == Ble::Connected && b.transfer.is_some(),
@@ -601,7 +600,7 @@ fn every_reachable_board_state_is_sound() {
         "the radio parked while the receiver runs",
     );
     x.assert_some(
-        |b| b.ble == Ble::Parking && !b.requests.is_empty() && b.posture.card == Card::Parked,
+        |b| b.ble == Ble::Parking && !b.requests.is_empty() && b.posture.parked,
         "a request arriving after the park",
     );
 

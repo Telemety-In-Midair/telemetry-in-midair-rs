@@ -69,7 +69,7 @@ fn idx(task: Task) -> usize {
 /// the crumb has something to get wrong.
 fn phases(task: Task) -> [Phase; 2] {
     match task {
-        Task::Loop => [Phase::TxSend, Phase::Card],
+        Task::Loop => [Phase::TxSend, Phase::Receive],
         Task::Serve => [Phase::Advertise, Phase::Session],
     }
 }

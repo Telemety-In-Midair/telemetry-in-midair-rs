@@ -1,5 +1,5 @@
-//! Everything that is not BLE: the radio, the GPS, the card and the panel,
-//! owned by one task on the second core.
+//! Everything that is not BLE: the radio, the GPS and the panel, owned by
+//! one task on the second core.
 //!
 //! Owning them in one task is what removes any link protocol between them.
 //! The BLE session never touches the hardware; it reads the snapshot this
@@ -17,7 +17,7 @@ use gps_proto::packet;
 use midair_proto::beacon::{Planner, Step};
 use midair_proto::ble::{self, Mode};
 use midair_proto::bulk;
-use midair_proto::posture::{Card, Effect, Effects, Posture, Radio, Request};
+use midair_proto::posture::{Effect, Effects, Posture, Radio, Request};
 use midair_proto::session::Stored;
 use midair_proto::radiocfg::{self, RadioConfig};
 use midair_proto::evlog::Kind;
@@ -29,7 +29,6 @@ use crate::gps::Gps;
 use crate::gpsctl::GpsWatch;
 use crate::node::Node;
 use crate::radio::Sx1262Driver;
-use crate::sdlog::{SdLog, CONFIG_MAX};
 use crate::{crumb, event, flash, oled, settings, state, watchdog, xfer};
 
 /// Status LEDs, cathodes on GPIO43 and GPIO14. Active low: the anodes sit
@@ -43,7 +42,7 @@ const BLINK_MS: u64 = 20;
 /// The longest gap between two passes of the hardware loop after which a
 /// GPS time mark parsed on the second is not used to set the hop clock,
 /// ms. The sentence arrived somewhere in that gap and was parsed at its
-/// end; with a beacon or a card flush in between, that is hundreds of
+/// end; with a beacon or a config apply in between, that is hundreds of
 /// milliseconds of error handed to every node that follows this one.
 const LATE_PASS_MS: u64 = 40;
 
@@ -160,7 +159,6 @@ pub async fn probe_j5(i2c0: esp_hal::peripherals::I2C0<'static>) -> Option<J5> {
 pub struct Hardware {
     node: Node<'static>,
     gps: Gps<'static>,
-    sdlog: SdLog<'static>,
     j5: Option<J5>,
     rx_led: Blinker,
     tx_led: Blinker,
@@ -168,8 +166,8 @@ pub struct Hardware {
     /// Whether a stored config was adopted at all, which is what the
     /// `CFG_LOADED` telemetry flag reports.
     cfg_loaded: bool,
-    /// Whether the next card mount is the cold boot's, which is the one
-    /// that adopts the file's `[power]` section: a deep-sleep wake keeps
+    /// Whether the next config load is the cold boot's, which is the one
+    /// that adopts the record's `[power]` section: a deep-sleep wake keeps
     /// the live settings, and so does a promotion.
     cold: bool,
     watch: GpsWatch,
@@ -198,29 +196,26 @@ impl Hardware {
     /// and the task's future, which is built on the second core's stack
     /// before it is moved into the arena, overflowed that stack.
     ///
-    /// The card starts deferred and comes up on the first effect that
-    /// mounts it, which a wake check never issues: it exists to ask whether
-    /// anyone wants the board back, and that question needs BLE and
-    /// nothing else. `cold` is whether this is a cold boot rather than a
+    /// The stored config is read on the first effect that asks for it,
+    /// which a wake check never issues: it exists to ask whether anyone
+    /// wants the board back, and that question needs BLE and nothing
+    /// else. `cold` is whether this is a cold boot rather than a
     /// deep-sleep wake; `posture` is what [`Posture::at_boot`] said the boot
     /// raises, whose effects [`boot`](Self::boot) then carries out.
     pub fn new(
         lora: Sx1262Driver<'static>,
         gps: Gps<'static>,
-        mut sdlog: SdLog<'static>,
         j5: Option<J5>,
         d5: Output<'static>,
         d2: Output<'static>,
         posture: Posture,
         cold: bool,
     ) -> Self {
-        sdlog.defer();
         let cfg = RadioConfig::default();
         let now_ms = Instant::now().as_millis();
         Self {
             node: Node::new(lora, &cfg),
             gps,
-            sdlog,
             j5,
             rx_led: Blinker::new(d5),
             tx_led: Blinker::new(d2),
@@ -328,16 +323,11 @@ impl Hardware {
     /// One effect the posture named, carried out.
     async fn effect(&mut self, e: Effect, now_ms: u64) {
         match e {
-            Effect::MountCard => {
-                watchdog::beat(Task::Loop, Phase::ConfigLoad);
-                self.cfg_loaded = self.adopt_stored_config(now_ms).await;
+            Effect::LoadConfig => {
+                self.cfg_loaded = self.adopt_stored_config().await;
                 self.cold = false;
                 self.node.reconfigure(&self.cfg);
                 self.planner = Planner::new(self.first_beacon_ms(now_ms));
-            }
-            Effect::ParkCard => {
-                watchdog::beat(Task::Loop, Phase::Card);
-                self.sdlog.park(now_ms)
             }
             Effect::GpsUp => {
                 watchdog::beat(Task::Loop, Phase::GpsCtl);
@@ -450,10 +440,9 @@ impl Hardware {
         // to acquire with nobody draining its sentences.
         //
         // What follows still runs. A board that is idle rather than asleep
-        // is one somebody may be looking at, so the card keeps flushing and
-        // mounting, telemetry stays fresh, the panel keeps its frame and
-        // the status line keeps printing - and none of that costs anything
-        // on a wake check, where the card is off the bus and the panel is
+        // is one somebody may be looking at, so telemetry stays fresh, the
+        // panel keeps its frame and the status line keeps printing - and
+        // none of that costs anything on a wake check, where the panel is
         // dark.
         if self.posture.gps_awake() {
             watchdog::beat(Task::Loop, Phase::Gps);
@@ -467,8 +456,6 @@ impl Hardware {
             self.repeat(now_ms).await;
         }
         self.telemetry(now_ms);
-        watchdog::beat(Task::Loop, Phase::Card);
-        self.sdlog.poll(now_ms);
         watchdog::beat(Task::Loop, Phase::Panel);
         self.panel(now_ms).await;
         watchdog::beat(Task::Loop, Phase::Status);
@@ -488,7 +475,7 @@ impl Hardware {
             // mode commanded over an override flag lands on the flag, and a
             // board already parked for sleep ignores the request.
             match r {
-                Request::Mode(m) if self.posture.card != Card::Parked => status_println!(
+                Request::Mode(m) if !self.posture.parked => status_println!(
                     "{}: node {} ({}), gps {}, radio {}",
                     m.as_str(),
                     self.cfg.address,
@@ -519,9 +506,6 @@ impl Hardware {
         }
         if let Some(p) = seen.position {
             state::set_position(p);
-            if p.has_fix() {
-                self.sdlog.log_position(now_ms, 0, 0, &p);
-            }
         }
     }
 
@@ -638,7 +622,6 @@ impl Hardware {
                 v[1..3].copy_from_slice(&rx.rssi.to_le_bytes());
                 v[3..].copy_from_slice(&p.encode());
                 state::record_remote(now_ms, Report::Position(v));
-                self.sdlog.log_position(now_ms, rx.src, rx.rssi, &p);
             } else if let Some(ping) = lora::Ping::decode(rx.payload) {
                 // A node on the air with no fix to report. Nothing to log
                 // to SD - there is no position - but an app gets it as data
@@ -718,9 +701,6 @@ impl Hardware {
             None => 0xFFFF,
         };
         let mut flags = 0u8;
-        if self.sdlog.ready() {
-            flags |= link::TELEM_FLAG_SD_OK;
-        }
         if self.gps.has_fix() {
             flags |= link::TELEM_FLAG_GPS_FIX;
         }
@@ -792,7 +772,7 @@ impl Hardware {
         // drifts down across a day is fragmentation - the failure that
         // shows up as a connect that never completes, hours in.
         status_println!(
-            "t={}s radio {} err {:04x} rx {} tx {} hop ch {} s {} | gps {} nmea fix {} sats {} | sd {} | nodes {} | idle {} Hz | heap {} B free",
+            "t={}s radio {} err {:04x} rx {} tx {} hop ch {} s {} | gps {} nmea fix {} sats {} | nodes {} | idle {} Hz | heap {} B free",
             now_ms / 1000,
             mode,
             err,
@@ -803,7 +783,6 @@ impl Hardware {
             self.gps.rx_sentences(),
             self.gps.has_fix() as u8,
             self.gps.packet().sats,
-            if self.sdlog.ready() { "mounted" } else { "absent" },
             state::remote_count(),
             idle_hz,
             esp_alloc::HEAP.free()
@@ -827,84 +806,40 @@ impl Hardware {
 
     /// Read the stored config and adopt it.
     ///
-    /// A wake check defers all of this: the card stays off the bus until
-    /// the board knows it is more than a check, and a promotion runs this
-    /// then. Everything here is about the *stored* config - the radio
-    /// settings, the console verbosity, the `[power]` section - so it
-    /// costs nothing on a wake nobody answers.
+    /// A wake check defers this: the config is not needed until the radio
+    /// is, and a promotion runs it then. Everything here is about the
+    /// *stored* config - the radio settings, the console verbosity, the
+    /// `[power]` section - so it costs nothing on a wake nobody answers.
+    ///
+    /// The store is the record in the board's own flash, which every push
+    /// writes. A board that has never taken a push runs the firmware
+    /// defaults, node address included.
     ///
     /// Returns whether a config was adopted at all.
-    async fn adopt_stored_config(&mut self, now_ms: u64) -> bool {
-        self.sdlog.resume(now_ms);
-        // Give the card a chance to mount before its config is asked for.
-        self.sdlog.poll(now_ms);
-
-        // Two stores, and the card wins. Editing `RADIO.CFG` on a computer
-        // has to do what it looks like, so a card that says anything
-        // outranks the backup - which exists for the board the card cannot
-        // answer for: one that never had a card, or whose card has failed.
-        // Without it such a board came back on firmware defaults and lost
-        // its address, the one setting nothing can guess back.
-        //
-        // The buffer spans the awaits below rather than being scoped
-        // around the card read, because both stores are read and written
-        // through it. It costs a kilobyte of this task's future.
-        let mut text = [0u8; CONFIG_MAX];
-        let from_card = self
-            .sdlog
-            .read_config(&mut text)
-            .and_then(|n| match radiocfg::parse_bytes(&text[..n]) {
-                Ok(c) => Some((c, n)),
+    async fn adopt_stored_config(&mut self) -> bool {
+        watchdog::beat(Task::Loop, Phase::ConfigLoad);
+        let mut text = [0u8; bulk::CONFIG_MAX];
+        let loaded = match flash::with_flash(|f| f.load_config(&mut text)).await.flatten() {
+            Some(n) => match radiocfg::parse_bytes(&text[..n]) {
+                Ok(c) => {
+                    println!("config: flash record loaded (address {})", c.address);
+                    self.cfg = c;
+                    true
+                }
+                // Only a config that parsed is ever written, so this is
+                // the record disagreeing with a firmware that has since
+                // changed what it accepts - not a bad push. Defaults, and
+                // say so.
                 Err(e) => {
-                    println!("config: RADIO.CFG invalid ({:?}), trying the backup", e);
-                    None
-                }
-            });
-        let loaded = match from_card {
-            Some((c, n)) => {
-                println!("config: RADIO.CFG loaded (address {})", c.address);
-                self.cfg = c;
-                // Keep the backup level with the card, so a card pulled or
-                // lost later does not take the config with it. An
-                // unchanged card costs a comparison rather than the two
-                // erases of a write, which is the common case for every
-                // boot after the first.
-                if !flash::with_flash(|f| f.save_config(&text[..n]))
-                    .await
-                    .unwrap_or(false)
-                {
-                    println!("config: RADIO.CFG could not be backed up to flash");
-                }
-                true
-            }
-            None => match flash::with_flash(|f| f.load_config(&mut text)).await.flatten() {
-                Some(n) => match radiocfg::parse_bytes(&text[..n]) {
-                    Ok(c) => {
-                        println!("config: flash backup loaded (address {})", c.address);
-                        self.cfg = c;
-                        true
-                    }
-                    // Only a config that parsed is ever written, so this is
-                    // the record disagreeing with a firmware that has since
-                    // changed what it accepts - not a bad push. Defaults,
-                    // and say so.
-                    Err(e) => {
-                        println!("config: flash backup invalid ({:?}), using defaults", e);
-                        false
-                    }
-                },
-                None => {
-                    println!("config: none stored, using defaults");
+                    println!("config: flash record invalid ({:?}), using defaults", e);
                     false
                 }
             },
+            None => {
+                println!("config: none stored, using defaults");
+                false
+            }
         };
-        // Honor sd_enabled only now: the setting itself lives on the card,
-        // so the card has to be read before it can say to stop using it.
-        if !self.cfg.sd_enabled {
-            println!("SD: disabled by config");
-            self.sdlog.disable(now_ms);
-        }
         state::set_verbose(self.cfg.verbose);
         state::set_radio_config(self.cfg.encode());
         state::set_tx_worst_case_ms(self.cfg.tx_worst_case_ms());
@@ -917,7 +852,7 @@ impl Hardware {
     /// The transfer already parsed it - a config that would not parse
     /// never reaches here, and the host was told so in the ack. What is
     /// left is the hardware: the radio, the node's own addressing, the
-    /// GPS, and the card copy that has to survive a reboot.
+    /// GPS, and the flash record that has to survive a reboot.
     async fn apply_radio_config(&mut self, now_ms: u64) -> bool {
         let mut raw = [0u8; bulk::CONFIG_MAX];
         let Some((new_cfg, len)) = xfer::take_pending(&mut raw) else {
@@ -935,36 +870,22 @@ impl Hardware {
         state::set_verbose(self.cfg.verbose);
         state::set_radio_config(self.cfg.encode());
         state::set_tx_worst_case_ms(self.cfg.tx_worst_case_ms());
-        // Both stores, because either one alone leaves a board that loses
-        // this config at the next power cycle: a card can be absent or
-        // failed, and the backup is behind whatever a computer last wrote
-        // to the card. A write that reached neither has to be reported to
-        // the operator rather than left in a console nobody is reading -
-        // it is the difference between a config that is applied and one
-        // that is applied until the next reboot.
-        //
-        // Written before `sd_enabled` is honored, and deliberately: a
-        // config that turns the card off still has to be *on* the card, or
-        // the next boot reads nothing there and comes up with the card
-        // enabled again.
-        let on_card = self.sdlog.write_config(now_ms, &raw[..len]);
+        // A write that did not reach flash has to be reported to the
+        // operator rather than left in a console nobody is reading - it
+        // is the difference between a config that is applied and one that
+        // is applied until the next reboot.
         let in_flash = flash::with_flash(|f| f.save_config(&raw[..len]))
             .await
             .unwrap_or(false);
-        if !self.cfg.sd_enabled {
-            status_println!("SD: disabled by config");
-            self.sdlog.disable(now_ms);
-        }
         event!(
             Kind::Transfer,
             "config applied, node {} ({}), {}",
             self.cfg.address,
             self.cfg.role.as_str(),
-            match (on_card, in_flash) {
-                (true, true) => "saved to SD and flash",
-                (true, false) => "saved to SD, NOT to flash",
-                (false, true) => "saved to flash, NOT to SD",
-                (false, false) => "NOT SAVED - lost on reboot",
+            if in_flash {
+                "saved to flash"
+            } else {
+                "NOT SAVED - lost on reboot"
             }
         );
         if regps && !self.gps.sleeping {
@@ -974,6 +895,7 @@ impl Hardware {
                 status_println!("gps did not accept settings");
             }
         }
+        let _ = now_ms;
         true
     }
 }
@@ -1079,7 +1001,6 @@ fn draw_screen(
 pub async fn hardware_task(
     lora: Sx1262Driver<'static>,
     gps: Gps<'static>,
-    sdlog: SdLog<'static>,
     j5: Option<J5>,
     d5: Output<'static>,
     d2: Output<'static>,
@@ -1088,7 +1009,7 @@ pub async fn hardware_task(
 ) {
     let stored = settings::get();
     let (posture, boot_fx) = Posture::at_boot(boot, &stored);
-    let mut hw = Hardware::new(lora, gps, sdlog, j5, d5, d2, posture, cold);
+    let mut hw = Hardware::new(lora, gps, j5, d5, d2, posture, cold);
     hw.boot(boot, boot_fx, &stored).await;
     loop {
         let wait = hw.pass().await;

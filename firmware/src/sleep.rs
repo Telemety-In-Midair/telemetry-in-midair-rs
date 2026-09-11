@@ -24,11 +24,11 @@ use crate::{event, evlog, settings, state, watchdog};
 
 /// What the park is given on top of a transmit already in flight, ms.
 ///
-/// The bounded parts of the sequence take well under half a second; the
-/// card's flush and unmount can stall on wear levelling for most of
-/// another, and an expiry there was enough to sleep over a park that had
-/// not finished. Nothing is spent in the ordinary case: this is a timeout
-/// rather than a delay, so the wait ends when the park does.
+/// The parts of the sequence take well under half a second between them;
+/// the rest is room for the loop to be somewhere else - a config apply, a
+/// panel refresh - when the request lands. Nothing is spent in the
+/// ordinary case: this is a timeout rather than a delay, so the wait ends
+/// when the park does.
 const PARK_SLACK_MS: u64 = 1_500;
 
 /// Park the radio, the GPS and the card, then deep sleep for `interval_s`.

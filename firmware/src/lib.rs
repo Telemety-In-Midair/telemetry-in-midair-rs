@@ -59,7 +59,6 @@ pub mod node;
 pub mod oled;
 pub mod panic;
 pub mod radio;
-pub mod sdlog;
 pub mod settings;
 pub mod sleep;
 pub mod state;

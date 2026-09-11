@@ -35,7 +35,11 @@ use crate::{crumb, evlog};
 /// When each task last beat, as the low word of the millisecond clock.
 /// A word rather than the whole clock so a beat is one store with no
 /// lock behind it; the age is a wrapping difference, so the wrap at
-/// forty-nine days costs nothing.
+/// forty-nine days costs nothing. Zero is the boot itself: a task that
+/// has not beaten yet is as old as the board is up, and nothing here
+/// writes a later "boot" beat over a real one - the monitor once did,
+/// and a loop already inside a long card mount then read as silent in
+/// `boot` and was reset for it.
 static SEEN_MS: [AtomicU32; Task::ALL.len()] = [const { AtomicU32::new(0) }; Task::ALL.len()];
 static PHASE: [AtomicU8; Task::ALL.len()] = [const { AtomicU8::new(0) }; Task::ALL.len()];
 
@@ -174,9 +178,6 @@ pub fn arm(wdt: &mut Wdt<TIMG1<'static>>) {
 /// for a log line.
 #[embassy_executor::task]
 pub async fn monitor_task(mut wdt: Wdt<TIMG1<'static>>) {
-    for task in Task::ALL {
-        beat(task, Phase::Boot);
-    }
     loop {
         Timer::after(Duration::from_millis(u64::from(MONITOR_PERIOD_MS))).await;
         let (sup, now) = snapshot();

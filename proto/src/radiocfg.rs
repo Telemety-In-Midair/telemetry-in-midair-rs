@@ -1,12 +1,12 @@
 //! Radio configuration: the `RADIO.CFG` file format and its parser.
 //!
-//! The file is TOML-shaped but the name is not `.toml`: it lives in the root
-//! of a FAT card, where 8.3 short names allow only a three-character
-//! extension.
+//! The file is TOML-shaped but the name is not `.toml`: it was written for
+//! the root of a FAT card, where 8.3 short names allow only a
+//! three-character extension, and the name outlived the card.
 //!
-//! The firmware loads this from the SD card at boot (`RADIO.CFG`) and/or
-//! receives it over BLE. No TOML crate runs on the target, so this is a
-//! small no_std
+//! The firmware receives this over USB or BLE and keeps the text in its own
+//! flash, where the next boot reads it. No TOML crate runs on the target,
+//! so this is a small no_std
 //! parser for the subset the file needs: `key = value` pairs with integer,
 //! boolean and quoted-string values, `#` comments, and `[section]` headers
 //! (accepted and ignored - keys are unique across sections).
@@ -478,9 +478,6 @@ pub struct RadioConfig {
     /// The mask travels in the frame, so nodes disagreeing about it is fine:
     /// a receiver decodes whatever the sender chose to include.
     pub beacon_fields: u8,
-    /// Whether the SD card is used at all. False stops logging, config
-    /// read-back and the card's power draw.
-    pub sd_enabled: bool,
     /// Verbose console logging on the ESP: per-frame link traffic and
     /// per-heartbeat detail, on top of the events that are always logged.
     ///
@@ -596,11 +593,9 @@ impl Default for RadioConfig {
             // slower: a node with no fix has nothing new to say every second.
             beacon_interval_s: 1,
             ping_interval_s: 5,
-            // Position only. Everything else a fix produces is written to
-            // the SD log, where a byte costs nothing, rather than spent on
-            // air time that has to be paid on every single transmission.
+            // Position only. Everything else a fix produces is air time
+            // that has to be paid on every single transmission.
             beacon_fields: crate::lora::FIELDS_DEFAULT,
-            sd_enabled: true,
             // The console is free when nothing is reading it, so the
             // detailed build is the one to ship and quieting it is the
             // deliberate choice.
@@ -817,7 +812,9 @@ pub const RADIO_CONFIG_VERSION: u8 = 1;
 
 // byte 1 (misc bools)
 const RCFG_RX_BOOST: u8 = 1 << 0;
-const RCFG_SD_ENABLED: u8 = 1 << 1;
+// Bit 1 was the SD card's enable. The firmware no longer drives a card,
+// so the bit is written clear and ignored on read; it stays reserved so
+// the blob's other flags keep their places.
 const RCFG_VERBOSE: u8 = 1 << 2;
 const RCFG_DCDC: u8 = 1 << 3;
 const RCFG_DIO2_RF_SWITCH: u8 = 1 << 4;
@@ -838,9 +835,6 @@ impl RadioConfig {
         let mut flags = 0u8;
         if self.rx_boost {
             flags |= RCFG_RX_BOOST;
-        }
-        if self.sd_enabled {
-            flags |= RCFG_SD_ENABLED;
         }
         if self.verbose {
             flags |= RCFG_VERBOSE;
@@ -931,7 +925,6 @@ impl RadioConfig {
             beacon_interval_s: u16at(17),
             ping_interval_s: if has_ping { u16at(32) } else { u16at(17) },
             beacon_fields: b[19],
-            sd_enabled: flags & RCFG_SD_ENABLED != 0,
             verbose: flags & RCFG_VERBOSE != 0,
             dcdc_enabled: flags & RCFG_DCDC != 0,
             dio2_rf_switch: flags & RCFG_DIO2_RF_SWITCH != 0,
@@ -1038,11 +1031,6 @@ pub const SECTIONS: &[Section] = &[
         name: "beacon",
         title: "Beacon",
         doc: "What goes out, and how often.",
-    },
-    Section {
-        name: "sd",
-        title: "SD card",
-        doc: "",
     },
     Section {
         name: "debug",
@@ -1264,14 +1252,6 @@ pub const KEYS: &[Key] = &[
         show: |c, w| lora::write_fields(c.beacon_fields, w),
     },
     Key {
-        section: "sd",
-        name: "sd_enabled",
-        kind: Kind::Bool,
-        commented: false,
-        doc: "Use the SD card. false stops position logging and the card's power draw. The config itself still persists: it is backed up to the board's internal flash either way.",
-        show: |c, w| write!(w, "{}", c.sd_enabled),
-    },
-    Key {
         section: "debug",
         name: "verbose",
         kind: Kind::Bool,
@@ -1410,7 +1390,7 @@ fn canonical(name: &str) -> &str {
 }
 
 /// The header every generated example starts with.
-const EXAMPLE_HEADER: &str = "RADIO.CFG - telemetry-in-midair radio configuration reference. Generated from the key table in the protocol crate (cargo run --example radio_example in proto/); every value below is the firmware default. The firmware reads at most 1024 bytes of config, which the comments here put this file well over, so it is a reference rather than a card file: strip the comments and what remains fits. The tools do that (cd tools && pixi run board-config --address 3 pushes it; add --dry-run --save ../RADIO.CFG for a card file). The card file goes in the SD root as RADIO.CFG (uppercase). A config pushed over USB or BLE is applied live and written to both the card and a backup record in the board's own flash, so it survives a power cycle on a board with no card. At boot the card wins over the backup, so pulling the card to edit RADIO.CFG on a computer does what it looks like it does. Every key is optional - an absent key keeps its default, and an empty file is valid. Section headers are cosmetic: keys are unique across sections, so a key works regardless of which [section] it sits under.";
+const EXAMPLE_HEADER: &str = "RADIO.CFG - telemetry-in-midair radio configuration reference. Generated from the key table in the protocol crate (cargo run --example radio_example in proto/); every value below is the firmware default. The firmware reads at most 1024 bytes of config, which the comments here put this file well over, so it is a reference rather than a file to push: strip the comments and what remains fits. The tools do that (cd tools && pixi run board-config --address 3 pushes it; add --dry-run --save ../RADIO.CFG for the stripped file). A config pushed over USB or BLE is applied live and kept in the board's own flash, so it survives a power cycle. Every key is optional - an absent key keeps its default, and an empty file is valid. Section headers are cosmetic: keys are unique across sections, so a key works regardless of which [section] it sits under.";
 
 /// Column the example's comments wrap at.
 const EXAMPLE_WIDTH: usize = 76;
@@ -1596,7 +1576,12 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
             "dio2_rf_switch" => cfg.dio2_rf_switch = bool_of(value, lineno)?,
             "tcxo_volts" => cfg.tcxo_volts = TCXO[choice_of(name, value, lineno)?],
             "tcxo_startup_ms" => cfg.tcxo_startup_ms = int_of(name, value, lineno)? as u16,
-            "sd_enabled" => cfg.sd_enabled = bool_of(value, lineno)?,
+            // The card is gone; a file that still carries its key is not
+            // wrong, only out of date, and the value is what it always
+            // would have been.
+            "sd_enabled" => {
+                bool_of(value, lineno)?;
+            }
             "verbose" => cfg.verbose = bool_of(value, lineno)?,
             "gps_enabled" => cfg.gps.gps_enabled = bool_of(value, lineno)?,
             "glonass_enabled" => cfg.gps.glonass_enabled = bool_of(value, lineno)?,
@@ -1755,8 +1740,8 @@ mod tests {
     /// header comment, so a truncated read of it succeeds and yields *every*
     /// setting at its default - address included.
     ///
-    /// So the size check belongs at the reader (`SdLog::read_config` refuses a
-    /// file it cannot hold whole) and cannot be delegated to a parse failure.
+    /// So the size check belongs at the reader - the flash record refuses a
+    /// text it cannot hold whole - and cannot be delegated to a parse failure.
     #[test]
     fn a_truncated_file_parses_as_a_shorter_one() {
         let example = include_str!("../../RADIO.example.toml");
@@ -2155,10 +2140,11 @@ mod tests {
         assert_eq!(parse("verbose = quiet"), Err(ConfigError::BadValue(1)));
     }
 
+    /// A file written when the firmware still drove a card parses, and
+    /// the key changes nothing.
     #[test]
-    fn sd_can_be_disabled() {
-        assert!(RadioConfig::default().sd_enabled);
-        assert!(!parse("sd_enabled = false").unwrap().sd_enabled);
+    fn the_retired_sd_key_is_accepted_and_ignored() {
+        assert_eq!(parse("sd_enabled = false").unwrap(), RadioConfig::default());
         assert_eq!(parse("sd_enabled = yes"), Err(ConfigError::BadValue(1)));
     }
 
@@ -2238,7 +2224,6 @@ mod tests {
             beacon_interval_s: 30,
             ping_interval_s: 7,
             beacon_fields: crate::lora::FIELD_LAT | crate::lora::FIELD_LON | crate::lora::FIELD_ALT,
-            sd_enabled: false,
             verbose: false,
             dcdc_enabled: false,
             dio2_rf_switch: true,
@@ -2281,7 +2266,6 @@ mod tests {
         // and it did not disturb the other bools sharing the flag byte
         let d = RadioConfig::default();
         assert_eq!(off.rx_boost, d.rx_boost);
-        assert_eq!(off.sd_enabled, d.sd_enabled);
         assert_eq!(off.verbose, d.verbose);
         assert_eq!(off.dcdc_enabled, d.dcdc_enabled);
 
