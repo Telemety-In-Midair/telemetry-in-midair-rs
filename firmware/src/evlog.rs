@@ -40,11 +40,29 @@ struct Queued {
 /// flash, so a full queue drops its oldest line.
 static QUEUE: Channel<CriticalSectionRawMutex, Queued, 8> = Channel::new();
 
+/// The last line noted of each kind, and when. A fault that repeats - a
+/// controller that fails its init every second, a transmit that times
+/// out every beacon - is one record, not a record per repeat: the ring
+/// is 512 slots and a sector erase per 32 of them, and a line that says
+/// what the last one said within a minute is not news. The console still
+/// gets every repeat.
+static LAST: critical_section::Mutex<core::cell::RefCell<[(u32, heapless::String<TEXT_MAX>); Kind::ALL.len()]>> =
+    critical_section::Mutex::new(core::cell::RefCell::new(
+        [const { (0, heapless::String::new()) }; Kind::ALL.len()],
+    ));
+
+/// How long a repeat of the same line is held back, seconds.
+const REPEAT_S: u32 = 60;
+
 /// How many of the newest records the boot prints.
 const TAIL: usize = 6;
 
 fn uptime_s() -> u32 {
     Instant::now().as_secs() as u32
+}
+
+const fn kind_index(kind: Kind) -> usize {
+    kind.as_wire() as usize - 1
 }
 
 /// Note an event. Sync, lock-free past the queue's own critical section,
@@ -66,9 +84,26 @@ pub fn note(kind: Kind, args: core::fmt::Arguments<'_>) {
         }
     }
     let _ = write!(Sink(&mut text), "{}", args);
+    let now = uptime_s();
+    // A boot's uptime starts at zero, so the first line of each kind is
+    // always news: the stored time is one past the line's, and zero means
+    // nothing stored.
+    let repeat = critical_section::with(|cs| {
+        let mut last = LAST.borrow(cs).borrow_mut();
+        let (at, line) = &mut last[kind_index(kind)];
+        let same = *at != 0 && *line == text && now.saturating_sub(*at - 1) < REPEAT_S;
+        if !same {
+            *at = now + 1;
+            *line = text.clone();
+        }
+        same
+    });
+    if repeat {
+        return;
+    }
     let q = Queued {
         kind,
-        uptime_s: uptime_s(),
+        uptime_s: now,
         text,
     };
     if let Err(embassy_sync::channel::TrySendError::Full(q)) = QUEUE.try_send(q) {

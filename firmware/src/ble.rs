@@ -622,7 +622,7 @@ where
     // Nothing from the last session is in flight; every operation below
     // that must finish is bracketed, and the session's heartbeat stops on
     // its behalf when one does not.
-    watchdog::session_free();
+    watchdog::session_reset();
     watchdog::beat(Task::Serve, Phase::Session);
 
     // Publish before anything else, so an app can populate its controls
@@ -864,7 +864,7 @@ where
         ),
     )
     .await;
-    watchdog::session_free();
+    watchdog::session_reset();
     match ended {
         Either3::Second(Either::Second(secs)) => Some(secs),
         _ => None,

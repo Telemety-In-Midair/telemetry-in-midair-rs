@@ -44,11 +44,16 @@ static PHASE: [AtomicU8; Task::ALL.len()] = [const { AtomicU8::new(0) }; Task::A
 /// was never started is not one that stalled.
 static UNWATCHED: AtomicU8 = AtomicU8::new(0);
 
-/// A notify or a write the session has in flight, as the low word of
-/// the clock it started at, or 0 for none. What lets the session's own
-/// heartbeat stop when the BLE stack has stopped answering underneath a
-/// connection that is still, as far as the controller knows, up.
+/// When the oldest session operation still in flight started, as the low
+/// word of the clock, or 0 for none; and how many are in flight. Two arms
+/// of the session - the notifier and the write handler - can each have
+/// one going, so the count is what says when the last one finished and
+/// the time is the first one's, which is the one that is stuck if any is.
+/// What lets the session's own heartbeat stop when the BLE stack has
+/// stopped answering underneath a connection that is still, as far as
+/// the controller knows, up.
 static SESSION_BUSY_SINCE: AtomicU32 = AtomicU32::new(0);
+static SESSION_OPS: AtomicU8 = AtomicU8::new(0);
 
 /// How long a session operation may take before the session's heartbeat
 /// stops on its behalf. A notify completes inside a connection interval
@@ -85,11 +90,26 @@ fn watched(task: Task) -> bool {
 
 /// The session has started something that must finish.
 pub fn session_busy() {
-    SESSION_BUSY_SINCE.store(now_ms32().max(1), Ordering::Relaxed);
+    if SESSION_OPS.fetch_add(1, Ordering::Relaxed) == 0 {
+        SESSION_BUSY_SINCE.store(now_ms32().max(1), Ordering::Relaxed);
+    }
 }
 
 /// It finished.
 pub fn session_free() {
+    let ops = SESSION_OPS.load(Ordering::Relaxed);
+    if ops <= 1 {
+        SESSION_OPS.store(0, Ordering::Relaxed);
+        SESSION_BUSY_SINCE.store(0, Ordering::Relaxed);
+    } else {
+        SESSION_OPS.store(ops - 1, Ordering::Relaxed);
+    }
+}
+
+/// Nothing is in flight: the session is starting, or it ended with an
+/// arm cancelled mid-operation, which never gets to say it finished.
+pub fn session_reset() {
+    SESSION_OPS.store(0, Ordering::Relaxed);
     SESSION_BUSY_SINCE.store(0, Ordering::Relaxed);
 }
 
