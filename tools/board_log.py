@@ -47,7 +47,7 @@ def main() -> int:
         print("event log erased")
         return 0
 
-    first = link.read_evlog(ser, 0)
+    first = read_with_retry(ser, 0)
     if first is None:
         sys.exit("the board did not answer (firmware predates the event log?)")
     count, _, record = first
@@ -58,7 +58,7 @@ def main() -> int:
     wanted = count if args.last is None else min(count, max(args.last, 0))
     records = [record]
     for index in range(1, wanted):
-        reply = link.read_evlog(ser, index)
+        reply = read_with_retry(ser, index)
         if reply is None:
             print(f"  (no reply for record {index}, stopping)", file=sys.stderr)
             break
@@ -71,6 +71,20 @@ def main() -> int:
     for r in reversed(records):
         print(format_record(r))
     return 0
+
+
+def read_with_retry(ser, index: int, attempts: int = 4):
+    """One record, asked for again when the reply did not survive the port.
+
+    A record's reply is longer than the console FIFO, so a status line from
+    the board can land in the middle of it and cost the frame its crc; the
+    firmware's own state is untouched by a repeat, so asking again is safe.
+    """
+    for _ in range(attempts):
+        reply = link.read_evlog(ser, index)
+        if reply is not None:
+            return reply
+    return None
 
 
 def format_record(r: dict) -> str:
