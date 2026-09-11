@@ -205,41 +205,26 @@ changes when a different node is actually heard.
 
 **It has to be turned before it works.** The heading is hard-iron corrected
 from the extremes seen on each axis, which only mean anything once the board
-has been rotated through a full circle - a magnetometer next to a LoRa PA, an
-SD card and a battery does not read a field centered on zero. Until it has,
+has been rotated through a full circle - a magnetometer next to a LoRa PA
+and a battery does not read a field centered on zero. Until it has,
 the marker reads `G` or `T` rather than showing a confident heading built
 from a quarter turn. It is also **not tilt-compensated**: hold the board
 level. Correcting that needs an accelerometer, which is a different part than
 the two supported here.
 
-## SD card
+## SD card slot
 
-`GPSLOG.CSV` gets one line per own/remote fix
-(`ms,src,lat_e7,lon_e7,alt_dm,speed_cms,course_cdeg,sats,fix,rssi`);
-readable in any spreadsheet. The card is optional and hot-pluggable - when
-none is present the driver retries the mount once a minute, so a card
-inserted later starts logging within that. Only about the last 20 seconds of
-positions are buffered in RAM while no card is mounted; anything older is
-dropped. `sd_enabled = false` shuts the card down entirely. A wake check
-never mounts the card at all; a promotion to idle does.
-
-Formatting: **MBR partition table, first partition FAT16 or FAT32**. That is
-what a card of 32 GB or less already ships as, so most cards work untouched.
-Larger (SDXC) cards ship exFAT, which is not supported and must be
-reformatted - use the SD Association's SD Card Formatter, or on Linux make
-an MBR partition of type `0c` and `mkfs.vfat -F 32 /dev/sdX1`. Formatting
-the whole device (`/dev/sdX`, no partition) produces a card the driver
-cannot mount. GPT is not supported either.
-
-Both filenames are MS-DOS 8.3 - eight characters plus a three-character
-extension - which is why the config file is `RADIO.CFG` and not
-`RADIO.TOML`. The FAT layer converts a name to 8.3 before looking it up, so
-a longer name is not a missing file but one that can never be opened.
-
-The card bus is 400 kHz: cards must be initialized at that or under, and
-the firmware never raises it - a flush is about a kilobyte every five
-seconds, and a flush or an unmount can stall on the card's own wear
-levelling, which is what the sleep path's park budget is sized for.
+The carrier has a microSD slot on SPI3 (GPIO46 SCK, GPIO45 MOSI, GPIO3
+MISO, GPIO44 CS), and the firmware does not drive it. It did until
+2026-09-11: a FAT driver logged every fix to `GPSLOG.CSV` and read
+`RADIO.CFG` from the card at boot. Its mount and its walks to the end of a
+grown log were single synchronous calls on the hardware loop's core that
+could run for longer than the loop's heartbeat bound, and the config store
+it provided is covered by the board's own flash. The four lines are parked
+at boot - three pulled down, the chip select pulled up so a card in the
+slot stays deselected. The driver and its documentation are in the history
+before that date, and the config file keeps the 8.3 name it was given for
+the card.
 
 ## GPS board v1
 

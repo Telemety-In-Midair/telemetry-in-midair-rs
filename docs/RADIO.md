@@ -7,12 +7,12 @@ radio_example`); this is the reasoning behind it.
 
 ## Configuring a board
 
-The firmware loads `RADIO.CFG` from the SD card at boot. The same file can
-be pushed at runtime over USB (`pixi run board-config`) or over BLE (the
-bulk characteristic; the app's Radio page), which applies it live and
-rewrites both stores below. All keys are optional; an absent key is the
-default, except under `[power]`, where absent means "leave the board's live
-value alone" (see `docs/POWER.md`).
+A config reaches a board as a push over USB (`pixi run board-config`) or
+over BLE (the bulk characteristic; the app's Radio page), which applies it
+live and writes it to the board's own flash, where the next boot reads it.
+All keys are optional; an absent key is the default, except under
+`[power]`, where absent means "leave the board's live value alone" (see
+`docs/POWER.md`).
 
 A push replaces the whole config: keys absent from what is sent revert to
 their defaults rather than keeping the board's current values. The USB tool
@@ -21,23 +21,18 @@ settings (`--file`) if the board is not on stock ones. Over BLE the board
 reports its current config, so the app can read it back - its Radio page has
 a "Load from board" that fills the editor from the board itself.
 
-A push that reached neither store says so on the status line, and
+A push that did not reach flash says so on the status line, and
 `board-config` exits non-zero when that happens.
 
 ### Where a config lives
 
-Two stores hold the same text, and the card is the one people edit:
-
-| Store | What it is | Written when |
-|-|-|-|
-| `RADIO.CFG` on the card | the file, in the card root, 8.3 name, at most 1024 bytes | a config is pushed |
-| a record in the `nvs` partition | the same text behind a length and a crc, one sector past the settings record | a config is pushed, and at every boot that reads the card |
-
-At boot the card wins - pulling it to edit `RADIO.CFG` on a computer has to
-do what it looks like - and a boot that reads one refreshes the backup, so a
-card edited offline is what both stores hold from then on. A board with no
-card, or with a card that has failed or gone unreadable, comes up on the
-backup instead of on firmware defaults. That is what the backup is for: the
+One store: a record in the `nvs` partition, the config text behind a
+length and a crc, one sector past the settings record, written when a
+config is pushed and read at boot. A board that has never taken a push
+runs the firmware defaults, node address included. Until 2026-09-11 there
+was a second store, `RADIO.CFG` on an SD card, which won at boot; the card
+is no longer driven (see `docs/HARDWARE.md`). The record is what makes a
+push survive a power cycle: the
 node address is the one setting nothing can guess back, since two senders
 sharing an address are mutually deaf.
 
@@ -164,7 +159,7 @@ the channel and stratum, and the telemetry characteristic reports both to
 the app's Status page.
 
 `tools/radio_sim.py` simulates a few boards on this plan - the hop clock,
-the receiver, the GPS UART, the card and the BLE notifier - and
+the receiver, the GPS UART and the BLE notifier - and
 `docs/RADIO-AUDIT.md` is what it found; `pixi run radio-sim` runs it.
 
 None of this is a certification. At the default the node holds one 500 kHz
@@ -177,9 +172,9 @@ Whether a given board and antenna comply either way is a measurement.
 
 `fields` decides what goes on the air. The default is position only: about
 half the air time of a full GPS packet on every broadcast. Altitude, speed,
-course, satellite count and time are still recorded in `GPSLOG.CSV` whether
-or not they are transmitted - the choice is only about what a *remote*
-receiver gets.
+course, satellite count and time still reach a connected phone over BLE
+whether or not they are transmitted - the choice is only about what a
+*remote* receiver gets.
 
 `lat` and `lon` are required; a config that omits either is rejected. The
 selected set travels in the frame as a one-byte mask, so nodes configured
@@ -210,8 +205,7 @@ the beacon interval rather than a ping waiting out its own.
 A node that hears a ping reports it as a status line (`node 3 ping: rssi
 -97, up 214s, gps ok`) rather than a position, and out on the node-ping
 characteristic as data, so an app can show the node as alive-without-a-fix.
-Nothing is written to `GPSLOG.CSV`, which holds fixes. The RSSI in either
-form is what makes a ping useful as a range check.
+The RSSI in either form is what makes a ping useful as a range check.
 
 ## Leaves and repeaters
 

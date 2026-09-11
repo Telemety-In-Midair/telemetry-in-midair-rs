@@ -29,6 +29,7 @@ pub const PCS_MAX: usize = 8;
 const KIND_NONE: u32 = 0;
 const KIND_PANIC: u32 = 1;
 const KIND_STALL: u32 = 2;
+const KIND_WATCHDOG: u32 = 3;
 
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static MAGIC_WORD: AtomicU32 = AtomicU32::new(0);
@@ -103,6 +104,13 @@ pub enum Crumb {
     Stall {
         uptime_s: u32,
         stall: Stall,
+    },
+    /// The hardware watchdog ran out with the monitor silent: the first
+    /// core stopped. Written by the watchdog's own interrupt on the
+    /// second core, moments before the reset stage.
+    Watchdog {
+        uptime_s: u32,
+        text: heapless::String<TEXT_MAX>,
     },
 }
 
@@ -194,6 +202,38 @@ pub fn record_stall(stall: &Stall, uptime_s: u32) {
     RESET_REASON.store(Reason::Stall as u32, Ordering::Relaxed);
 }
 
+/// Record that the watchdog's warning stage fired: the monitor on the
+/// first core has not fed it. Called from an interrupt on the second
+/// core, so what it knows is what the heartbeats say - each task's last
+/// phase and how long ago - which is the most a dead core can be asked.
+/// Atomics only, like the rest.
+pub fn record_watchdog(
+    serve: (Phase, u32),
+    hardware: (Phase, u32),
+    monitor_silent_ms: u32,
+    uptime_s: u32,
+) {
+    MAGIC_WORD.store(0, Ordering::Relaxed);
+    KIND.store(KIND_WATCHDOG, Ordering::Relaxed);
+    UPTIME_S.store(uptime_s, Ordering::Relaxed);
+    WHO.store(0, Ordering::Relaxed);
+    SILENT_MS.store(monitor_silent_ms, Ordering::Relaxed);
+    for cell in &PCS {
+        cell.store(0, Ordering::Relaxed);
+    }
+    let mut sink = Sink(0);
+    let _ = write!(
+        sink,
+        "core 0 silent {} s: serve loop last in {} {} s ago, hardware loop in {} {} s ago",
+        monitor_silent_ms / 1000,
+        serve.0.as_str(),
+        serve.1 / 1000,
+        hardware.0.as_str(),
+        hardware.1 / 1000
+    );
+    seal(sink.0.min(TEXT_MAX));
+}
+
 /// Say why the board is about to reset itself, for a reset that leaves
 /// no crumb.
 pub fn mark_reset(reason: Reason) {
@@ -226,16 +266,24 @@ pub fn take() -> Option<Crumb> {
         return None;
     }
     let uptime_s = UPTIME_S.load(Ordering::Relaxed);
+    let text = || {
+        let mut text = heapless::String::new();
+        for cell in TEXT.iter().take(len) {
+            let b = cell.load(Ordering::Relaxed);
+            // Kept printable: the log is read as text, and a byte that
+            // is not is more likely corruption than message.
+            let c = if (0x20..0x7F).contains(&b) { b as char } else { '?' };
+            let _ = text.push(c);
+        }
+        text
+    };
     match KIND.load(Ordering::Relaxed) {
+        KIND_WATCHDOG => Some(Crumb::Watchdog {
+            uptime_s,
+            text: text(),
+        }),
         KIND_PANIC => {
-            let mut text = heapless::String::new();
-            for cell in TEXT.iter().take(len) {
-                let b = cell.load(Ordering::Relaxed);
-                // Kept printable: the log is read as text, and a byte
-                // that is not is more likely corruption than message.
-                let c = if (0x20..0x7F).contains(&b) { b as char } else { '?' };
-                let _ = text.push(c);
-            }
+            let text = text();
             let mut pcs = heapless::Vec::new();
             for cell in &PCS {
                 let pc = cell.load(Ordering::Relaxed);

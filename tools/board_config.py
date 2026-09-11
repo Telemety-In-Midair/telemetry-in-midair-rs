@@ -9,10 +9,9 @@ Other keys go through --set, repeatably:
 
     pixi run board-config --address 3 --set role=tx_only --set interval_s=30
 
-The board applies the config immediately and writes it to the SD card as
-RADIO.CFG, which is where it survives a power cycle. Nothing is reflashed.
-The two-MCU board also kept a copy in the WIO-E5's own flash; the Wio-S3
-does not, so a board running without a card keeps the config only until it
+The board applies the config immediately and writes it to a record in its
+own flash, which is where it survives a power cycle. Nothing is reflashed.
+A board whose flash refused the write keeps the config only until it
 reboots - and says so. This exits non-zero when that happens.
 
 IMPORTANT - this sends a whole file, not a patch. The firmware parses a
@@ -28,7 +27,7 @@ settings, pass the file holding them with --file and edit that instead:
 
     pixi run board-config --file mynet.toml --address 3
 
---file also takes the SD card's own RADIO.CFG, which is the same format.
+--file also takes a stripped RADIO.CFG a --dry-run --save wrote earlier.
 
 Comments and the `_description`/`_type` documentation keys are stripped
 before sending. They are inert to the firmware, and the reference file is
@@ -214,9 +213,7 @@ def main() -> int:
     # The board logs "config applied, node N, <where it was saved>" once it has
     # parsed and adopted the file, which is the only read-back there is: an
     # ack proves the bytes arrived, this proves which address is now live and
-    # whether it will still be there after a power cycle. There are two
-    # stores - the card and a backup in the board's own flash - and only a
-    # push that reached neither is lost on the next reboot.
+    # whether it will still be there after a power cycle.
     applied = link.read_console(ser, "config applied", timeout=3.0)
     if not applied:
         print("config accepted (no 'config applied' line seen; it may have "
@@ -225,14 +222,13 @@ def main() -> int:
 
     print(applied)
     if "NOT SAVED" in applied:
-        print("\nWARNING: the config is live but reached neither store.\n"
-              "It will be lost on the next power cycle, reverting to firmware "
-              "defaults.\nCheck that a card is seated, readable, and FAT "
-              "formatted.")
+        print("\nWARNING: the config is live but did not reach the board's "
+              "flash.\nIt will be lost on the next power cycle, reverting to "
+              "firmware defaults.")
         return 2
     if "NOT to" in applied:
-        # One store took it, so the config survives a reboot - but the two
-        # now disagree, and at the next boot the card is the one that wins.
+        # Firmware from before the card was removed had two stores, and
+        # said so when only one took the config.
         print("\nNote: only one of the two stores took the config. It will "
               "survive a reboot,\nbut check the line above: a card that "
               "refused the write is a card problem,\nand a board running "

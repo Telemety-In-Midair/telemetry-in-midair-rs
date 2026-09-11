@@ -114,7 +114,7 @@ the audit's rework added. None has been flashed.
 | 5 | The one-channel default retuned at every slot boundary: through standby to the carrier it was already on, a millisecond deaf a second, and a preamble landing there was a frame lost. | `radio.rs` `hop_tick` | `Plan::retunes` says whether the carrier changes; the boundary is only noted when it does not. |
 | 6 | `Clock::tx_start` planned "the next slot" on a multi-slot interval - another node's slot, where nothing is owed - so the plan was dropped and the beacon waited a whole interval. Any pass that came late at the start of the node's slot. | `hop.rs`, `main.rs` | It plans the node's own next slot, and the hardware loop keeps a plan that is still ahead across the slots between rather than discarding it on the first one that is not the node's; a test walks every address, interval and phase. The simulator's port and its vectors follow. |
 | 7 | A valid header seen after a stale preamble's hold had lapsed inherited the stale start, so its hold could already be spent. Reachable where preamble and header land in one poll. | `rxgate.rs` | A header after a lapsed hold starts a fresh one. |
-| 8 | A config pushed during a wake check was written to a card that had never been mounted. | `posture.rs` | The apply mounts the card first. |
+| 8 | A config pushed during a wake check was written to a card that had never been mounted. | `posture.rs` | The apply mounted the card first; since the card's removal the apply reads the stored config first, by the same rule. |
 | 9 | Repeats were not gated on a pending sleep the way beacons are. | `main.rs` | `Posture::may_transmit` gates both. |
 
 On the app side:
@@ -194,7 +194,11 @@ Three mechanisms, one policy, one model:
   it needs - the watchdog, unfed, resets the board with the RTC copy
   intact. The panic handler does the same for a panic, with the message,
   location and the top of the backtrace, and the HAL routes CPU
-  exceptions through it.
+  exceptions through it. The watchdog's first stage is a warning
+  interrupt on the second core, five seconds before the reset, whose
+  handler writes each loop's last phase to RTC RAM - the one case the
+  monitor cannot write down is its own core stopping, which on this chip
+  also stops the other core's timers.
 - **The event log**, a ring of 128-byte records in a `coredump`
   partition: every boot with its reset reason and what the last boot
   left, every panic, every stall, and the faults worth a line. The boot
@@ -282,7 +286,7 @@ gantt
 
 Five events from a connected tracker to a chip asleep with its receiver
 acquiring and its radio in continuous receive. The window is real - the
-park waits up to `tx_worst_case_ms + 1500` for the card - and the console
+park waits up to `tx_worst_case_ms + 1500` for the loop - and the console
 is alive throughout.
 
 ## What the walk cannot say
@@ -291,8 +295,8 @@ is alive throughout.
   late, two nodes that overlap: `tools/radio_sim.py`. The models take the
   timing as given and check what is decided from it.
 - **The hardware.** Whether the SX1262 honors a standby, whether the M10
-  takes the park, whether the card flush finishes inside the budget. The
-  bench items below.
+  takes the park, whether the park finishes inside the budget. The bench
+  items below.
 - **The platform under the session.** The worker model steps the real
   `Session` over a `FakeLink`; what btleplug and the Java shim do inside
   one `Link` call - whether a connect lands, whether a subscribe is
@@ -371,13 +375,15 @@ that expects to find one.
    let the app reconnect: the controls are live again without a press.
    This is finding 12.
 8. Flash, let it boot, and `pixi run board-log`: a `boot` record with
-   `reset: power on` or `software`. Then a build with a `panic!` placed
-   after the attribute server attaches, connect a phone: the board resets
-   within a second, the boot line says `evlog: last boot left:` with the
-   panic's file and line, and `board-log` shows a `panic` record and a
-   `boot` record with `(panic)`. Then the same with a `loop {}` in the
-   hardware loop's pass: a `stall` record naming `hardware loop` and the
-   phase, about fifteen seconds in.
+   `reset: power on` or `software`. Then the three bench builds, each
+   flashed and left for a minute: `--features bench-panic` resets within
+   a second of its panic and the boot after says `evlog: last boot left:`
+   with the panic's file and line; `bench-stall` resets about fifteen
+   seconds in with a `stall` record naming `hardware loop` and its phase;
+   `bench-hang` stops the first core's executor, and thirty seconds later
+   the boot says `reset: hardware watchdog` with a `stall` record that
+   carries each loop's last phase, written by the watchdog's warning on
+   the second core.
 9. A tracker left beaconing for a day with a phone connecting now and
    then: `board-log` shows one `boot` record. More than one, each with a
    `stall` before it in `card` or `ble init` at the same uptime, is a

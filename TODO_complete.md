@@ -246,3 +246,27 @@ models walk what the policy decides, not the platform under it.
   non-asserting liveness check, for a model that expects to find one.
 - Not done: flashing any of it. `TODO.md` has the bench recipe, and the
   freeze's cause is what the log is for.
+
+## The SD card removed, and the bench (2026-09-11, later)
+
+- **The false stall.** The first flash of the watchdog reset the board
+  every 15 s: `hardware loop silent 15 s in boot`. The monitor's initial
+  boot beat had overwritten the loop's first beat, and the card's mount
+  ran longer than the bound in one synchronous call. The first is fixed
+  (a task that has not beaten is as old as the boot, nothing writes a
+  later boot beat); the second is why the card left.
+- **The card, out** (`98f73dc`): no driver, no `Card` posture (a
+  `Config::{Unread, Read}` and a `parked` flag replace it), no
+  `sd_enabled` key (accepted and ignored in an old file), the config kept
+  in flash alone, the slot's four lines parked. The app's editor row went
+  with it. The card's documentation is in the history.
+- **A two-stage watchdog.** Node `LN4` once reset by the bare watchdog
+  with nothing written: the monitor itself had stopped. Stage 0 is now a
+  warning interrupt on the second core that writes each loop's last phase
+  and the monitor's silence into RTC RAM; stage 1 resets. `bench-hang`
+  provokes it, beside `bench-panic` and `bench-stall`.
+- **Bench, both boards:** boot to beacon in half a second; node 1 hears
+  node 0's every ping and takes its hop clock; a config push over USB
+  while beaconing; four BLE connect, read and disconnect cycles from a
+  laptop, each seen on the console; rename, idle, tracking, a 20 s nap
+  logged as a deep-sleep wake; the log read back after all of it.

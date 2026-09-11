@@ -1011,7 +1011,20 @@ pub async fn hardware_task(
     let (posture, boot_fx) = Posture::at_boot(boot, &stored);
     let mut hw = Hardware::new(lora, gps, j5, d5, d2, posture, cold);
     hw.boot(boot, boot_fx, &stored).await;
+    #[cfg(any(feature = "bench-panic", feature = "bench-stall"))]
+    let fault_at = Instant::now() + Duration::from_secs(20);
     loop {
+        #[cfg(feature = "bench-panic")]
+        if Instant::now() >= fault_at {
+            panic!("bench: a deliberate panic in the hardware loop");
+        }
+        #[cfg(feature = "bench-stall")]
+        if Instant::now() >= fault_at {
+            status_println!("bench: the hardware loop stops here on purpose");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
         let wait = hw.pass().await;
         Timer::after(wait).await;
     }

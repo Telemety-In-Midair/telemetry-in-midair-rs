@@ -1,8 +1,9 @@
 # Power settings
 
 Every knob that changes what the Wio-S3 draws, what it costs, and where it
-is set. All of them live in `RADIO.CFG` - the TOML file in the root of the
-SD card, documented key by key in `RADIO.example.toml`.
+is set. All of them live in the radio config - the TOML-shaped file a push
+writes into the board's flash, documented key by key in
+`RADIO.example.toml`.
 
 This is the reference: the settings first, then how the numbers were
 taken, then the levers not yet pulled, in the order they are worth
@@ -20,8 +21,10 @@ listening, nothing transmitting:
 | S3 core, never sleeping | ~12 mA | not configurable, see below |
 | USB Serial/JTAG PHY | 3-5 mA | not configurable |
 | SX1262 listening | ~6 mA | `role`, `rx_boost` |
-| SD card, mounted idle | 1-10 mA | `sd_enabled` |
 | **Total** | **~126 mA** | |
+
+The SD card the earlier firmware mounted cost 1-10 mA idle, card dependent;
+the firmware no longer drives the slot.
 
 Plus one 288 ms LoRa transmit per `interval_s` at 127 mA, which averages
 to about 37 mA at the 1 s default - the price of a position every second,
@@ -181,12 +184,12 @@ is useless for a tracker.
 
 | Key | Range | Default | Effect |
 |-|-|-|-|
-| `sd_enabled` | bool | `true` | Stops logging and the card's 1-10 mA. Card-dependent and worth measuring on the specific card before relying on it. |
 | `verbose` | bool | `true` | Console detail. Costs nothing when nothing is attached. |
 
 ## Where a setting lives
 
-Most keys are read from the card at boot and that is the whole story. The
+Most keys are read from the stored config at boot and that is the whole
+story. The
 five under `[power]` are different: the board also keeps them in RTC RAM,
 so they survive a deep sleep, and in flash, so they survive a flat cell -
 and an app can change them live over BLE, which no other key can.
@@ -223,15 +226,15 @@ The rules that come out of it:
   is how a file turns a duty cycle off.
 - **A cold boot adopts the file.** It is what survives a reflash; the RTC
   copy is not.
-- **A deep-sleep wake does not.** Re-reading the card every interval would
-  undo a live change once per wake, forever.
+- **A deep-sleep wake does not.** Re-reading the stored config every
+  interval would undo a live change once per wake, forever.
 - **A live change lasts until the next cold boot**, where an uncommented key
   in the file takes over again.
 
 One lag worth knowing: the first advertising window's length is fixed before
-the card is mounted, so an `adv_window_s` from the file takes effect from the
-second window on. `ble_off_s` is re-read at the end of every window and has
-no such delay.
+the stored config is read, so an `adv_window_s` from the file takes effect
+from the second window on. `ble_off_s` is re-read at the end of every window
+and has no such delay.
 
 ## Setting them
 
@@ -270,8 +273,8 @@ no file key, so it lasts until something changes it.
 
 - **CPU clock.** Pinned at 80 MHz, the documented floor for the radio, in
   `firmware/src/bin/main.rs`. It cannot come from the file: the clock is
-  configured before the SPI bus that reads the card exists. Worth ~10-15 mA
-  against 160 MHz, which is already taken.
+  configured before the flash that holds the config is claimed. Worth
+  ~10-15 mA against 160 MHz, which is already taken.
 - **BLE modem sleep.** On, always, and not a setting. `esp-radio` ships it
   unimplemented - the controller's sleep callbacks are `todo!()` in every
   published version through 1.0.0-beta.0 - so it is a local patch to the

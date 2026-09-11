@@ -46,6 +46,17 @@ iso-gps-backup = []
 # while advertising, and again while a phone is connected and idle.
 iso-ble-no-modem-sleep = []
 
+# Bench faults, for proving the watchdog and the event log on a board.
+# Twenty seconds after the hardware loop is up, `bench-panic` panics on its
+# core and `bench-stall` stops it in a spin. Either build resets itself
+# within its bound and the boot after says so; neither is ever shipped.
+bench-panic = []
+bench-stall = []
+# `bench-hang` stops the first core's executor in a spin instead, twenty
+# seconds after boot: the monitor never runs again, and the watchdog's
+# warning on the second core is what has to say so.
+bench-hang = []
+
 [dependencies]
 # Same versions the retired ESP32-C6 firmware ran, retargeted at the S3: the
 # matched esp-rtos 0.2 / esp-radio 0.17 pair expects esp-hal 1.0.x.

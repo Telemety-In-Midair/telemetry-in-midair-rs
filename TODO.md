@@ -39,7 +39,7 @@ mode is worth anything. Both readings need a board on a meter:
    unfed here and backup-on-`VCC`-alone has never been priced.
 2. **The Stored floor.** Set a cadence and let it sleep: `board-set sleep 60`,
    then `board-set mode stored`. The park path now takes the receiver into
-   backup, the radio into cold sleep and the card off the bus, and holds
+   backup and the radio into cold sleep, and holds
    both NSS and UART TX across the sleep - so this reading is the floor
    itself rather than the old ~30 mA of ungated GPS. Low single-digit
    milliamps means storage life in weeks; tens of milliamps means the plan
@@ -223,11 +223,14 @@ Beeper.
 
 ## Open questions
 
-Will flashing the firmware with a `RADIO.CFG` present overwrite flags such
-as the node address? (It should not, and there are now two reasons: the card
-is read at boot and the card wins, and the flash backup lives in `nvs`, which
-the runner does not erase - `--erase-parts otadata` is the whole erase list.
-Untested on hardware.)
+Does flashing the firmware keep the node address? (It should: the config
+record lives in `nvs`, which the runner does not erase - `--erase-parts
+otadata` is the whole erase list. Untested on hardware.)
+
+**The SD card, later.** Removed 2026-09-11 (`docs/HARDWARE.md` says why);
+the driver is in the history before that date. If it comes back, its mount
+and its FAT walks have to beat for the hardware loop from inside the bus,
+or run somewhere the loop does not wait on.
 
 Will a sleeping board ever be connected to if an awake board is nearby?
 

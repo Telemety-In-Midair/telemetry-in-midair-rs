@@ -75,8 +75,8 @@ log. Lines are ASCII, up to `link::LOG_MAX` (128) bytes.
 
 A periodic status line every 10 s carries the radio's chip mode and latched
 device errors, the packet counters, the hop channel and stratum, GPS
-sentence counts and fix state, whether the card mounted, and the idle rate
-of the core. It exists because a quiet radio and a quiet GPS look identical
+sentence counts and fix state, the idle rate of the core and the free heap.
+It exists because a quiet radio and a quiet GPS look identical
 otherwise, and because the radio's status byte reports the mode it is in,
 not whether it got there intact.
 
@@ -126,8 +126,9 @@ scanner can be searched by `ws3gps`. Labels take ASCII letters, digits, `-`
 and `_`; anything else is rejected rather than sanitized.
 
 The label is stored with the settings that decide reachability - RTC RAM,
-mirrored to the `nvs` partition - rather than on the card, because a wake
-check advertises before anything has mounted one. It survives a deep sleep,
+mirrored to the `nvs` partition - rather than with the radio config,
+because a wake check advertises before anything has read that. It survives
+a deep sleep,
 a reflash and a flat cell, and a board updated from firmware that predates
 names reads back as unnamed rather than as unreadable. `pixi run board-wipe`
 is what removes it, along with the rest of the settings; see below.
@@ -237,8 +238,8 @@ for a central, the connected session, or the modem's off period.
 ### What a sleep does
 
 Before it sleeps the board parks everything it can reach. The radio goes to
-cold sleep (5.5 mA of continuous RX against 9.3 uA), the card is flushed and
-unmounted, the panel is blanked, and the receiver is sent into PMREQ backup
+cold sleep (5.5 mA of continuous RX against 9.3 uA), the panel is blanked,
+and the receiver is sent into PMREQ backup
 - re-issued on every park, because after a reset the firmware's belief about
 the module is worth nothing. The hardware loop declines to start a beacon
 while a sleep is pending, and the sleep path waits for the park for the
@@ -278,13 +279,11 @@ dropped)`, which is the erase having stuck.
 ### Wiping a board
 
 `pixi run board-wipe` sends the USB console's `WIPE` command: the board
-erases its settings record, its name and its radio config backup, drops the
-RTC RAM copy, acks, and restarts on its defaults. The firmware, the OTA
-slots and the card are untouched. `pixi run board-wipe --flash` erases every
-byte of flash instead and rebuilds and reflashes the firmware - the reset
-for a board that has been through several firmwares. Neither touches the SD
-card: a `RADIO.CFG` there is read at the next boot and wins, `[power]`
-section included.
+erases its settings record, its name and its stored radio config, drops the
+RTC RAM copy, acks, and restarts on its defaults. The firmware and the OTA
+slots are untouched. `pixi run board-wipe --flash` erases every byte of
+flash instead and rebuilds and reflashes the firmware - the reset for a
+board that has been through several firmwares.
 
 ### What the board wrote down
 

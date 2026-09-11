@@ -5,8 +5,7 @@ path is wired and why that wiring is a safety constraint, what a BLE session
 does, and the modes the radio runs in.
 
 The board is one Seeed Wio-S3 module (ESP32-S3R8 + SX1262 + TCXO in one can)
-on the `wio-s3-max-gps` carrier, with a u-blox MAX-M10 GPS and a microSD
-card. It replaced a two-MCU design - an ESP32-C6 for BLE and power, a
+on the `wio-s3-max-gps` carrier, with a u-blox MAX-M10 GPS. It replaced a two-MCU design - an ESP32-C6 for BLE and power, a
 WIO-E5 for GPS/LoRa/SD, a framed UART link between them - and roughly a
 third of the old firmware existed only to bridge that split.
 
@@ -43,7 +42,7 @@ classDiagram
 
     class Firmware {
         <<Wio-S3, embassy, one binary>>
-        BLE, LoRa, GPS, SD
+        BLE, LoRa, GPS
     }
     class ServeTask {
         <<ble.rs, duty_cycle and serve>>
@@ -70,7 +69,7 @@ classDiagram
     class HardwareTask {
         <<hardware.rs, second core>>
         Hardware: effect() pass()
-        owns radio, gps, card and panel
+        owns radio, gps and panel
         beacon() receive() repeat() panel()
         applies a pushed config
     }
@@ -110,10 +109,11 @@ classDiagram
         handle(owner, op)
     }
     class FlashStore {
-        <<one peripheral, three users>>
+        <<one peripheral, four users>>
         nvs settings record
-        nvs config backup
+        nvs radio config record
         OtaSink into the idle slot
+        coredump event log
     }
     class Settings {
         <<RTC RAM + nvs mirror>>
@@ -128,6 +128,7 @@ classDiagram
         guarded() beats across a wait that may last
         feeds the TIMG1 watchdog while all are in bound
         stall: crumb, log, reset
+        the watchdog warns on the second core, then resets
     }
     class PanicHandler {
         <<panic.rs>>
@@ -227,9 +228,6 @@ classDiagram
     class MaxM10 {
         <<GPS receiver, UART>>
     }
-    class SdCardHw {
-        <<FAT16 or FAT32, SPI, optional>>
-    }
 
     GpsGuiApp ..> GattSession : GATT
     HostTools ..> Firmware : USB serial
@@ -259,7 +257,7 @@ classDiagram
     Xfer --> FlashStore : OtaSink
     Xfer ..> State : request(ApplyConfig)
     Settings --> FlashStore : nvs mirror
-    HardwareTask --> FlashStore : config backup
+    HardwareTask --> FlashStore : radio config
     GattSession --> Settings
     Firmware *-- Monitor
     HardwareTask ..> Monitor : beat, every pass
@@ -293,7 +291,6 @@ classDiagram
     GpsPump --> HardwareTask : bytes
     GpsPump --> MaxM10
     HardwareTask --> MaxM10 : UBX commands
-    HardwareTask --> SdCardHw
     Node --> Sx1262Driver
     Node ..> LoraCodec
     Sx1262Driver --> Sx1262Cmds
@@ -302,7 +299,6 @@ classDiagram
     Sx1262Driver --> HopPlan
     HopClock <.. MaxM10 : time of day, with a fix
     HopClock <.. RemoteNode : sync word in every frame
-    SdCardHw ..> RadioConfig : RADIO.CFG
     Sx1262Cmds --> RfSwitch : DIO2, DIO3
     RfSwitch <..> RemoteNode : broadcasts and hops
 ```
@@ -324,6 +320,15 @@ board resets - and if the write to flash blocks, the watchdog resets the
 board with the RTC copy intact for the next boot to log. Before this a
 panic on either core stopped both, silently: the panicking core spun with
 its critical section held and the other core stopped at its next one.
+
+The watchdog itself has two stages, because the one failure the monitor
+cannot write down is its own core stopping - and on this chip that stops
+the other core's timers too, so the whole board freezes with nothing
+said. Five seconds before the reset a warning interrupt fires on the
+*second* core, whose handler writes each loop's last phase and the
+monitor's silence into RTC RAM. On the bench a first core stopped on
+purpose came back thirty seconds later logged as `core 0 silent 25 s:
+serve loop last in advertise 25 s ago, hardware loop in status 0 s ago`.
 
 ## The RF path, and why two registers are not tunable
 
@@ -506,7 +511,7 @@ off from GPS settles on one reference (the lowest address among equals)
 instead of every node holding to its own.
 
 Two things keep a clock honest that the diagram does not show. A pass of
-the hardware loop that comes late - after a transmit, after a card flush
+the hardware loop that comes late - after a transmit, after a config apply
 - stamps what it reads with a time that could be anywhere in the gap, so
 it never disciplines a clock that is already set; the next second's GPS
 sentence, or the next frame from the same sender, does. And the sync word
@@ -576,8 +581,8 @@ Both arrive the same way - a bulk transfer over BLE or the USB console -
 and the shared `midair_proto::bulk` state machine is what makes "one at a
 time" a property of the object rather than a flag someone has to check.
 Where they end up is what differs: a config is small, has to be parsed
-whole, and belongs on the card; an image is hundreds of kilobytes and goes
-straight to flash as it arrives.
+whole, and is kept as text in the board's flash; an image is hundreds of
+kilobytes and goes straight to flash as it arrives.
 
 ```mermaid
 flowchart TB
@@ -592,7 +597,7 @@ flowchart TB
     Pending --> Hw["HardwareTask"]
     Hw --> Radio["re-init the radio<br/>reconfigure the node<br/>re-push GPS settings"]
     Hw --> Card["write RADIO.CFG"]
-    Hw --> Nvs["write the nvs backup<br/>(what a board with no card comes back on)"]
+    Hw --> Nvs["write the nvs record<br/>(what the next boot comes back on)"]
 
     Xfer -->|KIND_OTA| Sink["OtaSink<br/>stage a sector, write it"]
     Sink --> Slot["the app slot that is NOT running"]
@@ -642,7 +647,7 @@ stateDiagram-v2
     Tracking --> BleDown : ble_on_s spent, ble_off_s set
     BleDown --> Tracking : ble_off_s elapses
 
-    Park --> Stored : card flushed, GPS in backup,<br/>radio cold, NSS and TX pads held
+    Park --> Stored : GPS in backup,<br/>radio cold, NSS and TX pads held
     Stored --> Tracking : timer wake with nvs tracking
 
     note right of WakeCheck
@@ -651,7 +656,7 @@ stateDiagram-v2
         wake sources, so the boot path used
         to wake the receiver every wake just
         to have Park put it back - no radio
-        init, and the card stays off the bus.
+        init, and the stored config is not read.
     end note
 
     note right of Idle
@@ -665,7 +670,7 @@ stateDiagram-v2
 
     note right of Listening
         The node beside the phone. GPS and
-        receiver up, card logging, BLE up
+        receiver up, BLE up
         the whole time - and nothing goes
         out on the air. Persisted, like
         tracking.
@@ -715,8 +720,8 @@ mirrored into the `nvs` partition so they also survive a flat cell. Only the
 settings that decide whether a board is reachable at all are mirrored, and
 the mode is now one of them - which resolves an inversion. The board's name
 is kept there for a related reason: a wake check advertises before anything
-has mounted the card, so a name on the card would be a name a sleeping board
-could not tell anyone. The GPS and radio
+has read the radio config, so a name kept with that would be a name a
+sleeping board could not tell anyone. The GPS and radio
 sleep flags are deliberately *not* saved, because "a board that cold-boots
 with its GPS running is the safer failure" - true for a tracker, and it
 drains the cell of a device in a bag. The mode answers both: a cold boot
@@ -724,12 +729,11 @@ lands in Idle, which is reachable *and* has the GPS down, and only an
 explicit stored `tracking` raises everything.
 
 The radio config is the partition's other tenant, one sector along, and it
-is stored for the opposite reason: not because it is needed before the card
-is mounted, but because there may be no card to mount. The card still wins
-at boot - editing `RADIO.CFG` on a computer has to do what it looks like -
-and a boot that reads one refreshes the backup from it, so the copy a
-card-less board falls back to is the last one anybody wrote. Without it a
-board that lost or never had a card came back on firmware defaults, and the
+is stored for the opposite reason: not because it is needed before the
+radio comes up, but because it is the only copy. Until 2026-09-11 an SD
+card held a second one that won at boot; the card is no longer driven, and
+the record is what every push writes and every boot reads. Without it a
+board came back on firmware defaults, and the
 node address is the one setting nothing can guess back.
 
 ## The states over time
@@ -791,9 +795,6 @@ gantt
     section GPS
     tracking - never gated  :active, g1, 1, 113s
 
-    section SD card
-    logging every fix       :active, d1, 1, 113s
-
     section USB console
     alive throughout        :active, u1, 0, 114s
 
@@ -825,7 +826,7 @@ so the phone can come straight back.
 
 `mode = stored`, `adv_window_s = 15`, `sleep_interval_s = 45`. The chip goes
 away and so does everything else - the receiver into backup, the radio into
-cold sleep, the card flushed and unmounted, the panel dark.
+cold sleep, the panel dark.
 
 What the floor actually is has never been measured. The chip is microamps
 and the radio is 9.3 uA; the M10 in backup on `VCC` alone is unknown, since
@@ -871,12 +872,6 @@ gantt
     PMREQ backup - re-issued by every Park :done, p2, 19, 46s
     still in backup - the wake check never speaks to it :done, p3, 65, 40s
     backup        :done, p4, 105, 46s
-
-    section SD card
-    logging every fix       :active, e1, 1, 18s
-    flushed and unmounted by Park :done, e2, 19, 46s
-    not mounted - a wake check reads no card :done, e3, 65, 40s
-    unmounted               :done,   e4, 105, 46s
 
     section USB console
     alive                   :active, v1, 0, 19s
@@ -1064,7 +1059,7 @@ classDiagram
     }
     class Posture {
         <<posture, proto>>
-        live, radio, gps, card
+        live, radio, gps, config, parked
         at_boot(mode, stored) Effects
         on(Request, stored) Effects
         consistent(stored) the rule
@@ -1204,7 +1199,7 @@ stateDiagram-v2
     end note
     note right of Asleep
         Invariant: radio asleep, GPS parked,
-        card parked, and the park finished.
+        parked, and the park finished.
     end note
     note left of Connected
         Every write, over BLE or the console,

@@ -1,6 +1,6 @@
 //! Wio-S3 firmware for the wio-s3-max-gps board.
 //!
-//! One module holds BLE, LoRa, GPS and SD. A config write is a request the
+//! One module holds BLE, LoRa and GPS. A config write is a request the
 //! hardware loop picks up on its next pass, and a command the serve loop
 //! picks up in whichever wait it is in.
 //!
@@ -12,8 +12,7 @@
 //! - Broadcasts that position over 915 MHz LoRa on the configured interval,
 //!   or a [`lora::Ping`] while it has no fix, and hears every other node in
 //!   range. A node configured as a repeater forwards what it hears.
-//! - Logs own and remote positions to a FAT SD card, and reads `RADIO.CFG`
-//!   from it at boot.
+//! - Keeps its radio config in its own flash, and reads it at boot.
 //! - Serves the gps-proto GATT service, extended with telemetry, the
 //!   remote-node roster, status lines and bulk transfer.
 //! - Takes a radio config or a firmware image over BLE or the USB console.
@@ -68,7 +67,7 @@ const LORA_SPI_HZ: u32 = 8_000_000;
 /// state lives in the task arena, but its future is built on this stack
 /// before it is moved there, so the stack has to hold the whole of
 /// `Hardware` once, beside the peripherals being moved into it; after that
-/// it is what polling uses - the card driver's frames and the console
+/// it is what polling uses - the radio driver's frames and the console
 /// formatting are the deep parts. 32 KiB overflowed at the spawn when the
 /// constructor was an `async fn` holding the state twice.
 #[cfg(feature = "dual-core")]
@@ -132,8 +131,8 @@ esp_bootloader_esp_idf::esp_app_desc!();
 async fn main(spawner: Spawner) -> ! {
     // Not `CpuClock::max()`, which on the S3 is 240 MHz, and not ESP-IDF's
     // default of 160 either. Nothing here claims that headroom: the
-    // hardware loop runs at 100 Hz, the GPS link is 9600 baud, the SD bus
-    // is 400 kHz and the radio sees one 8 MHz burst per beacon. The clock
+    // hardware loop runs at 100 Hz, the GPS link is 9600 baud and the
+    // radio sees one 8 MHz burst per beacon. The clock
     // is a standing cost the whole time the board is awake, and each step
     // down is on the order of 10 mA.
     //
@@ -271,7 +270,7 @@ async fn main(spawner: Spawner) -> ! {
 
     // What this boot raises. Three flavors and one decision, taken here
     // because everything below - which peripherals are spoken to, whether
-    // the card is mounted, what the serve loop budgets on - follows from it.
+    // the config is read, what the serve loop budgets on - follows from it.
     //
     // The stored mode only ever says stored or tracking; idle is what a
     // cold boot turns "stored" into, so a board that has just been flashed,
@@ -321,13 +320,13 @@ async fn main(spawner: Spawner) -> ! {
         match boot {
             Mode::Stored => "wake check, nothing raised",
             Mode::Idle => "reachable, gps in backup (CFG_MODE tracking to track)",
-            Mode::Tracking => "gps, radio and card up",
-            Mode::Listening => "gps, receiver and card up, nothing transmitted",
+            Mode::Tracking => "gps and radio up",
+            Mode::Listening => "gps and receiver up, nothing transmitted",
         }
     );
 
     // Everything below up to the `hardware_task` spawn is the application:
-    // the LoRa radio, the GPS, the card and the J5 panel. `iso-no-app`
+    // the LoRa radio, the GPS and the J5 panel. `iso-no-app`
     // drops the lot, which leaves BLE and the USB console - the closest
     // this board can get to the old two-MCU board's "ESP only, BLE
     // connected" reading. It does NOT power the GPS or the SX1262 down;
@@ -392,7 +391,7 @@ async fn main(spawner: Spawner) -> ! {
     //
     // The two halves go different ways. The receive half is an async
     // byte pump on this executor, which keeps draining the 128-byte FIFO
-    // while the hardware loop is inside a transmit or a card flush; the
+    // while the hardware loop is inside a transmit or a config apply; the
     // transmit half stays with the driver for the UBX commands.
     let gps_uart = Uart::new(
         peripherals.UART1,
@@ -461,11 +460,11 @@ async fn main(spawner: Spawner) -> ! {
     //
     // Everything else - the BLE host, the USB console, the GPS byte pump
     // - stays on this one, beside the BLE controller's own thread. The
-    // loop's blocking work is what this separates from the host: a card
-    // flush is tens of milliseconds of SPI at 400 kHz, and occasionally
-    // hundreds while the card wear-levels, and on one core every
-    // millisecond of it was a millisecond the host could not answer the
-    // phone or move a notification. The other way round, the host's work
+    // loop's blocking work is what this separates from the host: a
+    // receive poll's SPI, a config apply's radio re-init, a panel
+    // refresh, and on one core every millisecond of it was a millisecond
+    // the host could not answer the phone or move a notification. The
+    // other way round, the host's work
     // no longer lands inside the loop's 10 ms pass, which is what times a
     // received packet for the hop clock.
     //
@@ -493,6 +492,9 @@ async fn main(spawner: Spawner) -> ! {
             APP_STACK.init(Stack::new()),
             move || {
                 let (lora, gps, j5, d5, d2) = carried.into_inner();
+                // The watchdog's warning lands on this core, so a first
+                // core that has stopped cannot take it with it.
+                wio_s3_gps::watchdog::warn_on_this_core();
                 let executor = APP_EXECUTOR.init(esp_rtos::embassy::Executor::new());
                 executor.run(|app| {
                     app.spawn(hardware::hardware_task(lora, gps, j5, d5, d2, boot, cold))
@@ -538,6 +540,10 @@ async fn main(spawner: Spawner) -> ! {
     spawner
         .spawn(wio_s3_gps::watchdog::monitor_task(wdt))
         .expect("spawn monitor task");
+    #[cfg(feature = "bench-hang")]
+    spawner
+        .spawn(wio_s3_gps::watchdog::bench_hang_task())
+        .expect("spawn bench hang task");
 
     // `iso-no-ble` skips all of this: no `esp_radio::init`, so no PHY, no
     // controller and no advertising. The difference against the baseline is

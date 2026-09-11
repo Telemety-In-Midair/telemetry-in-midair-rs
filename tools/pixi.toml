@@ -10,8 +10,8 @@ python = ">=3.10"
 pyserial = ">=3.5"
 
 [tasks]
-# Push a radio config to the board over USB, applied live and saved to its
-# SD card:
+# Push a radio config to the board over USB, applied live and kept in its
+# flash:
 #   pixi run board-config --address 3
 #   pixi run board-config --address 3 --set role=tx_only
 # Sends a whole file (default ../RADIO.example.toml, i.e. firmware defaults
@@ -64,12 +64,11 @@ board-log = "python board_log.py"
 #   pixi run board-wipe
 #   pixi run board-wipe --flash
 # `espflash erase-flash` alone is not enough, because the settings also sit
-# in RTC RAM, which survives every reset short of a power cycle. The card
-# is never touched: pull it, or delete RADIO.CFG, to reset that too.
+# in RTC RAM, which survives every reset short of a power cycle.
 board-wipe = "python board_wipe.py"
 
 # Simulate a few boards on the hop plan - the clock, the receiver, the GPS
-# UART, the card and the BLE notifier - and report what a receiver and a
+# UART and the BLE notifier - and report what a receiver and a
 # phone see, before and after the fixes in docs/RADIO-AUDIT.md:
 #   pixi run radio-sim
 #   pixi run radio-sim --scenario B --seeds 6

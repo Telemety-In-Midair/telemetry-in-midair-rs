@@ -20,17 +20,37 @@
 //! monitor blocks trying to write a stall to flash because the dead core
 //! holds the lock the write needs, nothing feeds the watchdog and the
 //! watchdog resets the board. The crumb is written before either.
+//!
+//! A first core that stops is the one failure the monitor cannot write
+//! down, since the monitor is what stopped. The watchdog runs in two
+//! stages for that: a warning interrupt a few seconds before the reset,
+//! bound to the *second* core, whose handler writes what the heartbeats
+//! say - the last phase of each loop and how long ago - into RTC RAM.
+//! It cannot say what the first core is doing, but it can say what it
+//! was last seen doing, which is the question after a board that simply
+//! stopped. It also stops nothing itself: the reset stage follows.
 
 use embassy_futures::select::{select, Either};
 use embassy_time::{Duration, Instant, Timer};
+use esp_hal::interrupt::{InterruptConfigurable, Priority};
 use esp_hal::peripherals::TIMG1;
-use esp_hal::timer::timg::{MwdtStage, Wdt};
+use esp_hal::timer::timg::{MwdtStage, MwdtStageAction, Wdt};
 use midair_proto::supervise::{
     Phase, Stall, Supervisor, Task, Verdict, MONITOR_PERIOD_MS, WDT_TIMEOUT_MS,
 };
 use portable_atomic::{AtomicU32, AtomicU8, Ordering};
 
 use crate::{crumb, evlog};
+
+/// How long before the reset the warning interrupt fires. Long enough
+/// for the handler to run and the crumb to land; short enough that a
+/// monitor merely late does not see it, since the monitor's own bound on
+/// every task is well inside it.
+const WDT_WARNING_MS: u32 = 5_000;
+
+/// When the monitor last fed the watchdog, as the low word of the clock.
+/// What the warning handler reports as the first core's silence.
+static MONITOR_SEEN_MS: AtomicU32 = AtomicU32::new(0);
 
 /// When each task last beat, as the low word of the millisecond clock.
 /// A word rather than the whole clock so a beat is one store with no
@@ -163,12 +183,54 @@ fn snapshot() -> (Supervisor, u64) {
 
 /// Arm the hardware watchdog. Called once, early in the boot, so it
 /// covers the boot too; the monitor feeds it from then on.
+///
+/// Two stages: the warning interrupt at the timeout less
+/// [`WDT_WARNING_MS`], then the reset that many milliseconds later. A
+/// feed puts the count back to the start of the first stage.
 pub fn arm(wdt: &mut Wdt<TIMG1<'static>>) {
+    wdt.enable();
     wdt.set_timeout(
         MwdtStage::Stage0,
-        esp_hal::time::Duration::from_millis(u64::from(WDT_TIMEOUT_MS)),
+        esp_hal::time::Duration::from_millis(u64::from(WDT_TIMEOUT_MS - WDT_WARNING_MS)),
     );
-    wdt.enable();
+    wdt.set_stage_action(MwdtStage::Stage0, MwdtStageAction::Interrupt);
+    wdt.set_timeout(
+        MwdtStage::Stage1,
+        esp_hal::time::Duration::from_millis(u64::from(WDT_WARNING_MS)),
+    );
+    wdt.set_stage_action(MwdtStage::Stage1, MwdtStageAction::ResetSystem);
+}
+
+/// Bind the watchdog's warning interrupt to the core this is called on.
+///
+/// Called from the second core as it starts, so that a first core that
+/// has stopped - with its interrupts off, or spinning in a handler - does
+/// not take the warning with it. The handler writes the crumb the boot
+/// after will log, and nothing else.
+pub fn warn_on_this_core() {
+    let mut wdt = Wdt::<TIMG1<'static>>::new();
+    wdt.set_interrupt_handler(wdt_warning);
+    TIMG1::regs().int_ena().modify(|_, w| w.wdt().set_bit());
+}
+
+/// The warning stage fired: the monitor has not fed the watchdog for the
+/// whole of the first stage. Say what the heartbeats say, into RTC RAM,
+/// with atomics alone; the reset stage follows in a few seconds whether
+/// or not this ran.
+#[esp_hal::handler(priority = Priority::Priority3)]
+fn wdt_warning() {
+    TIMG1::regs().int_clr().write(|w| w.wdt().clear_bit_by_one());
+    let now32 = now_ms32();
+    let age = |seen: &AtomicU32| now32.wrapping_sub(seen.load(Ordering::Relaxed));
+    let phase_of = |task: Task| {
+        Phase::from_wire(PHASE[index(task)].load(Ordering::Relaxed)).unwrap_or_default()
+    };
+    crumb::record_watchdog(
+        (phase_of(Task::Serve), age(&SEEN_MS[index(Task::Serve)])),
+        (phase_of(Task::Loop), age(&SEEN_MS[index(Task::Loop)])),
+        age(&MONITOR_SEEN_MS),
+        Instant::now().as_secs() as u32,
+    );
 }
 
 /// Read the heartbeats every period; feed the watchdog while every task
@@ -184,10 +246,25 @@ pub async fn monitor_task(mut wdt: Wdt<TIMG1<'static>>) {
         match sup.check(now) {
             Verdict::Alive => {
                 wdt.feed();
+                MONITOR_SEEN_MS.store(now_ms32(), Ordering::Relaxed);
                 evlog::flush().await;
             }
             Verdict::Stalled(stall) => stalled(stall).await,
         }
+    }
+}
+
+/// Twenty seconds after it starts, stop the first core's executor in a
+/// spin: what a task that blocks looks like from everywhere else. The
+/// monitor stops feeding, the warning fires on the second core, and the
+/// boot after should say which phase the serve loop was last seen in.
+#[cfg(feature = "bench-hang")]
+#[embassy_executor::task]
+pub async fn bench_hang_task() {
+    Timer::after(Duration::from_secs(20)).await;
+    crate::status_println!("bench: the first core's executor stops here on purpose");
+    loop {
+        core::hint::spin_loop();
     }
 }
 

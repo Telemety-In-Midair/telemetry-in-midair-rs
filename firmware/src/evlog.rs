@@ -200,7 +200,9 @@ pub async fn boot() {
         let line = describe(&c);
         let (kind, at) = match &c {
             crumb::Crumb::Panic { uptime_s, .. } => (Kind::Panic, *uptime_s),
-            crumb::Crumb::Stall { uptime_s, .. } => (Kind::Stall, *uptime_s),
+            crumb::Crumb::Stall { uptime_s, .. } | crumb::Crumb::Watchdog { uptime_s, .. } => {
+                (Kind::Stall, *uptime_s)
+            }
         };
         let _ = flash::with_flash(|f| f.evlog_append(kind, at, &line)).await;
         println!("evlog: last boot left: {}", line);
@@ -247,6 +249,9 @@ fn describe(c: &crumb::Crumb) -> heapless::String<TEXT_MAX> {
                 stall.silent_ms / 1000,
                 stall.phase.as_str()
             );
+        }
+        crumb::Crumb::Watchdog { text, .. } => {
+            let _ = line.push_str(text);
         }
     }
     line

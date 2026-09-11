@@ -2,7 +2,7 @@
 
 Firmware for a GPS tracker board built on one Seeed Wio-S3 module
 (ESP32-S3R8 + SX1262): a MAX-M10 GPS in, positions out over 915 MHz LoRa,
-logging to SD, and BLE to the [gps-gui-rs](../gps-gui-rs) app. The board
+and BLE to the [gps-gui-rs](../gps-gui-rs) app. The board
 itself is [telemetry-in-midair](https://github.com/tmpk13/telemetry-in-midair).
 
 ## Layout
@@ -32,9 +32,8 @@ so a board keeps its address, name and settings. For a fixed BLE address:
 gen-ble-address` makes one).
 
 Reset a board: `pixi run board-wipe` clears the settings, the name and the
-config backup and restarts; `pixi run board-wipe --flash` erases every byte
-of flash and reflashes. The card is never touched, so a `RADIO.CFG` on it
-comes back at the next boot.
+stored radio config and restarts; `pixi run board-wipe --flash` erases every
+byte of flash and reflashes.
 
 ## Talking to a board
 
@@ -42,7 +41,7 @@ From `tools/`, over USB; the app does the same over BLE.
 
 | Task | What |
 |-|-|
-| `pixi run board-config --address 3` | Push a whole radio config, applied live and saved to the card and flash. `--set key=value`, `--file`, `--dry-run --save ../RADIO.CFG`. |
+| `pixi run board-config --address 3` | Push a whole radio config, applied live and kept in the board's flash. `--set key=value`, `--file`, `--dry-run --save ../RADIO.CFG`. |
 | `pixi run board-set mode tracking` | Write one setting. The ack says what the board stored. |
 | `pixi run board-info` | Protocol version, BLE address, name. |
 | `pixi run board-sleep --seconds 60` | Deep sleep now. |
@@ -81,7 +80,7 @@ with its name and phase before the reset. `pixi run board-log` reads it.
 | `ARCHITECTURE.md` | The parts, the RF path, a BLE session, the modes, the slot clock, the states over time, the state space walked |
 | `docs/RADIO.md` | Config, modulation, the slot clock, beacons and pings, repeaters |
 | `docs/BLE.md` | The service, config ids, names, modes, sleep, bulk transfer and OTA |
-| `docs/HARDWARE.md` | Module, pins, connectors, panel and compass, SD card, GPS antenna |
+| `docs/HARDWARE.md` | Module, pins, connectors, panel and compass, the card slot, GPS antenna |
 | `docs/POWER.md` | What each setting costs, the measured budget, the levers left |
 | `docs/STATESPACE.md` | The exhaustive models: coverage, findings, how to add to them |
 | `docs/RADIO-AUDIT.md`, `docs/SYSTEM-AUDIT.md` | The radio simulated; the system read end to end |
