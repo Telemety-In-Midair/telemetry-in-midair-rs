@@ -212,37 +212,6 @@ pub fn take_remote(now_ms: u64) -> Option<Value> {
     critical_section::with(|cs| SHARED.borrow(cs).roster.borrow_mut().take_dirty(now_ms))
 }
 
-/// Record what a remote node calls itself, returning whether the name is
-/// news - first heard, or changed - so the caller can say so once rather
-/// than on every announcement.
-pub fn record_remote_name(now_ms: u64, src: u8, label: &str) -> bool {
-    let news = critical_section::with(|cs| {
-        SHARED.borrow(cs).roster.borrow_mut().record_name(now_ms, src, label)
-    });
-    if news {
-        REMOTE_SIGNAL.signal(());
-    }
-    news
-}
-
-/// The next node name waiting to go out. `None` once every name has been
-/// handed over.
-pub fn take_remote_name() -> Option<[u8; midair_proto::ble::NODE_NAME_LEN]> {
-    critical_section::with(|cs| SHARED.borrow(cs).roster.borrow_mut().take_dirty_name())
-}
-
-/// What a remote node calls itself, for a console line or the panel.
-///
-/// Copied out rather than borrowed: the roster lives behind a critical
-/// section, and holding that across a format would put the hardware loop's
-/// locking on the console's schedule.
-pub fn remote_name(src: u8) -> Option<heapless::String<{ midair_proto::ble::NAME_LABEL_MAX }>> {
-    critical_section::with(|cs| {
-        let roster = SHARED.borrow(cs).roster.borrow();
-        heapless::String::try_from(roster.name(src)?).ok()
-    })
-}
-
 /// Re-arm every node still inside the roster's TTL, so a central that has
 /// just connected receives the whole roster rather than only the next node
 /// to report.

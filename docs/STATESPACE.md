@@ -31,7 +31,6 @@ walk over a finite model gives.
 | Beacon model | `proto/tests/statespace_beacon.rs` | Every phase of every slot against every pattern of transmit gates, frames arriving and late passes, at a one-slot and a three-slot interval. |
 | Dedup model | `proto/tests/statespace_dedup.rs` | Every frame by every path, every repeat and every passage of time against a ledger, on small tables. |
 | Roster model | `proto/tests/statespace_roster.rs` | Every record, take, replay and passage of time against a one-line ledger of what the table should hold. |
-| Node name model | `proto/tests/statespace_names.rs` | Every announcement, report, hand-out, replay and passage of time against a ledger of what each node should be called and what is still owed to a central. |
 | `supervise::Supervisor` | `proto/src/supervise.rs` | Which tasks are watched, how long each may go quiet, and what is written down when one stops: the monitor's policy. Added 2026-09-11; see *What it could not find*. |
 | `evlog::Record`, `evlog::Ring` | `proto/src/evlog.rs` | The record the board writes about itself into its own flash, and the ring it is kept in. |
 | Supervision model | `proto/tests/statespace_supervise.rs` | Either loop stops, the monitor stops, the monitor blocks after writing the crumb; the watchdog behind all of it, and the same board with nothing watching. |

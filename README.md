@@ -65,9 +65,7 @@ the file, the parser and the app's editor cannot disagree.
 
 Every node broadcasts and listens; a repeater forwards. Nodes take turns
 on a slot clock kept on GPS time or a heard frame, so two nodes beaconing
-every second never overlap. A node also puts its own name on the air every
-twentieth transmission, so a receiver calls it `sky-1` rather than
-`node 3`. SF12 at 500 kHz on one carrier by default;
+every second never overlap. SF12 at 500 kHz on one carrier by default;
 hopping is a setting. Awake, the board draws about 126 mA, 71 of them BLE.
 
 A board that stops comes back on its own. Both loops report what they are
@@ -80,7 +78,7 @@ with its name and phase before the reset. `pixi run board-log` reads it.
 | | |
 |-|-|
 | `ARCHITECTURE.md` | The parts, the RF path, a BLE session, the modes, the slot clock, the states over time, the state space walked |
-| `docs/RADIO.md` | Config, modulation, the slot clock, beacons, pings and names, repeaters |
+| `docs/RADIO.md` | Config, modulation, the slot clock, beacons and pings, repeaters |
 | `docs/BLE.md` | The service, config ids, names, modes, sleep, bulk transfer and OTA |
 | `docs/HARDWARE.md` | Module, pins, connectors, panel and compass, the card slot, GPS antenna |
 | `docs/POWER.md` | What each setting costs, the measured budget, the levers left |

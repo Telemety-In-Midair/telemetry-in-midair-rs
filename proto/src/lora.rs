@@ -392,62 +392,6 @@ impl Ping {
     }
 }
 
-/// Name transmission: `[NAME tag] [label bytes]`.
-///
-/// What the sender is called, which is the one thing a receiver cannot
-/// work out from a frame: the address in the header says which node sent
-/// it, and an address is a number somebody picked so two nodes would not
-/// collide, not something an operator recognizes on a screen. The label
-/// is the same one the board advertises over BLE and carries in its own
-/// flash, so a node is called one thing everywhere.
-///
-/// The label travels at its own length - 1 to [`crate::ble::NAME_LABEL_MAX`]
-/// bytes of it - and the frame is what says where it ends, so a short name
-/// costs short air time. It is not a field of the position message for the
-/// same reason: a name never changes, and paying fifteen bytes for it on
-/// every beacon would cost more air time in a minute than announcing it
-/// separately costs in an hour. How often it goes out instead of a beacon
-/// is [`crate::beacon::NameCadence`].
-pub const MSG_NAME: u8 = 0x53;
-
-/// Longest name message: the tag and the longest label.
-pub const NAME_MSG_MAX: usize = 1 + crate::ble::NAME_LABEL_MAX;
-
-/// Encoded length of a name message carrying `label`.
-pub const fn name_msg_len(label: &str) -> usize {
-    1 + label.len()
-}
-
-/// Encode a name transmission, returning the buffer and the used length.
-///
-/// `None` for a label this firmware would not store
-/// ([`crate::ble::valid_label`]), which includes the empty one: a board
-/// that has never been named has nothing to say here and beacons instead.
-pub fn encode_name(label: &str) -> Option<([u8; NAME_MSG_MAX], usize)> {
-    if !crate::ble::valid_label(label.as_bytes()) {
-        return None;
-    }
-    let mut b = [0u8; NAME_MSG_MAX];
-    b[0] = MSG_NAME;
-    b[1..1 + label.len()].copy_from_slice(label.as_bytes());
-    Some((b, name_msg_len(label)))
-}
-
-/// Decode a name transmission, or `None` if the payload is something else
-/// or does not carry a label this firmware would store.
-///
-/// The charset check is not politeness. The label reaches a screen, a
-/// console line and a log file, and the only thing standing between those
-/// and an arbitrary byte string is a hardware CRC that a frame from
-/// somebody else's network can pass.
-pub fn decode_name(data: &[u8]) -> Option<&str> {
-    if data.first() != Some(&MSG_NAME) {
-        return None;
-    }
-    let label = core::str::from_utf8(&data[1..]).ok()?;
-    crate::ble::valid_label(label.as_bytes()).then_some(label)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -570,65 +514,6 @@ mod tests {
     #[test]
     fn ping_is_smaller_than_a_position() {
         assert!(PING_MSG_LEN < position_msg_len(FIELDS_REQUIRED));
-    }
-
-    #[test]
-    fn name_roundtrip() {
-        let (enc, n) = encode_name("sky-1").expect("a valid label encodes");
-        assert_eq!(n, 6, "the tag and five bytes of label, nothing padded");
-        assert_eq!(decode_name(&enc[..n]), Some("sky-1"));
-
-        // The longest label this firmware stores fits the message.
-        let long = "a".repeat(crate::ble::NAME_LABEL_MAX);
-        let (enc, n) = encode_name(&long).expect("the longest label encodes");
-        assert_eq!(n, NAME_MSG_MAX);
-        assert_eq!(decode_name(&enc[..n]).map(str::to_owned), Some(long));
-    }
-
-    /// A label travels at its own length, so naming a node costs what its
-    /// name is rather than what the longest name would be.
-    #[test]
-    fn a_name_costs_its_own_length() {
-        for label in ["a", "sky-1", "ground-station"] {
-            let (_, n) = encode_name(label).unwrap();
-            assert_eq!(n, name_msg_len(label), "label {label}");
-            assert_eq!(n, 1 + label.len());
-        }
-    }
-
-    /// Only a label a board would store goes out, and only one comes back.
-    /// The charset is what keeps an arbitrary byte string out of a console
-    /// line and a display - a hardware CRC says a frame arrived intact, not
-    /// that it came from this network.
-    #[test]
-    fn a_name_that_is_not_a_label_is_refused() {
-        assert_eq!(encode_name(""), None, "an unnamed board has nothing to say");
-        assert!(encode_name(&"a".repeat(crate::ble::NAME_LABEL_MAX + 1)).is_none());
-        for bad in ["sky 1", "sky\"1", "sky/1"] {
-            assert!(encode_name(bad).is_none(), "label {bad}");
-        }
-        // And the same on the way in, whatever a sender put on the air.
-        let mut msg = [0u8; NAME_MSG_MAX];
-        msg[0] = MSG_NAME;
-        msg[1] = b' ';
-        assert_eq!(decode_name(&msg[..2]), None);
-        msg[1] = 0xFF;
-        assert_eq!(decode_name(&msg[..2]), None, "not utf-8 either");
-        assert_eq!(decode_name(&msg[..1]), None, "a tag with no label");
-    }
-
-    /// Three payload kinds now, and a receiver tries each in turn: none of
-    /// them may decode as another.
-    #[test]
-    fn a_name_does_not_alias_the_other_payloads() {
-        let (name, n) = encode_name("sky-1").unwrap();
-        assert_eq!(decode_position(&name[..n]), None);
-        assert_eq!(Ping::decode(&name[..n]), None);
-
-        let (pos, n) = encode_position(&sample(), FIELDS_DEFAULT);
-        assert_eq!(decode_name(&pos[..n]), None);
-        assert_eq!(decode_name(&Ping::default().encode()), None);
-        assert_eq!(decode_name(b""), None);
     }
 
     #[test]

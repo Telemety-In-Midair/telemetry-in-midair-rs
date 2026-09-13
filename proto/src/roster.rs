@@ -15,14 +15,6 @@
 //! spend air time on and `tod_ms` is not among the defaults, so there is
 //! nothing in a beacon to age it by.
 //!
-//! Names sit beside the reports rather than inside them. A node announces
-//! what it is called on its own slow cadence (see
-//! [`crate::lora::MSG_NAME`]), so a name is not something a node "last
-//! said" - it is what the node is, true of it between reports, before its
-//! first one, and across the change from a position to a ping and back. A
-//! name is therefore handed out on its own ([`Roster::take_dirty_name`])
-//! and only when it is news: first heard, or changed.
-//!
 //! This lives in the shared crate rather than the firmware because it
 //! emits the exact BLE byte layouts (see [`crate::ble`]) and can be tested
 //! on the host, which a `no_std` binary cannot be.
@@ -89,36 +81,15 @@ struct Slot {
     dirty: bool,
 }
 
-/// What a node calls itself, and whether that is still news.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct NameSlot {
-    /// The node that announced it.
-    src: u8,
-    /// The label, zero-padded - the shape the BLE value wants, and the
-    /// shape the sender keeps it in on its own flash.
-    label: [u8; ble::NAME_FIELD_LEN],
-    /// When this node was last heard from at all, not when it last
-    /// announced its name: a name announcement is one transmission in
-    /// twenty, and a name that expired between two of them would be
-    /// forgotten and re-learned for a node that never went off the air.
-    at_ms: u64,
-    /// Set when the name is first heard and when it changes, cleared once
-    /// handed out. A node re-announcing the name it already had is not
-    /// news and does not notify.
-    dirty: bool,
-}
-
-/// Per-node table of the latest report from each remote node, and of what
-/// each node calls itself.
+/// Per-node table of the latest report from each remote node.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Roster {
     slots: [Option<Slot>; SLOTS],
-    names: [Option<NameSlot>; SLOTS],
 }
 
 impl Roster {
     pub const fn new() -> Self {
-        Self { slots: [None; SLOTS], names: [None; SLOTS] }
+        Self { slots: [None; SLOTS] }
     }
 
     /// Record a node's newest report, replacing whatever that node last said.
@@ -136,50 +107,6 @@ impl Roster {
             .or_else(|| self.slots.iter().position(Option::is_none))
             .unwrap_or_else(|| self.oldest());
         self.slots[idx] = Some(Slot { report, at_ms: now_ms, dirty: true });
-        // Hearing from a node keeps its name alive, whatever the report
-        // was: the name rides a far slower cadence than the beacon, and
-        // aging it by its own last announcement would drop the name of a
-        // node that is reporting every second.
-        if let Some(n) = self.names.iter_mut().flatten().find(|n| n.src == src) {
-            n.at_ms = now_ms;
-        }
-    }
-
-    /// Record what a node calls itself, returning whether this is news -
-    /// a node named for the first time, or one that has been renamed.
-    ///
-    /// A label that is not one a board would store is ignored rather than
-    /// recorded: the caller has already refused it on the way off the air
-    /// (see [`crate::lora::decode_name`]), and this is the second place a
-    /// byte string would have to pass to reach a display.
-    ///
-    /// A name arriving for a node nothing has been heard from is kept.
-    /// That is the ordinary case rather than an edge one: a node announces
-    /// its name as its first transmission after boot, so the name usually
-    /// arrives before the first position.
-    pub fn record_name(&mut self, now_ms: u64, src: u8, label: &str) -> bool {
-        if src == 0 || !ble::valid_label(label.as_bytes()) {
-            return false;
-        }
-        self.expire(now_ms);
-        let mut padded = [0u8; ble::NAME_FIELD_LEN];
-        padded[..label.len()].copy_from_slice(label.as_bytes());
-        if let Some(n) = self.names.iter_mut().flatten().find(|n| n.src == src) {
-            n.at_ms = now_ms;
-            if n.label == padded {
-                return false;
-            }
-            n.label = padded;
-            n.dirty = true;
-            return true;
-        }
-        let idx = self
-            .names
-            .iter()
-            .position(Option::is_none)
-            .unwrap_or_else(|| self.oldest_name());
-        self.names[idx] = Some(NameSlot { src, label: padded, at_ms: now_ms, dirty: true });
-        true
     }
 
     /// Take the oldest report still waiting to go out, as the value to
@@ -219,53 +146,6 @@ impl Roster {
         })
     }
 
-    /// Take the oldest name still waiting to go out, as the value to
-    /// notify on [`ble::NODE_NAME_UUID`]: `[src, label zero-padded]`.
-    /// `None` once every name has been handed out.
-    ///
-    /// Separate from [`Roster::take_dirty`] because a name is not a report:
-    /// it is not superseded by the next thing the node says, and a node
-    /// reporting every second must not re-notify a name that has not
-    /// changed since it booted.
-    ///
-    /// No age travels with it, unlike a report: a name is not a
-    /// measurement that goes stale, and the age of the node it belongs to
-    /// is already on that node's own value.
-    pub fn take_dirty_name(&mut self) -> Option<[u8; ble::NODE_NAME_LEN]> {
-        let mut pick: Option<(usize, u64)> = None;
-        for (i, slot) in self.names.iter().enumerate() {
-            let Some(n) = *slot else { continue };
-            let older = match pick {
-                Some((_, at)) => n.at_ms < at,
-                None => true,
-            };
-            if n.dirty && older {
-                pick = Some((i, n.at_ms));
-            }
-        }
-        let (idx, _) = pick?;
-        let slot = self.names[idx].as_mut()?;
-        slot.dirty = false;
-        let mut v = [0u8; ble::NODE_NAME_LEN];
-        v[0] = slot.src;
-        v[1..].copy_from_slice(&slot.label);
-        Some(v)
-    }
-
-    /// What a node calls itself, or `None` for one that has not said.
-    ///
-    /// For a console line or a display: an address is what the frame
-    /// carries, a name is what the operator recognizes.
-    pub fn name(&self, src: u8) -> Option<&str> {
-        let slot = self.names.iter().flatten().find(|n| n.src == src)?;
-        let end = slot
-            .label
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap_or(ble::NAME_LABEL_MAX);
-        core::str::from_utf8(&slot.label[..end]).ok()
-    }
-
     /// Re-arm every node still inside the TTL, so a central that has just
     /// connected receives the whole roster rather than only the next node to
     /// report.
@@ -278,12 +158,6 @@ impl Roster {
         self.expire(now_ms);
         for slot in self.slots.iter_mut().flatten() {
             slot.dirty = true;
-        }
-        // Names too: a central that has just connected has no idea what
-        // any of these nodes are called, and the next announcement is
-        // twenty of the sender's transmissions away.
-        for name in self.names.iter_mut().flatten() {
-            name.dirty = true;
         }
     }
 
@@ -335,7 +209,7 @@ impl Roster {
         self.len() == 0
     }
 
-    /// Forget nodes not heard from within [`TTL_MS`], names included.
+    /// Forget nodes not heard from within [`TTL_MS`].
     fn expire(&mut self, now_ms: u64) {
         for slot in self.slots.iter_mut() {
             let stale = match *slot {
@@ -346,33 +220,6 @@ impl Roster {
                 *slot = None;
             }
         }
-        for name in self.names.iter_mut() {
-            let stale = match *name {
-                Some(n) => now_ms.saturating_sub(n.at_ms) >= TTL_MS,
-                None => false,
-            };
-            if stale {
-                *name = None;
-            }
-        }
-    }
-
-    /// Index of the name slot for the node longest unheard, for the same
-    /// reason [`Roster::oldest`] exists: a full table gives up the
-    /// quietest node.
-    fn oldest_name(&self) -> usize {
-        let mut oldest = 0;
-        for i in 1..SLOTS {
-            let older = match (self.names[i], self.names[oldest]) {
-                (Some(a), Some(b)) => a.at_ms < b.at_ms,
-                (None, _) => true,
-                _ => false,
-            };
-            if older {
-                oldest = i;
-            }
-        }
-        oldest
     }
 
     /// Index of the slot holding the oldest report; empty slots count as
@@ -613,164 +460,6 @@ mod tests {
         assert!(r.take_dirty(0).is_none());
         r.replay(0);
         assert!(r.take_dirty(0).is_none());
-    }
-
-    // -- what a node calls itself -----------------------------------------
-
-    /// The label out of a name value, read to its padding.
-    fn label(v: &[u8; ble::NODE_NAME_LEN]) -> &str {
-        let end = v[1..].iter().position(|&b| b == 0).unwrap_or(ble::NAME_LABEL_MAX);
-        core::str::from_utf8(&v[1..1 + end]).unwrap()
-    }
-
-    #[test]
-    fn a_name_is_handed_out_and_read_back() {
-        let mut r = Roster::new();
-        assert!(r.record_name(1_000, 3, "sky-1"));
-        assert_eq!(r.name(3), Some("sky-1"));
-        assert_eq!(r.name(4), None, "a node that has not said");
-
-        let v = r.take_dirty_name().expect("a name to hand out");
-        assert_eq!(v[0], 3);
-        assert_eq!(label(&v), "sky-1");
-        // Once each, like a report.
-        assert!(r.take_dirty_name().is_none());
-    }
-
-    /// A name is what the node is, not what it last said: the position and
-    /// ping values keep coming and the name is not resent with them.
-    #[test]
-    fn a_name_is_not_news_twice() {
-        let mut r = Roster::new();
-        assert!(r.record_name(1_000, 3, "sky-1"));
-        assert!(r.take_dirty_name().is_some());
-
-        assert!(!r.record_name(2_000, 3, "sky-1"), "the same name is not news");
-        assert!(r.take_dirty_name().is_none());
-
-        // A rename is.
-        assert!(r.record_name(3_000, 3, "sky-2"));
-        assert_eq!(label(&r.take_dirty_name().unwrap()), "sky-2");
-        assert_eq!(r.name(3), Some("sky-2"));
-    }
-
-    /// Reports and names are independent: a node going from a position to
-    /// a ping keeps its name, and a name does not displace a position.
-    #[test]
-    fn a_name_and_a_report_do_not_displace_each_other() {
-        let mut r = Roster::new();
-        r.record(1_000, position(3, -80));
-        r.record_name(1_100, 3, "sky-1");
-        assert_eq!(r.len(), 1, "a name is not a second node");
-        assert!(r.newest_position(1_100).is_some(), "the position survived");
-
-        r.record(2_000, ping(3, 60));
-        assert_eq!(r.name(3), Some("sky-1"), "and the name survived the ping");
-
-        // Draining the reports leaves the name to be handed out on its own.
-        assert_eq!(drain(&mut r, 2_000).len(), 1);
-        assert!(r.take_dirty_name().is_some());
-    }
-
-    /// The usual order on the air: a node announces its name as its first
-    /// transmission, so the name arrives before anything has been heard
-    /// from that node at all.
-    #[test]
-    fn a_name_can_arrive_before_the_first_report() {
-        let mut r = Roster::new();
-        assert!(r.record_name(1_000, 7, "ground-1"));
-        assert_eq!(r.len(), 0, "still nothing reported");
-        assert_eq!(r.name(7), Some("ground-1"));
-
-        r.record(2_000, position(7, -70));
-        assert_eq!(r.newest_position(2_000).unwrap().0, 7);
-        assert_eq!(r.name(7), Some("ground-1"));
-    }
-
-    /// A byte string that is not a label never reaches the table, whatever
-    /// arrived on the air.
-    #[test]
-    fn a_name_that_is_not_a_label_is_refused() {
-        let mut r = Roster::new();
-        assert!(!r.record_name(1_000, 3, "sky 1"));
-        assert!(!r.record_name(1_000, 3, ""));
-        assert!(!r.record_name(1_000, 3, &"a".repeat(ble::NAME_LABEL_MAX + 1)));
-        // Address 0 is not assignable, so nothing can be named by it.
-        assert!(!r.record_name(1_000, 0, "sky-1"));
-        assert!(r.take_dirty_name().is_none());
-        assert_eq!(r.name(3), None);
-    }
-
-    /// A name lives as long as the node is heard from, not as long as its
-    /// last announcement - which is twenty of the sender's transmissions
-    /// behind.
-    #[test]
-    fn a_report_keeps_a_name_alive() {
-        let mut r = Roster::new();
-        r.record_name(0, 3, "sky-1");
-        for t in (0..TTL_MS * 3).step_by((TTL_MS / 2) as usize) {
-            r.record(t, position(3, -80));
-            assert_eq!(r.name(3), Some("sky-1"), "at {t}");
-        }
-        // A node that does go off the air is forgotten, name and all.
-        r.record(TTL_MS * 4, position(4, -80));
-        assert_eq!(r.name(3), None);
-    }
-
-    /// A central that has just connected is told what every node it is
-    /// about to hear about is called.
-    #[test]
-    fn replay_covers_the_names() {
-        let mut r = Roster::new();
-        r.record_name(1_000, 3, "sky-1");
-        r.record_name(2_000, 4, "ground-1");
-        assert!(r.take_dirty_name().is_some());
-        assert!(r.take_dirty_name().is_some());
-        assert!(r.take_dirty_name().is_none());
-
-        r.replay(2_000);
-        // Oldest first, like the reports.
-        assert_eq!(label(&r.take_dirty_name().unwrap()), "sky-1");
-        assert_eq!(label(&r.take_dirty_name().unwrap()), "ground-1");
-        assert!(r.take_dirty_name().is_none());
-
-        // An expired node is not replayed.
-        r.record_name(3_000, 5, "sky-2");
-        r.replay(3_000 + TTL_MS);
-        assert!(r.take_dirty_name().is_none());
-        assert_eq!(r.name(5), None);
-    }
-
-    /// A full name table gives up the node longest unheard, the way the
-    /// report table does.
-    #[test]
-    fn a_full_name_table_evicts_the_quietest_node() {
-        let mut r = Roster::new();
-        for i in 0..SLOTS {
-            r.record_name(1_000 + i as u64, i as u8 + 1, "sky-1");
-        }
-        // Node 1 is the oldest; hearing a report from it makes node 2 the
-        // quietest.
-        r.record(5_000, position(1, -70));
-        assert!(r.record_name(6_000, 99, "new-1"));
-        assert_eq!(r.name(99), Some("new-1"));
-        assert_eq!(r.name(1), Some("sky-1"), "a node heard from is not evicted");
-        assert_eq!(r.name(2), None, "the quietest made way");
-    }
-
-    /// The longest label a board stores survives the round trip, padding
-    /// and all - the field is one byte longer than the label so a reader
-    /// always finds a zero to stop at.
-    #[test]
-    fn the_longest_label_round_trips() {
-        let long = "a".repeat(ble::NAME_LABEL_MAX);
-        let mut r = Roster::new();
-        assert!(r.record_name(1_000, 3, &long));
-        let v = r.take_dirty_name().unwrap();
-        assert_eq!(v.len(), ble::NODE_NAME_LEN);
-        assert_eq!(label(&v), long);
-        assert_eq!(v[ble::NODE_NAME_LEN - 1], 0, "the padding is always there");
-        assert_eq!(r.name(3).map(str::to_owned), Some(long));
     }
 
     // -- what the compass points at ---------------------------------------

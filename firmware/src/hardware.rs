@@ -14,7 +14,7 @@ use esp_hal::gpio::{Level, Output};
 use esp_hal::time::Rate;
 use esp_println::println;
 use gps_proto::packet;
-use midair_proto::beacon::{NameCadence, Planner, Step};
+use midair_proto::beacon::{Planner, Step};
 use midair_proto::ble::{self, Mode};
 use midair_proto::bulk;
 use midair_proto::posture::{Effect, Effects, Posture, Radio, Request};
@@ -155,48 +155,6 @@ pub async fn probe_j5(i2c0: esp_hal::peripherals::I2C0<'static>) -> Option<J5> {
     None
 }
 
-/// What one transmission carries. One message per turn, whichever it is.
-enum Carry {
-    /// The node's name, as [`lora::MSG_NAME`].
-    Name(heapless::String<{ ble::NAME_LABEL_MAX }>),
-    /// A position, with the fields the config selected.
-    Position,
-    /// A ping: alive, no fix.
-    Ping,
-}
-
-impl Carry {
-    /// What the console calls it.
-    fn what(&self) -> &'static str {
-        match self {
-            Carry::Name(_) => "name",
-            Carry::Position => "position",
-            Carry::Ping => "ping",
-        }
-    }
-}
-
-/// A remote node as a console line names it: `3 (sky-1)` once that node
-/// has announced a name, `3` until it has.
-///
-/// The address stays in front of the name rather than being replaced by
-/// it. An address is what the frame carried and what the config of every
-/// node on the network is written in, so a line that dropped it could not
-/// be matched against either.
-fn node_name(src: u8) -> heapless::String<24> {
-    use core::fmt::Write as _;
-    let mut s = heapless::String::new();
-    match state::remote_name(src) {
-        Some(label) => {
-            let _ = write!(s, "{} ({})", src, label);
-        }
-        None => {
-            let _ = write!(s, "{}", src);
-        }
-    }
-    s
-}
-
 /// The hardware the loop owns, and what it keeps between passes.
 pub struct Hardware {
     node: Node<'static>,
@@ -228,12 +186,6 @@ pub struct Hardware {
     /// Nodes already reported for sharing this node's turn, one bit each,
     /// so the console says it once per node rather than once per frame.
     turn_warned: [u8; 32],
-    /// Which turns this node spends on its own name rather than on a
-    /// beacon. The policy is [`NameCadence`]; what it reads is the label
-    /// in RTC RAM, which is a handful of words and no lock - so a rename
-    /// written over BLE on the other core is noticed on the next pass
-    /// without anything having to say so.
-    names: NameCadence,
 }
 
 impl Hardware {
@@ -287,7 +239,6 @@ impl Hardware {
             idle_at_ms: now_ms,
             prev_pass_ms: now_ms,
             turn_warned: [0; 32],
-            names: NameCadence::new(),
         }
     }
 
@@ -558,43 +509,16 @@ impl Hardware {
         }
     }
 
-    /// What the next transmission carries.
-    ///
-    /// The node's name when [`NameCadence`] says one is owed, otherwise a
-    /// position, or a ping when there is no fix to report. A name takes
-    /// the turn rather than being added to it - one transmission per turn
-    /// is the whole of the schedule's discipline - which costs a beacon in
-    /// twenty and buys a receiver that can put a name to every node it
-    /// hears.
-    fn carries(&self, has_fix: bool) -> Carry {
-        let stored = settings::get();
-        let label = stored.label();
-        if self.names.due(label) {
-            // Copied out rather than borrowed from `stored`, which is this
-            // function's own copy of RTC RAM.
-            if let Ok(name) = heapless::String::try_from(label) {
-                return Carry::Name(name);
-            }
-        }
-        if has_fix {
-            Carry::Position
-        } else {
-            Carry::Ping
-        }
-    }
-
-    /// The beacon: a position on the beacon interval, a ping on the ping
-    /// interval without a fix, so a node searching for the sky is a node a
-    /// receiver can hear rather than one indistinguishable from out of
-    /// range or dead - and every so often the node's name in place of
-    /// either (see [`Hardware::carries`]). Which interval applies is
-    /// decided by what the next transmission would carry, so a fix gained
-    /// is reported as soon as the beacon interval allows, not when the
-    /// slower ping would have. A ping is the smaller of the two on air, so
-    /// this cannot push a node past the budget its beacon already fits in.
+    /// The beacon: a position on the beacon interval, or a ping on the
+    /// ping interval without a fix, so a node searching for the sky is a
+    /// node a receiver can hear rather than one indistinguishable from out
+    /// of range or dead. Which interval applies is decided by what the
+    /// next transmission would carry, so a fix gained is reported as soon
+    /// as the beacon interval allows, not when the slower ping would have.
+    /// A ping is the smaller of the two on air, so this cannot push a node
+    /// past the budget its beacon already fits in.
     async fn beacon(&mut self, now_ms: u64) {
         let has_fix = self.gps.has_fix();
-        let carry = self.carries(has_fix);
         let interval_ms = if self.cfg.beacon_interval_s == 0 {
             0
         } else if has_fix {
@@ -613,10 +537,10 @@ impl Hardware {
             state::park_pending(),
         );
         let frame_len = self.cfg.frame_overhead()
-            + match &carry {
-                Carry::Name(label) => lora::name_msg_len(label),
-                Carry::Position => lora::position_msg_len(self.cfg.beacon_fields),
-                Carry::Ping => lora::PING_MSG_LEN,
+            + if has_fix {
+                lora::position_msg_len(self.cfg.beacon_fields)
+            } else {
+                lora::PING_MSG_LEN
             };
         let airtime_ms = self.cfg.time_on_air_us(frame_len).div_ceil(1000);
         // The last gate is a frame arriving: keying up over it would lose
@@ -644,30 +568,21 @@ impl Hardware {
         state::set_radio_busy(true);
         watchdog::beat(Task::Loop, Phase::TxSend);
         self.tx_led.pulse(now_ms);
-        let sent = match &carry {
-            Carry::Name(label) => match lora::encode_name(label) {
-                Some((msg, n)) => self.node.broadcast(&msg[..n], interval_ms).await,
-                // The label was valid when it was read; nothing else can
-                // reach here, and a beacon is not worth skipping over it.
-                None => Err(crate::node::TxError::Payload),
-            },
-            Carry::Position => {
-                let (pos, n) = lora::encode_position(&self.gps.packet(), self.cfg.beacon_fields);
-                self.node.broadcast(&pos[..n], interval_ms).await
-            }
-            Carry::Ping => {
-                self.node
-                    .broadcast(
-                        &lora::Ping {
-                            uptime_s: (now_ms / 1_000).min(u16::MAX as u64) as u16,
-                            gps_present: self.gps.present(),
-                            had_fix: self.watch.ever_had_fix(),
-                        }
-                        .encode(),
-                        interval_ms,
-                    )
-                    .await
-            }
+        let sent = if has_fix {
+            let (pos, n) = lora::encode_position(&self.gps.packet(), self.cfg.beacon_fields);
+            self.node.broadcast(&pos[..n], interval_ms).await
+        } else {
+            self.node
+                .broadcast(
+                    &lora::Ping {
+                        uptime_s: (now_ms / 1_000).min(u16::MAX as u64) as u16,
+                        gps_present: self.gps.present(),
+                        had_fix: self.watch.ever_had_fix(),
+                    }
+                    .encode(),
+                    interval_ms,
+                )
+                .await
         };
         state::set_radio_busy(false);
         match sent {
@@ -675,17 +590,11 @@ impl Hardware {
                 self.tx_count = self.tx_count.saturating_add(1);
                 vprintln!(
                     "beacon {} ({} ms on air)",
-                    carry.what(),
+                    if has_fix { "position" } else { "ping" },
                     self.cfg.beacon_airtime_us() / 1000
                 );
             }
             Err(e) => vprintln!("beacon TX failed: {:?}", e),
-        }
-        // Counted whether or not the radio took it, which is the planner's
-        // rule for a failed transmit too.
-        match carry {
-            Carry::Name(label) => self.names.sent_name(&label),
-            _ => self.names.sent_other(),
         }
         // As the radio timed it, so the interval runs from the slot it
         // started in. Recorded for a failed transmit too: a radio that
@@ -707,20 +616,12 @@ impl Hardware {
             self.rx_led.pulse(now_ms);
             heard_from = Some(rx.src);
             if let Some(p) = lora::decode_position(rx.payload) {
-                vprintln!("position from node {} rssi {}", node_name(rx.src).as_str(), rx.rssi);
+                vprintln!("position from node {} rssi {}", rx.src, rx.rssi);
                 let mut v = [0u8; ble::REMOTE_LEN];
                 v[0] = rx.src;
                 v[1..3].copy_from_slice(&rx.rssi.to_le_bytes());
                 v[3..].copy_from_slice(&p.encode());
                 state::record_remote(now_ms, Report::Position(v));
-            } else if let Some(label) = lora::decode_name(rx.payload) {
-                // What the sender calls itself. Said once when it is news:
-                // a node announces its name on a slow cadence forever, and
-                // a line a minute saying nothing changed is a line that
-                // hides the ones that do.
-                if state::record_remote_name(now_ms, rx.src, label) {
-                    status_println!("node {} is {}", rx.src, label);
-                }
             } else if let Some(ping) = lora::Ping::decode(rx.payload) {
                 // A node on the air with no fix to report. Nothing to log
                 // to SD - there is no position - but an app gets it as data
@@ -734,7 +635,7 @@ impl Hardware {
                 state::record_remote(now_ms, Report::Ping(v));
                 status_println!(
                     "node {} ping: rssi {}, up {}s, gps {}{}",
-                    node_name(rx.src).as_str(),
+                    rx.src,
                     rx.rssi,
                     ping.uptime_s,
                     if ping.gps_present { "ok" } else { "silent" },
@@ -743,7 +644,7 @@ impl Hardware {
             } else {
                 vprintln!(
                     "node {} sent {} bytes this build does not decode",
-                    node_name(rx.src).as_str(),
+                    rx.src,
                     rx.payload.len()
                 );
             }
@@ -836,10 +737,6 @@ impl Hardware {
         let telemetry = state::telemetry();
         let own = self.gps.packet();
         let target = state::compass_target(now_ms);
-        // Looked up here rather than inside the draw: the roster is behind
-        // a critical section and the panel is the second core's slowest
-        // pass.
-        let label = target.and_then(|(src, ..)| state::remote_name(src));
         if let Some(j) = self.j5.as_mut() {
             // Sampled every refresh whether or not a panel is fitted: the
             // hard-iron calibration only improves by being fed, and a
@@ -848,15 +745,7 @@ impl Hardware {
                 c.sample(&mut j.i2c).await;
             }
             if let Some(o) = j.oled.as_mut() {
-                draw_screen(
-                    o,
-                    j.compass.as_ref(),
-                    telemetry,
-                    &own,
-                    target,
-                    label.as_deref(),
-                    self.cfg.address,
-                );
+                draw_screen(o, j.compass.as_ref(), telemetry, &own, target, self.cfg.address);
                 o.flush(&mut j.i2c).await;
             }
         }
@@ -1069,7 +958,6 @@ fn draw_screen(
     telemetry: Option<link::Telemetry>,
     own: &packet::PositionPacket,
     target: Option<(u8, packet::PositionPacket, u16, i16)>,
-    label: Option<&str>,
     node_address: u8,
 ) {
     let Some((node, remote, age_s, rssi)) = target else {
@@ -1099,7 +987,6 @@ fn draw_screen(
 
     let target = oled::Target {
         node,
-        label,
         bearing_deg: midair_proto::geo::bearing_deg(from, to),
         distance_m: midair_proto::geo::distance_m(from, to),
         age_s,

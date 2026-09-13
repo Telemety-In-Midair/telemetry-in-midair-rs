@@ -64,16 +64,6 @@ forgotten rather than replayed as if they were still there. The age is
 measured on arrival because the sender chooses which fields to spend air
 time on and `time` is not one of the defaults.
 
-What a node calls itself arrives on a third, `c3a1000d-...` (`[src, label
-zero-padded to 16]`). It is the label that node carries in its own flash,
-announced over LoRa on its own slow cadence, so the same board reads as
-`sky-1` in a fleet list and `ws3gps-sky-1` in a scan list instead of as
-`node 3`. It is notified when a name is first heard and when it changes -
-never on a re-announcement of a name that has not - and replayed with the
-roster on connect, since the next announcement may be twenty of the
-sender's transmissions away. A node with no name reported has simply not
-announced one yet, or has never been named; there is no placeholder value.
-
 ### Status lines
 
 The firmware writes human-readable status lines to the USB console on
@@ -143,14 +133,13 @@ a reflash and a flat cell, and a board updated from firmware that predates
 names reads back as unnamed rather than as unreadable. `pixi run board-wipe`
 is what removes it, along with the rest of the settings; see below.
 
-Four surfaces carry it, and they catch up at different speeds:
+Three surfaces carry it, and they catch up at different speeds:
 
 | Surface | When it updates |
 |-|-|
 | scan response (`CompleteLocalName`) | the next advertising window - the one on the air was handed to the controller before the write |
 | name characteristic (`c3a1000c-...`, read + notify) | immediately, on the connection that renamed the board |
 | GAP device name (`0x2A00`) | the next boot; the attribute table is built once per power cycle |
-| the LoRa network | the board's next transmission; other boards then call it that on their own consoles, panels and node-name characteristic |
 
 The ack for `0x19` carries the stored *length*, not the label: an ack has
 four value bytes and no name fits in one. What a board is actually called
