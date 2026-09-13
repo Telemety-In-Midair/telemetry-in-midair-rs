@@ -120,6 +120,11 @@ struct GpsService {
     /// Last ping heard from a node with no fix.
     #[characteristic(uuid = ble::NODE_PING_UUID_U128, read, notify)]
     node_ping: [u8; ble::NODE_PING_LEN],
+    /// Which node this board is on the LoRa network, and what it is
+    /// called: `[address, label zero-padded]`. What an app records so it
+    /// can name that address wherever it later hears it reported.
+    #[characteristic(uuid = ble::NODE_ID_UUID_U128, read, notify)]
+    node_id: [u8; ble::NODE_ID_LEN],
     /// Latest status/log line (ASCII text).
     ///
     /// The same bound the lines are built to. A characteristic smaller than
@@ -577,6 +582,35 @@ async fn publish_name<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<
     let _ = server.gps.name.notify(conn, &value).await;
 }
 
+/// The node-id characteristic's value: which node this board is on the
+/// LoRa network, and what it is called.
+///
+/// The address is read back out of the config the radio is actually
+/// running rather than from a copy kept here, so the two cannot disagree
+/// about which node this board is. Before the radio has been configured
+/// there is no answer, and the value says so with address 0 - an app must
+/// not record a name against an address no node can have.
+fn node_id_value() -> [u8; ble::NODE_ID_LEN] {
+    let address = state::radio_config()
+        .and_then(|blob| radiocfg::RadioConfig::decode(&blob))
+        .map_or(0, |cfg| cfg.address);
+    let stored = settings::get();
+    ble::node_id(address, stored.label())
+}
+
+/// Refresh the node-id characteristic and notify the central.
+///
+/// Called on connect, after a rename, and after a config apply - the three
+/// moments either half of the pair can change. The pair goes out whole
+/// every time, so an app never has to join a new name to an old address.
+async fn publish_node_id<P: PacketPool>(server: &Server<'_>, conn: &GattConnection<'_, '_, P>) {
+    let value = node_id_value();
+    if server.gps.node_id.set(server, &value).is_err() {
+        return;
+    }
+    let _ = server.gps.node_id.notify(conn, &value).await;
+}
+
 /// Refresh the radio-config characteristic. A no-op until the radio has
 /// been configured, so the characteristic never carries the all-zero
 /// placeholder as if it were a real config.
@@ -630,6 +664,7 @@ where
     watchdog::session_busy();
     publish_settings(server, conn).await;
     publish_name(server, conn).await;
+    publish_node_id(server, conn).await;
     publish_radio_config(server, conn).await;
     watchdog::session_free();
 
@@ -699,6 +734,8 @@ where
                             // above does not carry: a name is a string, and
                             // the ack could only afford its length.
                             publish_name(server, conn).await;
+                            // And the pairing an app files the name under.
+                            publish_node_id(server, conn).await;
                         }
                         Wrote::Bulk => {
                             watchdog::beat(Task::Serve, Phase::Write);
@@ -824,6 +861,10 @@ where
         loop {
             state::RADIO_CONFIG_SIGNAL.wait().await;
             publish_radio_config(server, conn).await;
+            // A config push is what moves a board to another address, so
+            // the pairing has to follow it or an app is left filing this
+            // board's name under the node it used to be.
+            publish_node_id(server, conn).await;
         }
     };
 

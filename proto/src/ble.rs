@@ -167,6 +167,67 @@ pub const NODE_PING_LEN: usize = crate::link::PING_LEN + 2;
 /// Offset of the `age_s` field in a [`NODE_PING_LEN`] value.
 pub const NODE_PING_AGE_OFF: usize = crate::link::PING_LEN;
 
+/// Which node this board is on the LoRa network, and what it is called:
+/// `[address u8, label zero-padded to [`NAME_FIELD_LEN`]]`, read + notify.
+///
+/// This is what lets an app name a remote node. A frame carries the
+/// originating address and nothing else about the sender - there is no
+/// room on a shared channel to spend a turn announcing a name that changes
+/// once in a board's life - so the pairing is made where it costs nothing:
+/// an app that has connected to a board once knows that address 3 is
+/// `sky-1`, and can say so wherever it later hears node 3 reported, from
+/// whichever board it happens to be connected to.
+///
+/// One value rather than the two it could be read from. The address is a
+/// field of the radio config blob and the label is on [`NAME_UUID`], and
+/// they change at different moments - a rename notifies one, a config push
+/// the other - so an app joining them itself would sooner or later record
+/// a name against the address that board had before the push.
+///
+/// Address 0 means the radio has not been configured yet and the board
+/// cannot say which node it is; 0 is not an assignable address. An empty
+/// label is a board that has never been named, which an app shows as the
+/// address it already has.
+pub const NODE_ID_UUID: &str = "c3a1000d-9f6e-4b2c-8f5a-2e32c3b1e5d0";
+pub const NODE_ID_UUID_U128: u128 = 0xc3a1000d_9f6e_4b2c_8f5a_2e32c3b1e5d0;
+
+/// Node id value length: the LoRa address and the padded label.
+pub const NODE_ID_LEN: usize = 1 + NAME_FIELD_LEN;
+
+/// The [`NODE_ID_UUID`] value for a board at `address` called `label`.
+///
+/// A label that is not one a board stores goes out empty rather than as
+/// itself, which is [`crate::session::Stored::label`]'s rule: the value
+/// says "unnamed", and an app falls back to the address.
+pub fn node_id(address: u8, label: &str) -> [u8; NODE_ID_LEN] {
+    let mut v = [0u8; NODE_ID_LEN];
+    v[0] = address;
+    if valid_label(label.as_bytes()) {
+        v[1..1 + label.len()].copy_from_slice(label.as_bytes());
+    }
+    v
+}
+
+/// Read a [`NODE_ID_UUID`] value back as `(address, label)`.
+///
+/// `None` only for a value too short to be one. Trailing bytes are
+/// tolerated, so a future layout can grow the way the remote-position one
+/// did. The label stops at its padding and reads as `""` unless it is a
+/// label a board would store - the same refusal as on the way out, because
+/// this is the one string on the link that reaches an app's own display.
+pub fn parse_node_id(v: &[u8]) -> Option<(u8, &str)> {
+    let v = v.get(..NODE_ID_LEN)?;
+    let end = v[1..]
+        .iter()
+        .position(|&b| b == 0)
+        .unwrap_or(NAME_LABEL_MAX);
+    let label = match core::str::from_utf8(&v[1..1 + end]) {
+        Ok(s) if valid_label(s.as_bytes()) => s,
+        _ => "",
+    };
+    Some((v[0], label))
+}
+
 /// How the `age_s` field on [`REMOTE_UUID`] and [`NODE_PING_UUID`] reads:
 /// seconds since the board heard the report, saturating here.
 ///
@@ -755,11 +816,63 @@ mod tests {
         assert_eq!(to_u128(super::RADIO_CONFIG_UUID), super::RADIO_CONFIG_UUID_U128);
         assert_eq!(to_u128(super::NODE_PING_UUID), super::NODE_PING_UUID_U128);
         assert_eq!(to_u128(super::NAME_UUID), super::NAME_UUID_U128);
+        assert_eq!(to_u128(super::NODE_ID_UUID), super::NODE_ID_UUID_U128);
         // Same service as the C3 beacon, different characteristic ids.
         assert!(str_eq(
             gps_proto::packet::SERVICE_UUID,
             "c3a10001-9f6e-4b2c-8f5a-2e32c3b1e5d0"
         ));
+    }
+
+    /// The pairing an app records: this board is node 3, and node 3 is
+    /// called sky-1.
+    #[test]
+    fn node_id_round_trips() {
+        let v = super::node_id(3, "sky-1");
+        assert_eq!(v.len(), super::NODE_ID_LEN);
+        assert_eq!(super::parse_node_id(&v), Some((3, "sky-1")));
+        // The padding a reader stops at is always there: the field is one
+        // byte longer than the longest label.
+        assert_eq!(v[super::NODE_ID_LEN - 1], 0);
+
+        let long = "a".repeat(super::NAME_LABEL_MAX);
+        let v = super::node_id(255, &long);
+        assert_eq!(super::parse_node_id(&v), Some((255, long.as_str())));
+    }
+
+    /// A board that has never been named says so, and is not mistaken for
+    /// one called something unreadable. The app falls back to the address,
+    /// which it has either way.
+    #[test]
+    fn an_unnamed_board_has_a_node_id_with_no_label() {
+        assert_eq!(super::parse_node_id(&super::node_id(3, "")), Some((3, "")));
+        // Anything that is not a label a board would store reads as
+        // unnamed rather than as itself, on the way out and on the way in.
+        assert_eq!(super::parse_node_id(&super::node_id(3, "sky 1")), Some((3, "")));
+        let mut v = super::node_id(3, "sky-1");
+        v[1] = b' ';
+        assert_eq!(super::parse_node_id(&v), Some((3, "")));
+        v[1] = 0xFF;
+        assert_eq!(super::parse_node_id(&v), Some((3, "")));
+    }
+
+    /// Address 0 is not assignable, so it is what a board says before its
+    /// radio is configured - an app must not record a name against it.
+    #[test]
+    fn address_zero_is_a_board_that_cannot_say_yet() {
+        assert_eq!(super::parse_node_id(&super::node_id(0, "sky-1")), Some((0, "sky-1")));
+    }
+
+    /// Short is refused; longer is not, so the value can grow later the
+    /// way the remote-position one did.
+    #[test]
+    fn node_id_tolerates_a_longer_value_and_refuses_a_short_one() {
+        let v = super::node_id(7, "sky-1");
+        assert_eq!(super::parse_node_id(&v[..super::NODE_ID_LEN - 1]), None);
+        assert_eq!(super::parse_node_id(&[]), None);
+        let mut longer = v.to_vec();
+        longer.extend_from_slice(&[1, 2, 3]);
+        assert_eq!(super::parse_node_id(&longer), Some((7, "sky-1")));
     }
 
     /// The age field is appended, never inserted: everything a reader that

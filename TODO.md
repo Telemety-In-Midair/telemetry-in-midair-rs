@@ -68,6 +68,17 @@ Two things the first bench run of the modes changed (2026-08-31):
 
 ## Bench work
 
+**Check the node-id pairing on two boards.** Name one board and give it an
+address (`pixi run board-set name sky-1`, `pixi run board-config --address
+3`), then connect a phone to the other one: `c3a1000d` should read
+`[3, "sky-1"]` from the named board and the other's own pair from it, and
+a rename or a config push mid-connection should notify the new pair
+without a reconnect. The case only a bench shows is a wake check - a
+stored board answers address 0 until the promotion loads its config, and
+what matters is that the notification with the real address actually
+arrives rather than the app being left with the 0.
+
+
 **Flash the watchdog, the panic path and the event log, and provoke
 each once.** None of it has run on a board. `docs/STATESPACE.md` bench
 items 8 and 9 are the recipe: a clean boot's `board-log`, a deliberate

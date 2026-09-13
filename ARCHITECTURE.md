@@ -58,6 +58,7 @@ classDiagram
     class GattSession {
         <<ble.rs>>
         publish settings and radio config
+        publish the name and the node id
         replay the roster on connect
         notify position, telemetry, remotes, log
         apply_config() bulk writes

@@ -64,6 +64,34 @@ forgotten rather than replayed as if they were still there. The age is
 measured on arrival because the sender chooses which fields to spend air
 time on and `time` is not one of the defaults.
 
+A report names its node by LoRa address, which is a number somebody chose
+so that two nodes would not collide - not what anyone calls the board. The
+name is not on the air: a shared channel has no room to spend a turn
+announcing something that changes once in a board's life, and every
+receiver would have to carry a table of other boards' names. The pairing is
+made on this link instead.
+
+The node-id characteristic (`c3a1000d-...`, read + notify) is where:
+`[address, label zero-padded to 16]` - which node **this** board is, and
+what it is called. An app that has connected to a board once knows that
+address 3 is `sky-1`, and can say so wherever it later hears node 3
+reported, through whichever board it happens to be connected to. So a fleet
+is named by connecting to each board once, or by handing the app the same
+pairs as a file.
+
+It is one value rather than the two it could be read from. The address is a
+field of the radio-config blob and the label is on the name characteristic,
+and they change at different moments - a rename notifies one, a config push
+the other - so an app joining them itself would sooner or later file a name
+under the address that board had before the push. The pair goes out whole
+on connect, after a rename and after a config apply.
+
+Address 0 means the radio has not been configured yet, which is what a
+board answers during a wake check: no node number to give. The real pair
+arrives by notification a moment after a connect promotes the board. An
+empty label is a board that has never been named; an app shows the address
+it already has.
+
 ### Status lines
 
 The firmware writes human-readable status lines to the USB console on
@@ -133,12 +161,13 @@ a reflash and a flat cell, and a board updated from firmware that predates
 names reads back as unnamed rather than as unreadable. `pixi run board-wipe`
 is what removes it, along with the rest of the settings; see below.
 
-Three surfaces carry it, and they catch up at different speeds:
+Four surfaces carry it, and they catch up at different speeds:
 
 | Surface | When it updates |
 |-|-|
 | scan response (`CompleteLocalName`) | the next advertising window - the one on the air was handed to the controller before the write |
 | name characteristic (`c3a1000c-...`, read + notify) | immediately, on the connection that renamed the board |
+| node id (`c3a1000d-...`, read + notify) | immediately, paired with this board's LoRa address - see *Remote nodes* |
 | GAP device name (`0x2A00`) | the next boot; the attribute table is built once per power cycle |
 
 The ack for `0x19` carries the stored *length*, not the label: an ack has
