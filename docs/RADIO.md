@@ -207,6 +207,31 @@ A node that hears a ping reports it as a status line (`node 3 ping: rssi
 characteristic as data, so an app can show the node as alive-without-a-fix.
 The RSSI in either form is what makes a ping useful as a range check.
 
+## Names on the air
+
+The header's `src` says which node sent a frame, and an address is a number
+somebody picked so two nodes would not collide - not what anyone calls the
+board. So a node also broadcasts its name: the same label it advertises
+over BLE and keeps in its own flash, 1 to 15 bytes of it, at its own
+length.
+
+A name takes a turn rather than riding along with a position, because the
+schedule allows one transmission per turn and a fifteen-byte name added to
+every beacon would cost more air time in a minute than announcing it
+separately costs in an hour. A node announces its name as its first
+transmission after boot, again the first transmission after a rename, and
+otherwise once every twenty transmissions - a fixed fraction of whatever
+air time the node was configured to spend, so a slow fleet does not pay for
+names any more often than it pays for positions. A board that has never
+been named says nothing and beacons instead.
+
+A receiver holds the names beside the roster, one per node, for as long as
+it hears from that node at all - not for as long as the name announcement
+is fresh, which would forget the name of a node that never went off the
+air. The name then names the node everywhere: the console line (`node 3
+(sky-1) ping: ...`), the compass screen, and the node-name characteristic
+an app reads.
+
 ## Leaves and repeaters
 
 Every transmission is a broadcast and every node listens continuously, so

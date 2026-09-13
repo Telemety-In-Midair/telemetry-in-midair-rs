@@ -37,6 +37,7 @@ classDiagram
     class RemoteNode {
         <<other board, 915 MHz>>
         broadcasts position or ping
+        announces its name every 20th tx
         repeater forwards hops
     }
 
@@ -58,8 +59,8 @@ classDiagram
     class GattSession {
         <<ble.rs>>
         publish settings and radio config
-        replay the roster on connect
-        notify position, telemetry, remotes, log
+        replay the roster and the names on connect
+        notify position, telemetry, remotes, names, log
         apply_config() bulk writes
     }
     class UsbTask {
@@ -101,7 +102,7 @@ classDiagram
         <<snapshot, not a channel>>
         set_position() take_position()
         radio_busy() transfer_active()
-        roster, log lines
+        roster, node names, log lines
         posture requests, serve commands
     }
     class Xfer {

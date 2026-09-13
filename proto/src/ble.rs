@@ -167,6 +167,30 @@ pub const NODE_PING_LEN: usize = crate::link::PING_LEN + 2;
 /// Offset of the `age_s` field in a [`NODE_PING_LEN`] value.
 pub const NODE_PING_AGE_OFF: usize = crate::link::PING_LEN;
 
+/// A remote node's own name: `[src u8, label zero-padded to
+/// [`NAME_FIELD_LEN`]]`, notify + read.
+///
+/// The name a node carries in its own flash, as it announced it over LoRa
+/// (see [`crate::lora::MSG_NAME`]). Without it a remote node is an address
+/// - a number picked so two nodes would not collide, which is not what an
+/// operator calls anything - and the same board reads as "node 3" in a
+/// fleet list and "ws3gps-sky-1" in a scan list.
+///
+/// Kept apart from the position and the ping rather than prefixed to
+/// either: a name arrives on its own cadence, is the same until somebody
+/// renames the board, and is worth having for a node that has yet to
+/// report anything at all. It is notified when a node's name is first
+/// heard and when it changes, and replayed with the roster on connect, so
+/// a value arriving is news rather than a repetition.
+///
+/// The label is zero-padded and read to the first zero, which is always
+/// there: [`NAME_FIELD_LEN`] is one longer than the longest label.
+pub const NODE_NAME_UUID: &str = "c3a1000d-9f6e-4b2c-8f5a-2e32c3b1e5d0";
+pub const NODE_NAME_UUID_U128: u128 = 0xc3a1000d_9f6e_4b2c_8f5a_2e32c3b1e5d0;
+
+/// Node name value length: the source address and the padded label.
+pub const NODE_NAME_LEN: usize = 1 + NAME_FIELD_LEN;
+
 /// How the `age_s` field on [`REMOTE_UUID`] and [`NODE_PING_UUID`] reads:
 /// seconds since the board heard the report, saturating here.
 ///

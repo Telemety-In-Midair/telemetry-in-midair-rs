@@ -68,6 +68,18 @@ Two things the first bench run of the modes changed (2026-08-31):
 
 ## Bench work
 
+**Watch two boards learn each other's names.** Name one board and leave
+the other unnamed (`pixi run board-set name sky-1`), and the named one
+should announce with its first transmission: the other's console says
+`node N is sky-1` once, its ping and position lines carry `N (sky-1)`
+from then on, and the compass screen says `sky-1` in place of `nN`. Then
+the two things only a bench shows: a rename while both are running
+reaches the other board on the next transmission, and the announcement
+that costs a beacon every twentieth transmission is not enough to be
+visible as a gap in the position stream. A board that is never named must
+put nothing extra on the air at all.
+
+
 **Flash the watchdog, the panic path and the event log, and provoke
 each once.** None of it has run on a board. `docs/STATESPACE.md` bench
 items 8 and 9 are the recipe: a clean boot's `board-log`, a deliberate

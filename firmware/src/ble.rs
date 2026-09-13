@@ -120,6 +120,10 @@ struct GpsService {
     /// Last ping heard from a node with no fix.
     #[characteristic(uuid = ble::NODE_PING_UUID_U128, read, notify)]
     node_ping: [u8; ble::NODE_PING_LEN],
+    /// What a remote node calls itself, as that node announced it over
+    /// LoRa: `[src, label zero-padded]`.
+    #[characteristic(uuid = ble::NODE_NAME_UUID_U128, read, notify)]
+    node_name: [u8; ble::NODE_NAME_LEN],
     /// Latest status/log line (ASCII text).
     ///
     /// The same bound the lines are built to. A characteristic smaller than
@@ -788,6 +792,14 @@ where
             state::REMOTE_SIGNAL.wait().await;
             while state::radio_busy() {
                 Timer::after(Duration::from_millis(100)).await;
+            }
+            // Names first, so a position arriving behind one can be shown
+            // against a name rather than against an address that is
+            // replaced a moment later.
+            while let Some(v) = state::take_remote_name() {
+                if server.gps.node_name.set(server, &v).is_ok() {
+                    let _ = server.gps.node_name.notify(conn, &v).await;
+                }
             }
             while let Some(value) = state::take_remote(Instant::now().as_millis()) {
                 // `set` first so the value is readable by a central that

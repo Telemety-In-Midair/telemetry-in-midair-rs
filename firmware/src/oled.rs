@@ -515,9 +515,14 @@ impl Heading {
 }
 
 /// What the compass screen is drawn from.
-pub struct Target {
+pub struct Target<'a> {
     /// Address of the node being pointed at.
     pub node: u8,
+    /// What that node calls itself, once it has said (see
+    /// [`midair_proto::lora::MSG_NAME`]). Shown in place of the address:
+    /// the panel is read while walking towards the thing it points at, and
+    /// "sky-1" is what the operator knows that thing as.
+    pub label: Option<&'a str>,
     /// True bearing to it, degrees from north.
     pub bearing_deg: f32,
     pub distance_m: f32,
@@ -534,7 +539,7 @@ pub struct Target {
 /// things the status screen existed to show.
 pub fn render_compass(
     oled: &mut Oled,
-    target: &Target,
+    target: &Target<'_>,
     heading: Heading,
     fix: bool,
     sats: u8,
@@ -549,13 +554,23 @@ pub fn render_compass(
     const TEXT_COL: usize = 6;
     let mut line: heapless::String<16> = heapless::String::new();
 
-    let _ = write!(
-        line,
-        "n{} {} {:03}",
-        target.node,
-        midair_proto::geo::compass_point(rel),
-        rel as u16
-    );
+    // The fifteen columns hold a name, a compass point of up to three
+    // characters and three digits of bearing, with a space between each -
+    // so a name longer than seven is cut rather than pushing the bearing
+    // off the panel. Cut on bytes, which is cut on characters here: a
+    // label is ASCII by construction at both ends of the air.
+    const NAME_COLS: usize = 7;
+    let point = midair_proto::geo::compass_point(rel);
+    let _ = match target.label {
+        Some(label) => write!(
+            line,
+            "{} {} {:03}",
+            &label[..label.len().min(NAME_COLS)],
+            point,
+            rel as u16
+        ),
+        None => write!(line, "n{} {} {:03}", target.node, point, rel as u16),
+    };
     oled.text(TEXT_COL, 0, &line);
 
     line.clear();
