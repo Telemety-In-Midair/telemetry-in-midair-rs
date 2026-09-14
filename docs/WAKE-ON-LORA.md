@@ -432,3 +432,172 @@ space is what stops the knobs from producing a posture nobody intended.
 builds, arming a sentry and doing nothing else, so the average is readable
 against `POWER.md`'s table. Then the entry in that document's lever list
 goes from an estimate to a number.
+
+## Alternatives considered
+
+Two other shapes, both reasonable on their face, both worse here for
+reasons that are structural rather than tuning.
+
+### A. The sleeper transmits on each wake
+
+*The stored board chirps every time its duty cycle brings it up, so a
+listening node learns when to talk to it.* Receiver-initiated rendezvous:
+the sleeper advertises its own schedule instead of the waker hunting for
+it. The appeal is real - the waker needs no long preamble, no burst, and
+one chirp serves every listener in range.
+
+It loses on three independent counts, and the first is not a number.
+
+**The SX1262 can listen without the host. It cannot talk without it.**
+`SetRxDutyCycle` is the only self-timed command the chip has: nothing
+drives a transmission from the radio's own RTC, and `SetTx` is a one-shot
+the host has to issue. So a sentry that receives costs the S3 nothing -
+it stays in deep sleep for the whole cycle - while a sentry that transmits
+costs a chip wake every cycle, forever. That is a capability difference in
+the silicon, not a parameter, and no amount of shortening the chirp gets
+around it.
+
+**There is no short transmission at SF12/BW500.** The shortest frame this
+firmware already sends is the no-fix ping: a 4-byte payload, 248 ms on
+air. The preamble and the explicit header dominate everything a wake chirp
+could carry, so "a short transmission" is 248 ms at 127 mA whatever is in
+it.
+
+**Transmit current is ~21x receive current.** 127 mA against 6 mA, on top
+of being 7x longer than a sentry's RX window.
+
+Per cycle, using this document's own figures and `POWER.md`'s:
+
+| | A: chirp | B: sentry RX |
+|-|-|-|
+| S3 wake (no autonomous TX) | ~300 ms @ 35 mA = 10.5 mAs | none - the S3 stays asleep |
+| TCXO startup | 10 ms @ 6 mA = 0.06 mAs | 10 ms @ 6 mA = 0.06 mAs |
+| Radio | TX 248 ms @ 127 mA = 31.5 mAs | RX 33 ms @ 6 mA = 0.20 mAs |
+| Reply window | 150 ms @ 6 mA = 0.9 mAs | none |
+| **Per cycle** | **~42.9 mAs** | **~0.26 mAs** |
+
+The S3 wake figure is a guess with the word guess attached: boot time on
+this board has never been measured, and 300 ms assumes a wake path
+stripped of BLE, GPS and flash. A full boot makes it far worse.
+
+```mermaid
+gantt
+    title One cycle each, to scale - the chirp is the whole cycle
+    dateFormat X
+    axisFormat %L ms
+
+    section A - chirp
+    S3 wake ~300 ms @ 35 mA   :crit,   a1, 0, 300ms
+    TCXO 10 ms                :done,   a2, 300, 10ms
+    TX 248 ms @ 127 mA        :crit,   a3, 310, 248ms
+    reply window 150 ms @ 6 mA :active, a4, 558, 150ms
+
+    section B - sentry RX
+    S3 stays asleep           :done,   b1, 0, 10ms
+    TCXO 10 ms                :done,   b2, 0, 10ms
+    RX 33 ms @ 6 mA           :active, b3, 10, 33ms
+```
+
+At equal reachability the comparison does not narrow, it widens, because
+the two schemes trade against different things. B's sleeper cost falls as
+its sleep period grows and the *waker* pays for it in preamble length, so
+B at a 2 s sentry sleep is 0.13 mA with a wake landing in about 4 s. A's
+cost falls only by chirping less often, which is the reachability lottery
+the whole plan exists to remove: A at a 30 s chirp is 1.4 mA with a 30 s
+worst case. **B is an order of magnitude cheaper and seven times faster at
+the same time** - there is no axis on which A trades favorably.
+
+Shortening the chirp does not rescue it. At SF7/BW500 the transmission
+drops to ~8 ms and the cycle to ~11.6 mAs - at which point the S3 wake is
+90% of the cost and the radio is rounding error, so the thing the idea was
+optimizing has stopped mattering. And an SF7 chirp is ~10 dB less
+sensitive than the SF12 telemetry link, so the board could be heard and
+not found.
+
+Two more counts, both about the fleet rather than the board:
+
+- **A pays per cycle; B pays per wake event, and wakes are rare.** A board
+  might be woken once a day or once a month. A spends 86400/T_chirp
+  transmissions a day whether or not anybody is listening; B's expensive
+  half is the waker's burst, which happens only when somebody actually
+  wants the board. Over a day at a 30 s chirp that is ~33 mAh on A's
+  sleeper against ~3 mAh on B's, plus about 0.4 mAh on B's waker for a
+  wake that was actually asked for.
+- **A does not scale with the number of stored boards.** Ten stored boards
+  chirping every 30 s is ~8% of the channel permanently consumed by boards
+  doing nothing, colliding with the fleet's beacons and with each other -
+  and a sleeping board is the worst-placed node in the system to transmit,
+  because its hop clock is stale and it knows nothing about the channel.
+  The waker in B is an awake, clock-disciplined node that can plan its
+  transmission with the slot machinery that already exists.
+
+One thing A would buy that B does not: a stored board under B is radio
+silent until somebody calls it, and under A it announces itself on a
+cadence to anyone listening. Which of those is the feature depends on what
+the board is stored inside.
+
+### B'. A train of short wake packets instead of one long preamble
+
+*Send a wake packet every 250 ms until the sleeper catches one.* Same
+family as the long preamble - the waker still pays, the sleeper still only
+receives - so it keeps everything that makes B work. It fails on a
+different axis.
+
+**A duty-cycled receiver samples for a preamble, not for a packet.** Each
+packet in a train carries the ordinary 8 symbols, which at SF12/BW500 is
+100 ms of a 250 ms period, and the sentry's window has to land with at
+least its four detect symbols still inside that preamble - about 67 ms of
+each 250 ms. So a hit is probabilistic where the long preamble is
+certain.
+
+**And the probability can be exactly zero, permanently.** The sentry cycle
+and the train period are two free-running periodic processes; whether they
+ever coincide is set by their ratio. A 1000 ms sentry sleep against a 250
+ms train is a ratio of exactly 4, so the RX window samples the same 43 ms
+slice of every train period for as long as both run - the board either
+wakes on the first cycle or never wakes at all, decided by a phase offset
+nobody chose. Near-rational ratios are the same failure slowed down: 4.004
+takes 250 cycles to walk through the train. This is the shape the
+`busy-gate-skip-drops-by-phase` skill is about, and it is the worst kind
+of bug to ship, because a bench test that happened to get a lucky phase
+passes.
+
+**The air time is worse too.** Catching a 27% chance per cycle takes about
+six sentry cycles, six seconds of wall clock, of which 83% is carrier -
+roughly 5 s of transmission against the long preamble's 2.2 s, spread over
+longer, blocking the fleet for longer. The long preamble is the same
+energy spent in the one form a duty-cycled receiver can catch on the first
+cycle.
+
+**Its one genuine advantage is the band.** A 248 ms packet fits the FHSS
+rule of 400 ms per channel per 20 s and a 2.05 s preamble does not. So if
+a hopping plan ever has to carry wake frames, the train - or something
+like it, spread across channels - is the only lawful shape, and the
+refusal this plan proposes for `hop_channels > 1` is what would have to be
+lifted. Not a reason to prefer it now, and the reason to keep the refusal
+explicit rather than implicit.
+
+### What the board would need for A to be the right answer
+
+A is the right design when the sleeper's schedule can be *predicted*
+rather than merely announced - then nobody hunts, nobody bursts, and both
+sides open a short window at an agreed instant. That needs a clock, and
+this board does not have one: **GPIO15 and GPIO16 are the S3's
+XTAL_32K_P/N, and on this module they are unrouted pads** - `main.rs`
+parks them with the other unused pins and the module datasheet lists them
+as plain GPIO. So `RTC_SLOW_CLK` is the internal 150 kHz RC oscillator,
+calibrated against the main crystal at boot and then free-running and
+uncorrected through the sleep, drifting with temperature at the percent
+level rather than the ppm level.
+
+At 1% a schedule stays good for about 1.6 s before the drift exceeds half
+a sentry window. That kills the useful hybrid as well as A itself: the
+obvious refinement to this plan - **have the woken board announce its next
+sentry window in its wake acknowledgment**, so a node that has talked to
+it recently can reach it with a short preamble instead of a long one - is
+worth nothing at 1% drift and worth a great deal at 20 ppm, where a
+schedule survives an hour to within 72 ms. That is a 32.768 kHz crystal
+and two pads, and it is the one hardware change that would make a
+different wake design better than this one.
+
+Recorded in `HW-TODO.md`.
