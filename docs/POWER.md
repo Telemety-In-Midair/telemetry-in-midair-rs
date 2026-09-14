@@ -443,7 +443,11 @@ direction; everything below item 1 is provisional until it is done.
    path below ~40 mA without a respin.
 8. **`SetRxDutyCycle`** on the SX1262 for a leaf that mostly listens: ~5 mA
    down to ~1-2, at the cost of picking a sleep/RX ratio against the beacon
-   interval.
+   interval. The larger version of the same command is wake-on-LoRa, where
+   the radio duty-cycles while the chip is in deep sleep and DIO1 wakes it -
+   which removes the wake-check burst this document's stored figures are
+   dominated by. Designed in `WAKE-ON-LORA.md`; item 5 above is one of its
+   inputs.
 9. **The board:** `V_BCKP` to +3V3, a load switch under the GPS and the
    SX1262 (the old board's 46 mA floor exists because it had one), a buck
    in place of U2. No firmware substitutes for any of them.

@@ -197,12 +197,15 @@ Hop statistics in telemetry: frames heard per channel, clock corrections
 applied and their size. Without them a receiver that is a little out of
 step looks like a range problem.
 
-Wake-on-radio: `SetRxDutyCycle` (0x94). The radio cycles sleep/RX on its own
-and only wakes the MCU when a real preamble arrives, instead of holding
-continuous RX. Biggest battery win available on a leaf that mostly listens.
-Needs the receive loop restructured and the sleep/RX ratio picked against
-the beacon interval: too long asleep and a whole broadcast passes unheard,
-so the two have to be chosen together.
+Wake-on-radio: `SetRxDutyCycle` (0x94) on the SX1262, DIO1 (GPIO9, inside the
+S3's RTC range) as an EXT0 deep-sleep wake source. The radio keeps listening
+while the chip is gone and only wakes it when a frame addressed to the board
+arrives, which replaces the wake-check cadence with a doorbell: reachable on
+demand rather than on an interval, and microamps rather than a boot a minute
+between wakes. Designed in `docs/WAKE-ON-LORA.md` - the wake frame, the
+second sync word that keeps ordinary traffic from waking the board, the
+preamble arithmetic against the sentry sleep period, the fast-reject path,
+and the order. Phase 0 of that plan is two measurements, not code.
 
 CAD auto-transitions: `SetCadParams` (0x88) with ExitMode. Detect a preamble
 and drop straight into RX to catch the payload, or find the channel clear
