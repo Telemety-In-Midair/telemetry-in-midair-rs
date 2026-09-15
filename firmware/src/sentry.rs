@@ -77,6 +77,15 @@ const OVERHEAD_LADDER_US: [u32; 10] = [
 /// something that should happen on the first.
 const TRIAL_CYCLES: u32 = 3;
 
+/// Longest the source will hold the PA on before standing down, seconds.
+///
+/// Keying with no end to it was a convenience, and it is the wrong default
+/// for a thing that lives on a bench: a board left plugged in stays keyed
+/// until somebody remembers it, which is exactly the state nobody is
+/// watching. Twenty minutes covers a full probe run with room, and a run
+/// that needs longer can be restarted deliberately.
+const SOURCE_MAX_KEYED_S: u64 = 1_200;
+
 /// Most transmit power the source will key at, dBm.
 ///
 /// Two boards on a bench need milliwatts, and this is what makes keeping
@@ -312,19 +321,36 @@ pub async fn source(radio: &mut Sx1262Driver<'_>) -> ! {
         radio.standby();
         park().await
     }
-    println!("sentry source: keyed continuously at {} dBm", dbm);
+    println!(
+        "sentry source: keyed at {} dBm, standing down after {} s",
+        dbm, SOURCE_MAX_KEYED_S
+    );
+    let until = Instant::now() + Duration::from_secs(SOURCE_MAX_KEYED_S);
     let mut said = Instant::now();
-    loop {
+    while Instant::now() < until {
         watchdog::beat(Task::Loop, Phase::Receive);
-        // A periodic line, so a console shows the source is still up - a
-        // silent one and a wedged one look the same otherwise.
         if Instant::now() - said > Duration::from_secs(30) {
+            // The errors are read to be acted on, not just printed. A radio
+            // that latches one while keyed has something wrong with the
+            // transmit path - on this module DIO3 also supplies the antenna
+            // switch, so the failure that matters is the one where the PA is
+            // driving an isolated port. Standing down on it is the whole
+            // reason to look.
             let (mode, err) = radio.health();
-            println!("sentry source: still keyed, radio {} err 0x{:04X}", mode, err);
+            if err != 0 {
+                println!("sentry source: STANDING DOWN, radio latched 0x{:04X} while keyed", err);
+                radio.standby();
+                park().await
+            }
+            let left = (until - Instant::now()).as_secs();
+            println!("sentry source: still keyed, radio {}, {} s left", mode, left);
             said = Instant::now();
         }
         Timer::after(Duration::from_millis(200)).await;
     }
+    println!("sentry source: {} s up, standing down", SOURCE_MAX_KEYED_S);
+    radio.standby();
+    park().await
 }
 
 /// Sit still, keeping the heartbeat up. For a source that declined to key.
