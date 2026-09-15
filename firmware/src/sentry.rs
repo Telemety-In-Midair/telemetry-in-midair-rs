@@ -31,7 +31,7 @@
 use embassy_time::{Duration, Instant, Timer};
 use esp_println::println;
 use midair_proto::sentry::{
-    classify_charge, sweep_floor, SweepStep, TcxoCharge, DETECT_SYMBOLS,
+    classify_charge, summarize_intervals, sweep_floor, SweepStep, TcxoCharge, DETECT_SYMBOLS,
 };
 use midair_proto::supervise::{Phase, Task};
 
@@ -48,6 +48,13 @@ const SLEEP_US: u32 = 1_000_000;
 
 /// Detections to collect for the cadence measurement.
 const CADENCE_SAMPLES: usize = 16;
+
+/// Longest the cadence half will spend collecting them, seconds.
+///
+/// It tolerates gaps rather than stopping at the first one - a source that
+/// is not on the air is not a receiver that stopped cycling - so it needs a
+/// budget of its own or a dead source would hold it forever.
+const CADENCE_BUDGET_S: u64 = 90;
 
 /// Trials per sweep step. Forty is enough that a window which passes every
 /// one is not passing by luck, and few enough that the whole ladder runs in
@@ -69,6 +76,13 @@ const OVERHEAD_LADDER_US: [u32; 10] = [
 /// as a multiple of the commanded cycle. Three cycles is generous for
 /// something that should happen on the first.
 const TRIAL_CYCLES: u32 = 3;
+
+/// Most transmit power the source will key at, dBm.
+///
+/// Two boards on a bench need milliwatts, and this is what makes keeping
+/// the PA on indefinitely a bench convenience rather than a way to cook a
+/// module. 0 dBm is 1 mW, which is still an enormous signal at that range.
+const SOURCE_MAX_DBM: i8 = 10;
 
 /// Poll period on DIO1, milliseconds.
 ///
@@ -109,13 +123,26 @@ pub async fn probe(radio: &mut Sx1262Driver<'_>) -> ! {
     }
     // Nothing else on this build has anything to do, and the loop is what
     // keeps the board's watchdog fed while the console output is read off.
+    // Says so on a cadence for the reason `park` does: a finished run and a
+    // wedged one look the same to a console attached after the fact, and
+    // this run's whole output is the lines above.
+    let mut said = Instant::now();
     loop {
         watchdog::beat(Task::Loop, Phase::Receive);
-        Timer::after(Duration::from_millis(500)).await;
+        if Instant::now() - said > Duration::from_secs(15) {
+            println!("sentry probe: done, results above");
+            said = Instant::now();
+        }
+        Timer::after(Duration::from_millis(200)).await;
     }
 }
 
 /// Arm once and time the detections that follow.
+///
+/// Gaps are tolerated rather than treated as the end of the run. A source
+/// that stops transmitting and a chip that stops cycling look identical
+/// from one timeout, and they are not the same finding - so this keeps
+/// waiting and lets the interval lengths separate them afterwards.
 async fn cadence(radio: &mut Sx1262Driver<'_>, listening: u32) {
     // A generous window: this half is about the cycle, not about how short
     // a window can be, so nothing here should fail for want of listening
@@ -128,45 +155,56 @@ async fn cadence(radio: &mut Sx1262Driver<'_>, listening: u32) {
     );
     radio.arm_duty_cycle(rx_us, SLEEP_US, DETECT_SYMBOLS, irq::PREAMBLE_DETECTED);
 
-    let deadline = Duration::from_micros(u64::from(commanded) * u64::from(TRIAL_CYCLES));
+    // Per-wait deadline, and the budget for the whole collection.
+    let wait = Duration::from_micros(u64::from(commanded) * u64::from(TRIAL_CYCLES));
+    let give_up = Instant::now() + Duration::from_secs(CADENCE_BUDGET_S);
+    let mut intervals: heapless::Vec<u32, CADENCE_SAMPLES> = heapless::Vec::new();
     let mut last: Option<Instant> = None;
-    let mut n = 0u32;
-    let mut total_us = 0u64;
-    let mut min_us = u32::MAX;
-    let mut max_us = 0u32;
-    for _ in 0..CADENCE_SAMPLES {
-        // Deliberately no re-arm between samples: whether the chip keeps
-        // cycling on its own is half of what this measures.
-        let Some(at) = wait_for_detect(radio, deadline).await else {
-            break;
-        };
-        if let Some(prev) = last {
-            let us = (at - prev).as_micros() as u32;
-            n += 1;
-            total_us += u64::from(us);
-            min_us = min_us.min(us);
-            max_us = max_us.max(us);
+    let mut detections = 0u32;
+    while intervals.len() < CADENCE_SAMPLES && Instant::now() < give_up {
+        // Deliberately no re-arm: whether the chip keeps cycling on its own
+        // is half of what this measures, and re-arming would start the
+        // cycle at its receive phase and measure the window instead.
+        match wait_for_detect(radio, wait).await {
+            Some(at) => {
+                detections += 1;
+                if let Some(prev) = last {
+                    let _ = intervals.push((at - prev).as_micros() as u32);
+                }
+                last = Some(at);
+            }
+            // Nothing this time. The next detection's interval spans the
+            // gap, which is what marks it as one.
+            None => continue,
         }
-        last = Some(at);
     }
 
-    if n == 0 {
-        println!("sentry probe: cadence FAILED - fewer than two detections");
-        println!("sentry probe: either the cycle is not running, or the chip left it after the first");
+    println!("sentry probe: {} detections, {} intervals", detections, intervals.len());
+    let Some(i) = summarize_intervals(&intervals, commanded) else {
+        if detections == 0 {
+            println!("sentry probe: cadence FAILED - nothing detected at all");
+            println!("sentry probe: no signal, wrong settings, or the cycle never ran");
+        } else {
+            println!("sentry probe: cadence FAILED - detections, but never two a cycle apart");
+            println!("sentry probe: the chip is not staying in the cycle, or the source is barely on");
+        }
         return;
-    }
-    let mean = (total_us / u64::from(n)) as u32;
+    };
     println!(
-        "sentry probe: {} intervals, mean {} us, min {} us, max {} us",
-        n, mean, min_us, max_us
+        "sentry probe: {} at the cycle, {} over it (gaps in the source)",
+        i.tight, i.loose
     );
-    if (n as usize) < CADENCE_SAMPLES - 1 {
-        // It stopped early. That is a finding rather than a failure: a chip
-        // that leaves the cycle on a reception has to be re-armed by
-        // whatever wakes up, which is a step a sleeping board must not skip.
-        println!("sentry probe: stopped after {} - the chip does not stay in the cycle by itself", n + 1);
-    }
-    match classify_charge(commanded, mean, OVERHEAD_LADDER_US[0]) {
+    println!(
+        "sentry probe: cycle mean {} us, min {} us, max {} us",
+        i.mean_us, i.min_us, i.max_us
+    );
+    // Two consecutive windows both hearing is the chip cycling unaided; a
+    // run of them is it keeping that up.
+    println!(
+        "sentry probe: the chip stays in the cycle by itself ({} consecutive pairs)",
+        i.tight
+    );
+    match classify_charge(commanded, i.mean_us, OVERHEAD_LADDER_US[0]) {
         TcxoCharge::Added => println!(
             "sentry probe: oscillator restart is ADDED - a window listens for as long as commanded"
         ),
@@ -175,7 +213,7 @@ async fn cadence(radio: &mut Sx1262Driver<'_>, listening: u32) {
         ),
         TcxoCharge::Unclear => println!(
             "sentry probe: cadence UNCLEAR - {} us against a commanded {} us, look at the run",
-            mean, commanded
+            i.mean_us, commanded
         ),
     }
 }
@@ -235,48 +273,75 @@ async fn wait_for_detect(radio: &mut Sx1262Driver<'_>, deadline: Duration) -> Op
     }
 }
 
-/// Key a continuous preamble in bounded bursts, as the signal the probe
-/// measures against. Does not return.
+/// Key a continuous preamble, as the signal the probe measures against.
+/// Does not return.
 ///
-/// **This keys the PA and leaves it keyed.** On this board DIO2 switches
-/// the antenna and DIO3 supplies that switch, so it only runs after the
-/// ordinary initialization has set both - which is why it takes an
-/// initialized driver and checks the latched device errors before every
-/// burst rather than trusting the first one. `XOSC_START` latched means the
-/// oscillator did not start, which on this module means the switch is
-/// unpowered, and keying into an isolated port destroys the part.
+/// **This keys the PA and leaves it keyed**, for as long as the board is
+/// powered. Two things make that acceptable rather than reckless, and both
+/// are checked here rather than left to whoever is at the bench:
 ///
-/// Bursts rather than a truly continuous carrier: the PA is 127 mA in a
-/// module that normally sees a third of a second at a time, and the boards
-/// are centimeters apart on a bench. Turn the power down before running it.
+/// - **The power has to be low.** At the top of the range the PA is 127 mA
+///   in a module that normally sees a third of a second at a time. At
+///   [`SOURCE_MAX_DBM`] it is a fraction of that, and two boards a bench
+///   apart need nothing more. A board configured higher is refused.
+/// - **The antenna switch has to be right.** DIO2 switches it and DIO3
+///   supplies it, so this only ever follows the ordinary initialization
+///   that sets both, and the latched device errors are read before keying -
+///   `XOSC_START` means the oscillator did not start, which on this module
+///   means the switch is unpowered, and keying into an isolated port
+///   destroys the part.
+///
+/// Continuous rather than burst because of what is downstream: a sweep
+/// trial that lands while the source is quiet fails, and a source with an
+/// off-period would put that failure into every step of the sweep at the
+/// rate of its own duty cycle. The measurement would then be of the
+/// transmitter, not the receiver.
 pub async fn source(radio: &mut Sx1262Driver<'_>) -> ! {
-    /// Seconds keyed, then seconds quiet.
-    const BURST_S: u64 = 10;
-    println!("sentry source: {} s keyed, {} s quiet, repeating", BURST_S, BURST_S);
-    loop {
-        let err = radio.key_infinite_preamble();
-        if err != 0 {
-            // Not a burst that failed - a radio that must not be keyed.
-            println!("sentry source: REFUSING to key, device errors 0x{:04X}", err);
-            radio.standby();
-            loop {
-                watchdog::beat(Task::Loop, Phase::Receive);
-                Timer::after(Duration::from_millis(500)).await;
-            }
-        }
-        println!("sentry source: keyed");
-        hold(BURST_S).await;
+    let dbm = radio.power_dbm();
+    if dbm > SOURCE_MAX_DBM {
+        println!(
+            "sentry source: REFUSING to key at {} dBm - {} dBm or less (board-config --set power_dbm=0)",
+            dbm, SOURCE_MAX_DBM
+        );
+        park().await
+    }
+    let err = radio.key_infinite_preamble();
+    if err != 0 {
+        // Not a burst that failed - a radio that must not be keyed at all.
+        println!("sentry source: REFUSING to key, device errors 0x{:04X}", err);
         radio.standby();
-        println!("sentry source: quiet");
-        hold(BURST_S).await;
+        park().await
+    }
+    println!("sentry source: keyed continuously at {} dBm", dbm);
+    let mut said = Instant::now();
+    loop {
+        watchdog::beat(Task::Loop, Phase::Receive);
+        // A periodic line, so a console shows the source is still up - a
+        // silent one and a wedged one look the same otherwise.
+        if Instant::now() - said > Duration::from_secs(30) {
+            let (mode, err) = radio.health();
+            println!("sentry source: still keyed, radio {} err 0x{:04X}", mode, err);
+            said = Instant::now();
+        }
+        Timer::after(Duration::from_millis(200)).await;
     }
 }
 
-/// Wait `secs`, keeping the heartbeat up across it.
-async fn hold(secs: u64) {
-    let until = Instant::now() + Duration::from_secs(secs);
-    while Instant::now() < until {
+/// Sit still, keeping the heartbeat up. For a source that declined to key.
+///
+/// It says so on a cadence rather than going quiet. A board that refused is
+/// otherwise indistinguishable from a wedged one at the far end of a
+/// console that was attached after the refusal was printed - and the
+/// refusal is the more likely of the two, so it is the one that has to keep
+/// being visible.
+async fn park() -> ! {
+    let mut said = Instant::now();
+    loop {
         watchdog::beat(Task::Loop, Phase::Receive);
+        if Instant::now() - said > Duration::from_secs(10) {
+            println!("sentry source: parked, not transmitting");
+            said = Instant::now();
+        }
         Timer::after(Duration::from_millis(200)).await;
     }
 }

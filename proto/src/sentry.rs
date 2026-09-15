@@ -121,6 +121,65 @@ pub fn classify_charge(commanded_us: u32, observed_us: u32, overhead_us: u32) ->
     }
 }
 
+/// Intervals that are one cycle apart, told from intervals that are not.
+///
+/// A source that is not on the air continuously leaves gaps, and a gap only
+/// ever makes an interval *longer* - the receiver kept cycling, nothing was
+/// there to hear. So the intervals worth measuring are the short ones, and
+/// the long ones are the source rather than the receiver.
+///
+/// Without this a bursting source reads as a chip that stopped cycling,
+/// which is a conclusion about the wrong end of the link and one that would
+/// send the design off after a fault that is not there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Intervals {
+    /// Mean of the intervals that sat within tolerance of one cycle.
+    pub mean_us: u32,
+    pub min_us: u32,
+    pub max_us: u32,
+    /// How many were one cycle apart - consecutive windows, both hearing.
+    pub tight: u32,
+    /// How many were longer, i.e. had a gap in them.
+    pub loose: u32,
+}
+
+/// Summarize measured detection intervals against the commanded cycle.
+///
+/// An interval counts as tight when it is no more than half a cycle over
+/// one: long enough to absorb the oscillator restart and the chip's own RC
+/// timebase, short enough that a skipped window cannot hide in it. Returns
+/// `None` when nothing was tight, which means either the cycle never ran or
+/// the source was never on for two windows together - and those are told
+/// apart by whether anything was detected at all.
+pub fn summarize_intervals(intervals: &[u32], commanded_us: u32) -> Option<Intervals> {
+    let limit = commanded_us.saturating_add(commanded_us / 2);
+    let mut sum = 0u64;
+    let mut tight = 0u32;
+    let mut loose = 0u32;
+    let mut min_us = u32::MAX;
+    let mut max_us = 0u32;
+    for &v in intervals {
+        if v <= limit {
+            tight += 1;
+            sum += u64::from(v);
+            min_us = min_us.min(v);
+            max_us = max_us.max(v);
+        } else {
+            loose += 1;
+        }
+    }
+    if tight == 0 {
+        return None;
+    }
+    Some(Intervals {
+        mean_us: (sum / u64::from(tight)) as u32,
+        min_us,
+        max_us,
+        tight,
+        loose,
+    })
+}
+
 /// One step of a receive-window sweep: how many cycles ran at this window
 /// length and how many of them detected the signal that was present
 /// throughout.
@@ -344,6 +403,42 @@ mod tests {
         // Just under the ceiling still encodes exactly, not at the clamp.
         assert_eq!(duty_steps_from_us(262_143_000), 16_777_152);
         assert!(duty_steps_from_us(262_143_000) < DUTY_STEPS_MAX);
+    }
+
+    #[test]
+    fn a_gap_in_the_source_does_not_read_as_a_stopped_cycle() {
+        // Nine intervals at the cycle, then the source went quiet for three
+        // cycles, then nine more. The cycle is the tight ones; the gap is
+        // about the transmitter and must not move the measurement.
+        let commanded = 1_043_000;
+        let mut v = [commanded + 9_000; 19];
+        v[9] = commanded * 3;
+        let i = summarize_intervals(&v, commanded).unwrap();
+        assert_eq!(i.tight, 18);
+        assert_eq!(i.loose, 1);
+        assert_eq!(i.mean_us, commanded + 9_000);
+        // And the verdict off that mean is still the right one.
+        assert_eq!(
+            classify_charge(commanded, i.mean_us, 10_000),
+            TcxoCharge::Added
+        );
+    }
+
+    #[test]
+    fn nothing_within_a_cycle_is_no_measurement_at_all() {
+        let commanded = 1_043_000;
+        // Every interval is several cycles: no two consecutive windows ever
+        // both heard, so there is no cycle here to report.
+        assert_eq!(summarize_intervals(&[commanded * 4, commanded * 7], commanded), None);
+        assert_eq!(summarize_intervals(&[], commanded), None);
+    }
+
+    #[test]
+    fn half_a_cycle_over_is_the_edge_of_tight() {
+        let commanded = 1_000_000;
+        // A skipped window would show up as two cycles, which is past it.
+        assert_eq!(summarize_intervals(&[1_500_000], commanded).unwrap().tight, 1);
+        assert_eq!(summarize_intervals(&[1_500_001], commanded), None);
     }
 
     #[test]

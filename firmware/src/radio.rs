@@ -781,6 +781,11 @@ impl<'d> Sx1262Driver<'d> {
         err
     }
 
+    /// Transmit power the radio is configured for, dBm.
+    pub fn power_dbm(&self) -> i8 {
+        self.cfg.power_dbm
+    }
+
     /// One LoRa symbol at the running configuration, microseconds.
     pub fn symbol_time_us(&self) -> u32 {
         self.cfg.symbol_time_us()
