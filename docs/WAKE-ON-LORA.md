@@ -397,36 +397,61 @@ sequenceDiagram
 Each phase ends somewhere the board still works, and each has a bench test
 that fails loudly if the phase did not land.
 
-**0. Measure, before writing anything.** The GPS backup floor (lever 5)
-and the board's real boot time. Both are inputs to the design, both are
-currently guesses, and one of them decides whether phase 4 is worth doing.
+**0. Measure, before writing anything.** Two afternoons, independent of
+each other, and between them they gate both the value and the feasibility
+of everything below.
+
+- *Does it work?* Arm `SetRxDutyCycle` on one board and confirm the chip
+  actually cycles - the current trace should be a square wave, and DIO3
+  should be pulsing the TCXO. One board, no protocol, no second radio.
+  This is risk 1 and it is the cheapest possible look at it. Then the
+  two-board version in phase 2.
+- *Is it worth it?* The GPS backup floor (`POWER.md` lever 5) and the
+  board's real boot time. The first decides whether the result is weeks or
+  hours; the second sets the waker's burst gap, and the four seconds in the
+  Gantt charts is labelled illustrative for a reason.
 
 **1. The transmit side alone.** `MSG_WAKE`, the preamble argument, the
 sync word setter, `send_wake`, `board-wake`. No sleeping, no sentry: a
 second board in listening mode with the wake sync word set should hear the
-frame and print it. Proves the long preamble and the second sync word
-work before anything depends on them.
+frame and print it. Proves the long preamble and the second sync word work
+before anything depends on them.
 
-**2. The sentry, awake.** `SetRxDutyCycle` and the symbol timeout, armed
-on a board that is not sleeping, DIO1 watched by the ordinary poll. Board
-B wakes board A while A is awake. Proves the duty cycle detects a long
-preamble at all, and is where risk 1 either appears or does not - with the
-console alive to say so.
+**2. The sentry, awake.** `SetRxDutyCycle` and the symbol timeout, armed on
+a board that is not sleeping, DIO1 watched by the ordinary poll. Board B
+wakes board A while A is awake. Adds `Radio::Sentry` and
+`Effect::RadioSentry` to the posture now rather than later - it is a small
+change, and leaving the model behind the hardware is how a posture nobody
+intended gets built. The config knobs stay out; the mechanism is not proven
+enough to argue about its settings.
 
 **3. The EXT0 wake.** `Ext0WakeupSource` in `enter_deep_sleep`, the sentry
 armed by `PrepareSleep`, the boot path telling `Ext0` from the timer and
-saying which on the boot line. No fast reject yet: every wake is a full
-boot. Proves the radio survives the S3's sleep, which is risk 2.
+saying which on the boot line. Log the chip's mode byte on every wake, so a
+radio that fell out of duty cycle names itself instead of looking like a
+wake that never came. The timer backstop is registered alongside the pin
+and stays registered: a board that can only be woken by the radio is a
+board that can be lost.
 
-**4. The fast reject.** The peek, the address check, the re-arm and the
-second sleep. This is risk 5 and the one to be most careful in, because
-its failure is a board that does not come back.
+**Stop here and use it.** At the end of phase 3 every wake is a full boot,
+which is exactly what the board does today - so a false wake costs what a
+wake check already costs, and the worst case of not having built the fast
+reject is the current behavior. That makes phases 1-3 a safe place to
+stand, and it is the point at which the false-wake rate stops being a guess:
+count the wakes that turned out not to be for this board, and let the number
+decide whether phase 4 is worth its risk. If the wake sync word does what it
+should, it may never be.
+
+**4. The fast reject, if the count justifies it.** The peek, the address
+check, the re-arm and the second sleep. This is risk 5 and the most
+dangerous code in the plan, because its failure is a board that does not
+come back - which is why it is opt-in behind a measurement rather than part
+of the first working version.
 
 **5. The policy and the config.** `proto/src/sentry.rs`, the four config
-keys, `Radio::Sentry` in the posture, the state space tests, the
-`RADIO.example.toml` text. Deliberately last: the mechanism has to be
-known to work before its knobs are worth arguing about, and the state
-space is what stops the knobs from producing a posture nobody intended.
+keys, the state space tests over the posture states added in phase 2, the
+`RADIO.example.toml` text. Deliberately late: the mechanism has to be known
+to work before its knobs are worth arguing about.
 
 **6. Measure it.** An `iso-sentry` feature beside the existing `iso-*`
 builds, arming a sentry and doing nothing else, so the average is readable
