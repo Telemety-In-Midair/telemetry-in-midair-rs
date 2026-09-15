@@ -411,6 +411,132 @@ of everything below.
   hours; the second sets the waker's burst gap, and the four seconds in the
   Gantt charts is labelled illustrative for a reason.
 
+## Phase 0 in detail
+
+Three measurements. Two of them need no instrument, because the thing
+being measured can be made to report itself - and the one that does need a
+meter needs the cheap kind, because it is a plateau.
+
+### E1. Does the duty cycle survive the TCXO
+
+The risk is that `tcxo_startup_ms` is charged *against* `rxPeriod` rather
+than added to it, so a 33 ms window is 10 ms of oscillator and 23 ms of
+listening, and the sentry misses preambles the arithmetic says it should
+hear. The instrument for this is the radio.
+
+Two boards. **Board B** transmits a continuous LoRa preamble
+(`SetTxInfinitePreamble`, 0xD1) at the sentry's modulation. **Board A** is
+armed with `SetRxDutyCycle` and its IRQ mask set so DIO1 carries
+`PreambleDetected` alone; the ordinary hardware loop timestamps DIO1's
+rising edges with `Instant::now()` and prints the intervals.
+
+With a signal continuously present, every window that opens *should*
+detect, so the pin becomes a direct readout of the receiver's own
+schedule:
+
+| What the console shows | What it means |
+|-|-|
+| No edges at all | The duty cycle is not running, or the window never becomes sensitive. Risk 1 is real and the design stops here. |
+| Interval ~= rxPeriod + sleepPeriod + 10 ms | The TCXO is *added* to the window. The arithmetic in this document holds. |
+| Interval ~= rxPeriod + sleepPeriod | The TCXO is *absorbed*. Listening time is 10 ms less than commanded, and every window in the design has to grow by that much. |
+| Edges present but irregular | Look at the spread before concluding anything; the sentry's timebase is the chip's own RC. |
+
+Then the sweep that produces the number the design actually needs. With B
+still transmitting, walk `rxPeriod` down from something generous - 100 ms -
+toward the floor, a couple of hundred cycles at each step, and record the
+detection rate. **The smallest `rxPeriod` that still detects on every
+cycle, minus the four-symbol detect time, is the real per-window
+overhead.** That measurement replaces the 10 ms assumption in the table
+above and is what sizes every preamble in the plan.
+
+Two things this test does not prove. A continuous preamble says the window
+opens and detects; it does not say a *finite* preamble of length L gets
+caught, which is phase 2's job with a real `send_wake` frame. And it says
+nothing about the radio surviving the S3's sleep, which is phase 3's.
+
+**Before keying B:** `SetTxInfinitePreamble` leaves the PA on until a
+`SetStandby`, and on this module DIO3 supplies both the TCXO and the
+antenna switch's VDD - transmitting with that wrong is the failure that
+destroys the module rather than the one that shortens the range. So run it
+only from the normal `init` path, never from a hand-rolled minimal setup,
+and check `GetDeviceErrors` for `XOSC_START` before the first key-up. Drop
+the power to the bottom of the range and key in bounded bursts - ten
+seconds on, ten off - rather than truly continuously: the boards are
+centimeters apart on a bench and the PA is 127 mA of heat in a module that
+normally sees 288 ms at a time.
+
+### E2. The stored floor
+
+The plateau measurement, and the one that decides whether the result is
+weeks or hours. A DMM in series with the battery is the right instrument:
+the number wanted is a steady state, the wake burst is already known to be
+~126 mA, and at sub-milliamp currents a meter's burden voltage stops
+mattering.
+
+The sequencing is most of the difficulty, because the board must not lose
+power between being told what to do and being measured:
+
+1. Meter in series in the battery lead **first**, with USB still supplying
+   the board through D4.
+2. `pixi run board-set sleep-interval 300`, then `board-set mode stored`.
+   300 s is the clamp ceiling, long enough for a clean plateau and short
+   enough to get the board back.
+3. **Pull USB, leave the battery.** The USB Serial/JTAG PHY is 3-5 mA and
+   the host is feeding the rail, so neither can be in the reading. The
+   console goes with it, which is why the mode is commanded first.
+4. Read the plateau across the interval. Let the first wake pass before
+   trusting it - the first sleep after a mode change is not the steady
+   state.
+
+The trap: **pulling the battery resets the mode.** Tracking and listening
+survive a power cycle and everything else comes back idle, so a board that
+loses its rail between step 2 and step 4 is measured awake and idle, which
+is a plausible-looking number for the wrong state. And RTC RAM survives an
+erase-flash and a reset but not a power cycle, so nothing else rescues it.
+
+Afterwards, plug back in and read the boot line and the event log: a park
+that did not hold is counted in `parks_missed`, and a floor taken over an
+unfinished park is a floor with a receiver in it.
+
+Run `--features iso-gps-backup` as the separate, awake half of the same
+question. The step at t=20 s is the receiver's own draw and is the number
+`POWER.md` carries at ~10 mA on a bench against 25-31 in the datasheet.
+That half is a basement job - the current in backup does not care about the
+sky. Only the question this one cannot answer, whether the ephemeris
+survives a backup, needs to go outside, and that is a TTFF stopwatch rather
+than a meter.
+
+### E3. Boot latency
+
+Needed to size the waker's burst gap, and the four seconds in this
+document's Gantt charts is illustrative rather than measured.
+
+No instrument: `Rtc::time_since_boot` reads the RTC main timer, which
+counts through a deep sleep - that is what the timer wake source counts
+against. So record it into RTC RAM at sleep entry, read it at the top of
+`main`, and the difference less the commanded interval is the wake plus
+everything before that point.
+
+Verify the counter actually survives before trusting it: print it on two
+consecutive wakes and check it climbs. It is divided by the 150 kHz RC, so
+it is percent-accurate - which is ample for timing a four-second boot to
+tens of milliseconds, and is the one job that oscillator is good at.
+
+Then instrument two points rather than one: the top of `main`, and the
+instant the radio is armed and BLE is advertising. The first is the wake
+cost; the gap to the second is what a waker's burst has to outlast.
+
+### What to buy, if the rest should be easy
+
+Everything above is deliberately shaped around a meter and two boards.
+What it cannot do is show a sub-milliamp floor and a 126 mA burst in one
+trace, which is what phase 6 wants and what `POWER.md`'s warning about
+averaging instruments is really about. That is a current-profiling job -
+sub-microamp to an amp in a single range, tens of kilosamples a second, and
+able to source the board so nothing else is on the rail. One of those turns
+E2 from a staged procedure into a screenshot, and it is the same instrument
+the `Battery I Sense` shunt in `HW-TODO.md` is reaching for.
+
 **1. The transmit side alone.** `MSG_WAKE`, the preamble argument, the
 sync word setter, `send_wake`, `board-wake`. No sleeping, no sentry: a
 second board in listening mode with the wake sync word set should hear the
