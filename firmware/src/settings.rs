@@ -68,6 +68,22 @@ static NAME: [AtomicU8; midair_proto::ble::NAME_FIELD_LEN] =
 static WAKE_COUNT: AtomicU32 = AtomicU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static LAST_SLEEP_S: AtomicU32 = AtomicU32::new(0);
+/// The RTC counter as the last deep sleep was entered, in milliseconds.
+///
+/// The RTC main timer is what the sleep's own wake source counts against,
+/// so unlike every other clock on the board it keeps running through the
+/// sleep. Stamping it on the way down and reading it on the way up gives
+/// the one number the wake path has never had: how long the wake itself
+/// takes, which is what anything trying to reach a sleeping board has to
+/// outlast.
+///
+/// Milliseconds rather than the counter's microseconds, and a u32, because
+/// the persistent statics are one word each; it wraps after 49 days of RTC
+/// uptime and the read is a wrapping subtraction, so a wrap costs one
+/// nonsense reading rather than a wrong number forever.
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static SLEEP_AT_MS: AtomicU32 = AtomicU32::new(0);
+
 /// Deep sleeps entered before the hardware loop finished parking, since
 /// the last cold boot. Each one is an interval spent with the receiver or
 /// the radio still drawing, which nothing else reports.
@@ -192,6 +208,24 @@ pub fn note_park_missed() {
     // them: a count in front of no magic word reads as garbage next boot.
     set(get());
     PARKS_MISSED.store(PARKS_MISSED.load(Ordering::Relaxed).saturating_add(1), Ordering::Relaxed);
+}
+
+/// Stamp the RTC counter as a deep sleep is entered.
+pub fn note_sleep_at(rtc_ms: u32) {
+    // Stamped alongside the settings for the reason the counters are: a
+    // stamp in front of no magic word reads as garbage on the next boot.
+    set(get());
+    SLEEP_AT_MS.store(rtc_ms, Ordering::Relaxed);
+}
+
+/// The stamp the last deep sleep left, or `None` if this boot did not come
+/// through one that took a stamp.
+pub fn sleep_stamp_ms() -> Option<u32> {
+    if MAGIC_WORD.load(Ordering::Relaxed) == MAGIC {
+        Some(SLEEP_AT_MS.load(Ordering::Relaxed))
+    } else {
+        None
+    }
 }
 
 /// Parks missed since the last cold boot.

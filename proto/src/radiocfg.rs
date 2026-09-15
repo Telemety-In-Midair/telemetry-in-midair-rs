@@ -685,6 +685,16 @@ impl RadioConfig {
     /// number of microseconds and the whole calculation stays in integer math:
     /// no float, so it is usable on the no_std targets too.
     pub fn time_on_air_us(&self, payload_len: usize) -> u32 {
+        self.time_on_air_preamble_us(payload_len, PREAMBLE_SYMBOLS)
+    }
+
+    /// One LoRa symbol at the current spreading factor and bandwidth, in
+    /// microseconds.
+    ///
+    /// The four legal bandwidths all divide 1 MHz evenly, so this is exact
+    /// in integer math - which is what keeps every airtime below off the
+    /// floating point a no_std target would rather not carry.
+    pub fn symbol_time_us(&self) -> u32 {
         let sf = self.spreading_factor.clamp(5, 12) as u32;
         // Bandwidth in Hz; 62 is the config's shorthand for 62.5 kHz.
         let bw_hz = if self.bandwidth_khz == 62 {
@@ -692,13 +702,24 @@ impl RadioConfig {
         } else {
             self.bandwidth_khz as u32 * 1_000
         };
-        // 1_000_000 / bw_hz is exact for every legal bandwidth (16, 8, 4 or 2),
-        // so the symbol time comes out an exact microsecond count.
-        let t_sym_us = (1u32 << sf) * (1_000_000 / bw_hz);
+        (1u32 << sf) * (1_000_000 / bw_hz)
+    }
 
-        // Preamble is (n + 4.25) symbols with n = 8. 4.25 = 17/4, so scale the
-        // symbol count by 4 and divide once to keep the quarter-symbol exact.
-        let t_preamble_us = (4 * 8 + 17) * t_sym_us / 4;
+    /// [`time_on_air_us`](Self::time_on_air_us) with the preamble length
+    /// given rather than assumed.
+    ///
+    /// Everything this firmware sends on the network uses
+    /// [`PREAMBLE_SYMBOLS`]. A transmission meant to be caught by a receiver
+    /// that is only listening part of the time does not: its preamble has to
+    /// span that receiver's whole cycle, which is thousands of symbols
+    /// rather than eight, and is most of what such a frame costs.
+    pub fn time_on_air_preamble_us(&self, payload_len: usize, preamble_syms: u32) -> u32 {
+        let sf = self.spreading_factor.clamp(5, 12) as u32;
+        let t_sym_us = self.symbol_time_us();
+
+        // Preamble is (n + 4.25) symbols. 4.25 = 17/4, so scale the symbol
+        // count by 4 and divide once to keep the quarter-symbol exact.
+        let t_preamble_us = (4 * preamble_syms + 17) * t_sym_us / 4;
 
         // Payload symbol count. `cr` is coding_rate's 1..4 offset over 4, `de`
         // the low-data-rate flag, the header is explicit (IH = 0) and the CRC
@@ -760,6 +781,14 @@ impl RadioConfig {
         self.time_on_air_us(0)
     }
 }
+
+/// Preamble length every frame on the network is sent with, in symbols.
+///
+/// The SX126x power-up default, and all a receiver held in continuous
+/// receive needs: it is already listening when the preamble starts, so the
+/// preamble only has to be long enough to lock onto. A receiver that is
+/// only listening part of the time is the case this does not cover.
+pub const PREAMBLE_SYMBOLS: u32 = 8;
 
 /// Ceiling on [`RadioConfig::hop_dwell_ms`]. Past ten seconds a slot is no
 /// longer a hop, it is a channel with a schedule.

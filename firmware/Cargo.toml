@@ -46,6 +46,19 @@ iso-gps-backup = []
 # while advertising, and again while a phone is connected and idle.
 iso-ble-no-modem-sleep = []
 
+# The wake-on-radio bench probe, in two halves that want two boards. The
+# probe takes the board over instead of running the hardware loop, so both
+# need a mode that brings the radio up (`board-set mode listening`) and both
+# expect the same radio settings at each end.
+#
+#   iso-sentry-probe   duty-cycle the receiver and measure it off DIO1
+#   iso-sentry-source  key a continuous preamble for the probe to hear
+#
+# `iso-sentry-source` keys the PA in ten-second bursts. Turn the power down
+# first, and never build both into one image.
+iso-sentry-probe = []
+iso-sentry-source = []
+
 # Bench faults, for proving the watchdog and the event log on a board.
 # Twenty seconds after the hardware loop is up, `bench-panic` panics on its
 # core and `bench-stall` stops it in a spin. Either build resets itself

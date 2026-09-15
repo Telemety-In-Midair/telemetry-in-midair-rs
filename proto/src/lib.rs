@@ -137,6 +137,7 @@ pub mod posture;
 pub mod radiocfg;
 pub mod roster;
 pub mod rxgate;
+pub mod sentry;
 pub mod session;
 pub mod supervise;
 

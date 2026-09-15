@@ -48,6 +48,7 @@ use midair_proto::hop::{self, Offer, SyncWord};
 use midair_proto::lora::FRAME_MAX;
 use midair_proto::radiocfg::RadioConfig;
 use midair_proto::rxgate::{Irq, RxGate, Seen};
+use midair_proto::sentry;
 use midair_proto::supervise::{Phase, Task};
 
 use crate::sx1262::{dev_err, irq, mode, reg, FallbackMode, StandbyClk, Sx1262, RX_CONTINUOUS};
@@ -720,6 +721,69 @@ impl<'d> Sx1262Driver<'d> {
             self.radio.clear_device_errors();
         }
         true
+    }
+
+    /// Arm the chip's own receive/sleep cycle, with `mask` routed to DIO1.
+    ///
+    /// The periods are in microseconds and are encoded here, so a caller
+    /// works in the units the arithmetic is done in rather than in the
+    /// chip's 15.625 us steps. Packet parameters are restored first for the
+    /// same reason [`enter_rx`](Self::enter_rx) restores them: a transmit
+    /// leaves them carrying its own length.
+    ///
+    /// `rx_active` stays false. This is not continuous receive, and a poll
+    /// that decided the receiver needed re-arming would take the chip
+    /// straight back out of the cycle.
+    pub fn arm_duty_cycle(&mut self, rx_us: u32, sleep_us: u32, detect_symbols: u8, mask: u16) {
+        self.rx_active = false;
+        self.radio.set_standby(StandbyClk::Rc);
+        self.radio.set_lora_packet_params(RX_MAX_PAYLOAD);
+        self.radio.set_lora_symb_num_timeout(detect_symbols);
+        self.radio.set_dio_irq_params(mask);
+        self.radio.clear_irq_status(irq::ALL);
+        self.radio.set_rx_duty_cycle(
+            sentry::duty_steps_from_us(rx_us),
+            sentry::duty_steps_from_us(sleep_us),
+        );
+    }
+
+    /// Whether the radio is asserting DIO1.
+    pub fn irq_pending(&self) -> bool {
+        self.radio.irq_pending()
+    }
+
+    /// Read the pending interrupt bits and clear exactly those.
+    pub fn take_irq(&mut self) -> u16 {
+        let status = self.radio.irq_status();
+        if status != 0 {
+            self.radio.clear_irq_status(status);
+        }
+        status
+    }
+
+    /// Key the PA on a continuous preamble until [`standby`](Self::standby).
+    ///
+    /// Only useful as an instrument: it gives a duty-cycled receiver
+    /// somewhere a signal is always present, so every window that opens
+    /// should detect and the receiver's DIO1 reports its own schedule.
+    ///
+    /// Returns the latched device errors, which the caller is expected to
+    /// check before keying again - `XOSC_START` here means DIO3 is not
+    /// supplying the antenna switch, and transmitting into an isolated port
+    /// is what destroys this module.
+    pub fn key_infinite_preamble(&mut self) -> u16 {
+        let err = self.radio.device_errors();
+        if err == 0 {
+            self.rx_active = false;
+            self.radio.set_standby(StandbyClk::Rc);
+            self.radio.set_tx_infinite_preamble();
+        }
+        err
+    }
+
+    /// One LoRa symbol at the running configuration, microseconds.
+    pub fn symbol_time_us(&self) -> u32 {
+        self.cfg.symbol_time_us()
     }
 
     /// Put the radio into standby (used for the soft-sleep state).

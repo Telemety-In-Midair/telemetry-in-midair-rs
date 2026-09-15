@@ -424,11 +424,28 @@ than added to it, so a 33 ms window is 10 ms of oscillator and 23 ms of
 listening, and the sentry misses preambles the arithmetic says it should
 hear. The instrument for this is the radio.
 
-Two boards. **Board B** transmits a continuous LoRa preamble
-(`SetTxInfinitePreamble`, 0xD1) at the sentry's modulation. **Board A** is
-armed with `SetRxDutyCycle` and its IRQ mask set so DIO1 carries
-`PreambleDetected` alone; the ordinary hardware loop timestamps DIO1's
-rising edges with `Instant::now()` and prints the intervals.
+Two boards, two builds, both needing a mode that brings the radio up
+(`board-set mode listening`) and the same radio settings at each end:
+
+```
+cargo run --release --features iso-sentry-source   # board B, the signal
+cargo run --release --features iso-sentry-probe    # board A, the measurement
+```
+
+**Board B** transmits a continuous LoRa preamble (`SetTxInfinitePreamble`,
+0xD1) in ten-second bursts. **Board A** is armed with `SetRxDutyCycle`, its
+IRQ mask set so DIO1 carries `PreambleDetected` alone, and timestamps DIO1's
+rising edges. It runs two halves and prints both:
+
+- **Cadence.** Armed once and left alone. The interval between detections is
+  the real cycle, and whether detections keep coming says whether the chip
+  stays in the cycle by itself - which decides whether a sleeping board has
+  to re-arm on every wake.
+- **Sweep.** Each window length tried independently, forty times. The ladder
+  is in *overhead* rather than in absolute microseconds, so the same sweep
+  runs at any spreading factor: each step is the symbols the modem must
+  count plus some headroom, and the shortest step that still detects every
+  time is the overhead itself.
 
 With a signal continuously present, every window that opens *should*
 detect, so the pin becomes a direct readout of the receiver's own
@@ -441,13 +458,18 @@ schedule:
 | Interval ~= rxPeriod + sleepPeriod | The TCXO is *absorbed*. Listening time is 10 ms less than commanded, and every window in the design has to grow by that much. |
 | Edges present but irregular | Look at the spread before concluding anything; the sentry's timebase is the chip's own RC. |
 
-Then the sweep that produces the number the design actually needs. With B
-still transmitting, walk `rxPeriod` down from something generous - 100 ms -
-toward the floor, a couple of hundred cycles at each step, and record the
-detection rate. **The smallest `rxPeriod` that still detects on every
-cycle, minus the four-symbol detect time, is the real per-window
-overhead.** That measurement replaces the 10 ms assumption in the table
-above and is what sizes every preamble in the plan.
+**The smallest window that still detects on every cycle, minus the
+four-symbol detect time, is the real per-window overhead.** That number
+replaces the 10 ms assumption in the table above and is what sizes every
+preamble in the plan, so the probe prints it rather than the raw rate.
+
+Reading the sweep is the one place a plausible wrong answer is easy to get,
+which is why it is `midair_proto::sentry::sweep_floor` and host-tested
+rather than eyeballed off the table. A step is only accepted if it *and
+every longer step* passed: a short window that happened to catch while a
+longer one missed is a run to repeat, and taking the shortest passing step
+on its own would quietly adopt the luckier of the two. The probe says `NO
+FLOOR` rather than guessing.
 
 Two things this test does not prove. A continuous preamble says the window
 opens and detects; it does not say a *finite* preamble of length L gets
@@ -511,20 +533,32 @@ than a meter.
 Needed to size the waker's burst gap, and the four seconds in this
 document's Gantt charts is illustrative rather than measured.
 
-No instrument: `Rtc::time_since_boot` reads the RTC main timer, which
-counts through a deep sleep - that is what the timer wake source counts
-against. So record it into RTC RAM at sleep entry, read it at the top of
-`main`, and the difference less the commanded interval is the wake plus
-everything before that point.
+No instrument, and no build flag - it is on in the shipped firmware,
+because the number was a guess and leaving it to a special build is how it
+stays one. Two lines, from the two clocks that can each see half of it:
 
-Verify the counter actually survives before trusting it: print it on two
-consecutive wakes and check it climbs. It is divided by the 150 kHz RC, so
-it is percent-accurate - which is ample for timing a four-second boot to
-tens of milliseconds, and is the one job that oscillator is good at.
+```
+wake: rtc 64231 ms, slept from 4102 ms, elapsed 60129 ms over 60000 ms asked
+boot: radio up 2870 ms into this boot
+```
 
-Then instrument two points rather than one: the top of `main`, and the
-instant the radio is armed and BLE is advertising. The first is the wake
-cost; the gap to the second is what a waker's burst has to outlast.
+The first comes from `Rtc::time_since_boot`, the RTC main timer, which
+counts through a deep sleep - it is what the wake source counts against, and
+every other clock on the board stops. Stamped on the way down and read at
+the first point after the wake where an `Rtc` exists; `elapsed` less `asked`
+is the wake itself. Both readings are printed rather than only the
+difference, because whether that counter survives a sleep is the thing to
+confirm before trusting anything derived from it, and two consecutive wakes
+climbing is the confirmation. It is divided by the 150 kHz RC, so it is
+percent-accurate - ample for timing a four-second boot, and the one job that
+oscillator is good at.
+
+The second is the ordinary monotonic clock, so it measures only within this
+boot: how long after the chip started the radio could hear anything. Printed
+only when the boot actually raised the radio, since a wake check leaves it
+parked and has nothing to report.
+
+**The two added together are what a waker's burst has to outlast.**
 
 ### What to buy, if the rest should be easy
 

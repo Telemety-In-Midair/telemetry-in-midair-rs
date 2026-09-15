@@ -120,6 +120,11 @@ pub async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
     }
 
     settings::note_sleep(interval_s);
+    // The RTC main timer keeps counting through the sleep - it is what the
+    // wake source counts against - so a stamp here and a reading on the far
+    // side is how long the wake itself took, less the interval asked for.
+    // Nothing else on the board can measure that: every other clock stops.
+    settings::note_sleep_at(rtc.time_since_boot().as_millis() as u32);
     println!(
         "deep sleep for {} s (mode {}, radio and gps parked)",
         interval_s,

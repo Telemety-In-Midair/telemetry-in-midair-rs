@@ -553,6 +553,25 @@ async fn main(spawner: Spawner) -> ! {
     {
         println!("BLE-ADDR {}", wio_s3_gps::ble::fmt_address(&addr_bytes));
         let mut rtc = Rtc::new(peripherals.LPWR);
+        // The first point after a wake where the RTC counter can be read.
+        // Both readings go out, not just the difference: whether the counter
+        // survives a deep sleep at all is the thing to confirm before
+        // trusting any number derived from it, and two consecutive wakes
+        // climbing is the confirmation.
+        if woke_from_sleep {
+            let now_ms = rtc.time_since_boot().as_millis() as u32;
+            if let Some(stamp) = settings::sleep_stamp_ms() {
+                let elapsed = now_ms.wrapping_sub(stamp);
+                let asked_ms = settings::get().sleep_interval_s.saturating_mul(1000);
+                status_println!(
+                    "wake: rtc {} ms, slept from {} ms, elapsed {} ms over {} ms asked",
+                    now_ms,
+                    stamp,
+                    elapsed,
+                    asked_ms
+                );
+            }
+        }
         wio_s3_gps::ble::duty_cycle(&mut rtc, addr_bytes).await
     }
 

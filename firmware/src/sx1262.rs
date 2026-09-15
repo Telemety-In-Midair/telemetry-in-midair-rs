@@ -26,6 +26,9 @@ mod op {
     pub const SET_STANDBY: u8 = 0x80;
     pub const SET_TX: u8 = 0x83;
     pub const SET_RX: u8 = 0x82;
+    pub const SET_RX_DUTY_CYCLE: u8 = 0x94;
+    pub const SET_LORA_SYMB_NUM_TIMEOUT: u8 = 0xA0;
+    pub const SET_TX_INFINITE_PREAMBLE: u8 = 0xD1;
     pub const SET_RX_TX_FALLBACK_MODE: u8 = 0x93;
     pub const SET_REGULATOR_MODE: u8 = 0x96;
     pub const CALIBRATE: u8 = 0x89;
@@ -174,6 +177,13 @@ const BUSY_TIMEOUT_MS: u64 = 50;
 /// so it must be the latter; single mode would leave a node that rarely
 /// transmits deaf after its first packet.
 pub const RX_CONTINUOUS: u32 = 0x00FF_FFFF;
+
+/// Preamble every frame on the network is sent with, in symbols.
+///
+/// Mirrors the protocol crate's `PREAMBLE_SYMBOLS`, which is what the
+/// airtime arithmetic uses; the two have to agree or every computed time on
+/// air is wrong by the difference.
+pub const NETWORK_PREAMBLE_SYMBOLS: u16 = 8;
 
 /// Convert milliseconds to the chip's 15.625 us timeout step, saturating
 /// at the 24-bit field.
@@ -389,18 +399,30 @@ impl<'d> Sx1262<'d> {
     }
 
     /// The LoRa packet params this firmware always uses, for a payload of
-    /// `payload_len` bytes: an 8-symbol preamble, an explicit header, the
-    /// hardware CRC on, and no IQ inversion.
+    /// `payload_len` bytes: an explicit header, the hardware CRC on, and no
+    /// IQ inversion, behind the network's ordinary preamble.
     ///
     /// `RadioConfig::time_on_air_us` computes air time from these same
     /// fixed choices, so the two have to agree.
     pub fn set_lora_packet_params(&mut self, payload_len: u8) {
+        self.set_lora_packet_params_preamble(payload_len, NETWORK_PREAMBLE_SYMBOLS);
+    }
+
+    /// The same, with the preamble length given.
+    ///
+    /// Only a transmission meant for a receiver that is asleep most of the
+    /// time needs this: its preamble has to span that receiver's whole
+    /// cycle, so it runs to thousands of symbols where everything else on
+    /// the network uses eight.
+    pub fn set_lora_packet_params_preamble(&mut self, payload_len: u8, preamble_syms: u16) {
         self.cmd(
             op::SET_PACKET_PARAMS,
             &[
-                0x00, 0x08, // preamble length, 8 symbols
+                (preamble_syms >> 8) as u8,
+                preamble_syms as u8,
                 0x00, // variable length, i.e. explicit header
-                payload_len, 0x01, // CRC on
+                payload_len,
+                0x01, // CRC on
                 0x00, // no IQ inversion
             ],
         );
@@ -429,6 +451,60 @@ impl<'d> Sx1262<'d> {
             op::SET_RX,
             &[(timeout >> 16) as u8, (timeout >> 8) as u8, timeout as u8],
         );
+    }
+
+    /// Cycle receive and sleep on the chip's own timer, both periods in
+    /// the same 15.625 us step `SetRx` counts in.
+    ///
+    /// The one command on this part that runs without the host: the chip
+    /// listens for `rx_steps`, sleeps with its configuration retained for
+    /// `sleep_steps`, and repeats until something takes it out - so the MCU
+    /// can be in deep sleep for whole cycles at a time and still be woken by
+    /// a frame. The chip leaves the cycle by itself on a reception, landing
+    /// in the fallback mode with the packet in its buffer.
+    ///
+    /// A transmission is only heard if its preamble spans a whole cycle, so
+    /// the two periods and the preamble of whatever is meant to be heard are
+    /// one choice and not three.
+    pub fn set_rx_duty_cycle(&mut self, rx_steps: u32, sleep_steps: u32) {
+        self.cmd(
+            op::SET_RX_DUTY_CYCLE,
+            &[
+                (rx_steps >> 16) as u8,
+                (rx_steps >> 8) as u8,
+                rx_steps as u8,
+                (sleep_steps >> 16) as u8,
+                (sleep_steps >> 8) as u8,
+                sleep_steps as u8,
+            ],
+        );
+    }
+
+    /// How many LoRa symbols the modem must count before it accepts that a
+    /// signal is really there. 0 disables the check.
+    ///
+    /// What makes a duty-cycled receive window cheap: without it a window
+    /// that caught noise stays in receive for the whole of its timeout, and
+    /// with it the modem gives up after a few symbols and goes back to
+    /// sleep. Larger is more confident and costs that much more window on
+    /// every cycle for the life of the board.
+    pub fn set_lora_symb_num_timeout(&mut self, symbols: u8) {
+        self.cmd(op::SET_LORA_SYMB_NUM_TIMEOUT, &[symbols]);
+    }
+
+    /// Transmit preamble symbols continuously until a `SetStandby`.
+    ///
+    /// A test mode, and the instrument for a duty-cycled receiver: with a
+    /// preamble always on the air, every receive window that opens should
+    /// detect, so the receiver's DIO1 becomes a readout of its own schedule.
+    ///
+    /// It keys the PA and leaves it keyed. On this board DIO2 switches the
+    /// antenna and DIO3 supplies that switch, so this must only ever follow
+    /// the ordinary initialization that sets both - keying with either wrong
+    /// transmits into an isolated port, which destroys the module rather
+    /// than shortening its range.
+    pub fn set_tx_infinite_preamble(&mut self) {
+        self.cmd(op::SET_TX_INFINITE_PREAMBLE, &[]);
     }
 
     pub fn set_tx(&mut self, timeout: u32) {

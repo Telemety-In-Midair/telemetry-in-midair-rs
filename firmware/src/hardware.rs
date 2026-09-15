@@ -248,10 +248,26 @@ impl Hardware {
     /// two override flags on top of that, which are the settings that
     /// survive a deep sleep re-applied because the wake that restored them
     /// is a fresh boot to everything else.
+    // The probe builds below never return, so everything after them is
+    // unreachable on purpose. Scoped to those features so the warning still
+    // means something in the build that ships.
+    #[cfg_attr(
+        any(feature = "iso-sentry-probe", feature = "iso-sentry-source"),
+        allow(unreachable_code)
+    )]
     pub async fn boot(&mut self, boot: Mode, boot_fx: Effects, stored: &Stored) {
         let now_ms = Instant::now().as_millis();
         for e in boot_fx {
             self.effect(e, now_ms).await;
+        }
+        // The second half of the wake timing. The console's `wake:` line
+        // says how long the chip took to come back; this says how long after
+        // that the radio was able to hear anything, and the two together are
+        // what a transmission trying to reach a board that is waking up has
+        // to outlast. Only when the boot actually raised the radio - a wake
+        // check leaves it parked and has nothing to report.
+        if self.posture.radio_up() {
+            status_println!("boot: radio up {} ms into this boot", Instant::now().as_millis());
         }
 
         // The isolation build asks unconditionally, because the point is
@@ -274,6 +290,14 @@ impl Hardware {
                 ISO_GPS_BACKUP_MS / 1000
             );
         }
+
+        // Both halves take the board over rather than returning to the
+        // loop: the probe needs the radio's whole attention and the source
+        // needs the PA, and neither has anything to do with tracking.
+        #[cfg(feature = "iso-sentry-probe")]
+        crate::sentry::probe(self.node.radio_mut()).await;
+        #[cfg(feature = "iso-sentry-source")]
+        crate::sentry::source(self.node.radio_mut()).await;
 
         match boot {
             Mode::Tracking => status_println!(
