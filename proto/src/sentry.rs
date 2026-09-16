@@ -262,57 +262,116 @@ pub fn sweep_floor(steps: &[SweepStep], t_sym_us: u32, detect_symbols: u8) -> Op
     })
 }
 
-/// A sentry's two half-periods and the preamble that catches it.
+/// Symbols the LoRa explicit header occupies, which the chip must also
+/// receive inside its restarted timer once it has heard a preamble.
+pub const HEADER_SYMBOLS: u32 = 8;
+
+/// A sentry's two half-periods and the preamble window that reaches it.
+///
+/// The preamble is bounded at *both* ends, which is the whole difficulty:
+///
+/// - **Below**, because the receiver is deaf for the sleep phase and the
+///   oscillator restart behind it, so a preamble shorter than that gap can
+///   fall entirely inside one and never be sampled.
+/// - **Above**, because of what the chip does when it *does* hear one. The
+///   datasheet's sniff loop stops its window timer on preamble detection
+///   and restarts it at `2 * rxPeriod + sleepPeriod` to look for a header;
+///   a preamble still running when that expires is abandoned, and the
+///   packet behind it is never received. The datasheet states it as
+///   `Tpreamble + Theader <= 2 * rxPeriod + sleepPeriod`.
+///
+/// So a longer preamble is not the safe direction. Past the upper bound the
+/// wake stops working again, and it fails the same way it fails below the
+/// lower one - silently, with the receiver awake and listening.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sentry {
     /// Receive window, microseconds: the symbols to be counted plus the
     /// measured per-window overhead.
     pub rx_us: u32,
-    /// Sleep between windows, microseconds. The knob: everything else here
-    /// follows from it.
+    /// Sleep between windows, microseconds.
     pub sleep_us: u32,
     /// Symbols the modem counts before accepting a signal.
     pub detect_symbols: u8,
-    /// Preamble a transmission needs to be certain of catching one window.
-    pub preamble_symbols: u32,
+    /// Oscillator startup, microseconds. Added *between* the sleep and the
+    /// receive phases rather than taken out of the window, so it lengthens
+    /// the cycle and the deaf gap alike.
+    pub tcxo_us: u32,
+    /// Shortest preamble that can still be sampled by a window.
+    pub preamble_min_us: u32,
+    /// Longest preamble the chip's restarted timer will sit through.
+    pub preamble_max_us: u32,
 }
 
 impl Sentry {
-    /// Size a sentry for `cfg` from a sleep period and the per-window
-    /// overhead a sweep measured.
-    ///
-    /// The preamble condition is that a transmission must still be in
-    /// preamble wherever a window opens, and must stay there long enough to
-    /// be counted. Two sleeps plus a window covers that with a whole extra
-    /// sleep of margin, which is deliberate: the two timebases are free
-    /// running, one of them is the chip's RC, and a preamble that is a
-    /// little too short fails as a wake that silently never arrives.
-    pub fn new(cfg: &RadioConfig, sleep_us: u32, overhead_us: u32, detect_symbols: u8) -> Self {
-        let t_sym_us = cfg.symbol_time_us();
-        let rx_us = u32::from(detect_symbols)
-            .saturating_mul(t_sym_us)
-            .saturating_add(overhead_us);
-        let need_us = sleep_us
+    /// Size a sentry for `cfg` from a sleep period, the per-window overhead
+    /// a sweep measured, and the oscillator startup the config asks for.
+    pub fn new(
+        cfg: &RadioConfig,
+        sleep_us: u32,
+        overhead_us: u32,
+        detect_symbols: u8,
+        tcxo_us: u32,
+    ) -> Self {
+        let t_sym_us = cfg.symbol_time_us().max(1);
+        let detect_us = u32::from(detect_symbols).saturating_mul(t_sym_us);
+        let header_us = HEADER_SYMBOLS.saturating_mul(t_sym_us);
+        let rx_us = detect_us.saturating_add(overhead_us);
+        // Deaf for the sleep phase plus the oscillator restart behind it;
+        // a window then needs its detect symbols inside what is left.
+        let preamble_min_us = sleep_us
+            .saturating_add(tcxo_us)
+            .saturating_add(detect_us);
+        // The chip's own post-detection timer, less the header it still has
+        // to fit behind the preamble.
+        let preamble_max_us = rx_us
             .saturating_mul(2)
-            .saturating_add(rx_us);
-        let preamble_symbols = need_us.div_ceil(t_sym_us.max(1));
+            .saturating_add(sleep_us)
+            .saturating_sub(header_us);
         Self {
             rx_us,
             sleep_us,
             detect_symbols,
-            preamble_symbols,
+            tcxo_us,
+            preamble_min_us,
+            preamble_max_us,
         }
     }
 
-    /// One full cycle, microseconds.
+    /// Whether a preamble exists that satisfies both bounds.
+    ///
+    /// It does only when the window is long enough to cover half of what
+    /// detection and the header cost together - so the receive window, not
+    /// the sleep, is what decides whether a sentry is possible at all.
+    pub fn feasible(&self) -> bool {
+        self.preamble_min_us <= self.preamble_max_us
+    }
+
+    /// The preamble to transmit with, in symbols: the middle of the window,
+    /// so the drift of two free-running RC timebases has room either side.
+    pub fn preamble_symbols(&self, cfg: &RadioConfig) -> Option<u32> {
+        if !self.feasible() {
+            return None;
+        }
+        let t_sym_us = cfg.symbol_time_us().max(1);
+        let mid = self.preamble_min_us + (self.preamble_max_us - self.preamble_min_us) / 2;
+        Some(mid / t_sym_us)
+    }
+
+    /// How much room the two bounds leave, microseconds. The margin every
+    /// clock in the system has to stay inside.
+    pub fn preamble_window_us(&self) -> u32 {
+        self.preamble_max_us.saturating_sub(self.preamble_min_us)
+    }
+
+    /// One full cycle, microseconds: both phases and the oscillator restart
+    /// the datasheet adds between them.
     pub fn cycle_us(&self) -> u32 {
-        self.rx_us.saturating_add(self.sleep_us)
+        self.rx_us
+            .saturating_add(self.sleep_us)
+            .saturating_add(self.tcxo_us)
     }
 
     /// Share of each cycle the receiver is powered, in parts per thousand.
-    ///
-    /// The figure the sentry's average current scales with: integer, so the
-    /// same number comes out on the board as on the host.
     pub fn duty_permille(&self) -> u32 {
         let cycle = self.cycle_us();
         if cycle == 0 {
@@ -321,10 +380,10 @@ impl Sentry {
         (u64::from(self.rx_us) * 1000 / u64::from(cycle)) as u32
     }
 
-    /// Time on air of a wake transmission carrying `payload_len` bytes,
-    /// microseconds - the long preamble and the frame behind it.
-    pub fn wake_airtime_us(&self, cfg: &RadioConfig, payload_len: usize) -> u32 {
-        cfg.time_on_air_preamble_us(payload_len, self.preamble_symbols)
+    /// Time on air of a wake transmission carrying `payload_len` bytes.
+    pub fn wake_airtime_us(&self, cfg: &RadioConfig, payload_len: usize) -> Option<u32> {
+        let syms = self.preamble_symbols(cfg)?;
+        Some(cfg.time_on_air_preamble_us(payload_len, syms))
     }
 
     /// The register value for the receive half.
@@ -341,8 +400,11 @@ impl Sentry {
 /// Why a sentry cannot be armed as asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Refusal {
-    /// The preamble the sleep period demands does not fit the 16-bit
-    /// packet-parameter field. Shorten the sleep.
+    /// No preamble satisfies both bounds: the receive window is too short to
+    /// cover detection and the header between them. Lengthen `rx_us`;
+    /// changing the sleep does not help, since it moves both bounds together.
+    NoPreambleFits,
+    /// The preamble the bounds allow does not fit the 16-bit field.
     PreambleTooLong,
     /// Either half-period overflows the chip's 24-bit timer.
     PeriodTooLong,
@@ -353,14 +415,11 @@ pub enum Refusal {
 
 /// Whether `sentry` can be armed on a node running `cfg`, for a wake
 /// transmission carrying `payload_len` bytes.
-///
-/// The dwell check is the one that is a refusal rather than a clamp. A wake
-/// preamble is seconds long by construction, which a single carrier may
-/// hold and a hopping plan may not, and shortening it to fit would leave a
-/// sentry that cannot be woken - a worse outcome than declining to arm one
-/// and saying so.
 pub fn check(cfg: &RadioConfig, sentry: &Sentry, payload_len: usize) -> Result<(), Refusal> {
-    if sentry.preamble_symbols > PREAMBLE_SYMBOLS_MAX {
+    let Some(syms) = sentry.preamble_symbols(cfg) else {
+        return Err(Refusal::NoPreambleFits);
+    };
+    if syms > PREAMBLE_SYMBOLS_MAX {
         return Err(Refusal::PreambleTooLong);
     }
     if duty_steps_from_us(sentry.rx_us) >= DUTY_STEPS_MAX
@@ -368,10 +427,23 @@ pub fn check(cfg: &RadioConfig, sentry: &Sentry, payload_len: usize) -> Result<(
     {
         return Err(Refusal::PeriodTooLong);
     }
-    if cfg.hop_channels > 1 && sentry.wake_airtime_us(cfg, payload_len) > FHSS_DWELL_MAX_US {
+    let airtime = sentry.wake_airtime_us(cfg, payload_len).unwrap_or(u32::MAX);
+    if cfg.hop_channels > 1 && airtime > FHSS_DWELL_MAX_US {
         return Err(Refusal::DwellExceeded);
     }
     Ok(())
+}
+
+/// Shortest receive window that admits any preamble at all, microseconds.
+///
+/// Half of what detection and the header cost together, since the chip's
+/// post-detection timer grants two receive windows for them. Below this a
+/// sentry cannot be woken at any sleep period or preamble length.
+pub fn min_rx_us(cfg: &RadioConfig, detect_symbols: u8, tcxo_us: u32) -> u32 {
+    let t_sym_us = cfg.symbol_time_us().max(1);
+    let detect_us = u32::from(detect_symbols) * t_sym_us;
+    let header_us = HEADER_SYMBOLS * t_sym_us;
+    (tcxo_us + detect_us + header_us).div_ceil(2)
 }
 
 #[cfg(test)]
@@ -527,84 +599,107 @@ mod tests {
         assert_eq!(classify_charge(commanded, commanded, 0), TcxoCharge::Unclear);
     }
 
+    /// The board's configured oscillator startup, microseconds.
+    const TCXO_US: u32 = 10_000;
+
     #[test]
-    fn a_one_second_sleep_needs_a_two_second_preamble() {
+    fn the_preamble_is_bounded_at_both_ends() {
         let c = cfg();
         let t_sym = c.symbol_time_us();
         assert_eq!(t_sym, 8_192, "SF12 at BW500");
-        let s = Sentry::new(&c, 1_000_000, 10_000, DETECT_SYMBOLS);
-        assert_eq!(s.rx_us, 4 * 8_192 + 10_000);
-        // 2 * 1 s + the window, in whole symbols.
-        let need = 2 * 1_000_000 + s.rx_us;
-        assert_eq!(s.preamble_symbols, need.div_ceil(t_sym));
-        // A preamble that covers two sleeps is a little over two seconds.
-        assert!(s.preamble_symbols * t_sym >= need);
-        assert!((2_000_000..2_200_000).contains(&(s.preamble_symbols * t_sym)));
+        let s = Sentry::new(&c, 1_000_000, 50_000, DETECT_SYMBOLS, TCXO_US);
+        // Below: deaf for the sleep and the oscillator restart, then the
+        // detect symbols have to fit in what is left of the preamble.
+        assert_eq!(s.preamble_min_us, 1_000_000 + TCXO_US + 4 * t_sym);
+        // Above: the chip's restarted timer, less the header behind it.
+        assert_eq!(s.preamble_max_us, 2 * s.rx_us + 1_000_000 - 8 * t_sym);
+        assert!(s.feasible());
+        let syms = s.preamble_symbols(&c).unwrap();
+        assert!(syms * t_sym >= s.preamble_min_us);
+        assert!(syms * t_sym <= s.preamble_max_us);
     }
 
     #[test]
-    fn the_duty_is_the_share_of_the_cycle_spent_listening() {
-        let s = Sentry::new(&cfg(), 1_000_000, 10_000, DETECT_SYMBOLS);
-        // ~43 ms in ~1043 ms.
-        assert_eq!(s.cycle_us(), s.rx_us + 1_000_000);
-        assert_eq!(s.duty_permille(), 41);
-        // Sleeping twice as long halves it, near enough: the window is
-        // unchanged, so the cycle it is a share of is what doubled.
-        let slow = Sentry::new(&cfg(), 2_000_000, 10_000, DETECT_SYMBOLS);
-        assert_eq!(slow.rx_us, s.rx_us);
-        assert_eq!(slow.duty_permille(), 20);
-    }
-
-    #[test]
-    fn a_longer_sleep_is_cheaper_and_costs_preamble() {
+    fn a_longer_preamble_is_not_the_safe_direction() {
+        // The failure this arithmetic exists to prevent. A preamble sized
+        // the intuitive way - long enough to span two whole cycles - sails
+        // past the upper bound, and the chip abandons it before the packet
+        // arrives. It fails exactly like one that is too short: silently,
+        // with the receiver awake.
         let c = cfg();
-        let fast = Sentry::new(&c, 1_000_000, 10_000, DETECT_SYMBOLS);
-        let slow = Sentry::new(&c, 4_000_000, 10_000, DETECT_SYMBOLS);
+        let s = Sentry::new(&c, 1_000_000, 50_000, DETECT_SYMBOLS, TCXO_US);
+        let intuitive_us = 2 * s.sleep_us + s.rx_us;
+        assert!(
+            intuitive_us > s.preamble_max_us,
+            "the obvious preamble must be over the bound, or this test proves nothing"
+        );
+    }
+
+    #[test]
+    fn the_receive_window_decides_whether_a_sentry_is_possible() {
+        let c = cfg();
+        let floor = min_rx_us(&c, DETECT_SYMBOLS, TCXO_US);
+        // A window under the floor admits no preamble at any sleep period,
+        // because the sleep moves both bounds together and cancels out.
+        let tiny = Sentry::new(&c, 1_000_000, 0, DETECT_SYMBOLS, TCXO_US);
+        assert!(tiny.rx_us < floor);
+        assert!(!tiny.feasible());
+        assert_eq!(check(&c, &tiny, 8), Err(Refusal::NoPreambleFits));
+        let slow = Sentry::new(&c, 60_000_000, 0, DETECT_SYMBOLS, TCXO_US);
+        assert!(!slow.feasible(), "a longer sleep cannot rescue a short window");
+        // Widen the window past the floor and it becomes possible.
+        let ok = Sentry::new(&c, 1_000_000, floor, DETECT_SYMBOLS, TCXO_US);
+        assert!(ok.rx_us >= floor);
+        assert!(ok.feasible());
+    }
+
+    #[test]
+    fn a_wider_window_buys_margin_and_costs_current() {
+        let c = cfg();
+        let narrow = Sentry::new(&c, 1_000_000, 50_000, DETECT_SYMBOLS, TCXO_US);
+        let wide = Sentry::new(&c, 1_000_000, 300_000, DETECT_SYMBOLS, TCXO_US);
+        // The only lever on the margin two free-running RC clocks need.
+        assert!(wide.preamble_window_us() > narrow.preamble_window_us());
+        assert!(wide.duty_permille() > narrow.duty_permille());
+    }
+
+    #[test]
+    fn the_oscillator_restart_lengthens_the_cycle() {
+        // The datasheet adds the startup between the sleep and the receive
+        // phases rather than taking it out of the window, so it shows up in
+        // the cycle and in the deaf gap, not in the listening time.
+        let c = cfg();
+        let s = Sentry::new(&c, 1_000_000, 50_000, DETECT_SYMBOLS, TCXO_US);
+        assert_eq!(s.cycle_us(), s.rx_us + s.sleep_us + TCXO_US);
+        let none = Sentry::new(&c, 1_000_000, 50_000, DETECT_SYMBOLS, 0);
+        assert_eq!(s.rx_us, none.rx_us, "the window is unchanged");
+        assert_eq!(s.preamble_min_us - none.preamble_min_us, TCXO_US);
+    }
+
+    #[test]
+    fn a_longer_sleep_is_cheaper_and_needs_more_preamble() {
+        let c = cfg();
+        let fast = Sentry::new(&c, 1_000_000, 300_000, DETECT_SYMBOLS, TCXO_US);
+        let slow = Sentry::new(&c, 4_000_000, 300_000, DETECT_SYMBOLS, TCXO_US);
         assert!(slow.duty_permille() < fast.duty_permille());
-        assert!(slow.preamble_symbols > fast.preamble_symbols);
+        assert!(slow.preamble_min_us > fast.preamble_min_us);
         assert!(slow.wake_airtime_us(&c, 8) > fast.wake_airtime_us(&c, 8));
-    }
-
-    #[test]
-    fn an_absorbed_startup_makes_every_window_longer() {
-        // The whole point of measuring: the same sleep period sized against
-        // a measured 10 ms overhead and a measured 25 ms one are different
-        // designs, and the second needs more preamble for the same sleep.
-        let c = cfg();
-        let cheap = Sentry::new(&c, 1_000_000, 10_000, DETECT_SYMBOLS);
-        let dear = Sentry::new(&c, 1_000_000, 25_000, DETECT_SYMBOLS);
-        assert_eq!(dear.rx_us - cheap.rx_us, 15_000);
-        assert!(dear.preamble_symbols > cheap.preamble_symbols);
     }
 
     #[test]
     fn one_carrier_takes_a_wake_preamble_and_a_hopping_plan_refuses_it() {
         let mut c = cfg();
-        let s = Sentry::new(&c, 1_000_000, 10_000, DETECT_SYMBOLS);
-        // The default is one channel, so there is no dwell limit to break.
+        let s = Sentry::new(&c, 1_000_000, 300_000, DETECT_SYMBOLS, TCXO_US);
         assert_eq!(c.hop_channels, 1);
         assert_eq!(check(&c, &s, 8), Ok(()));
-        // The same sentry on a hopping plan holds one carrier for seconds,
-        // which the band does not allow.
         c.hop_channels = 50;
-        assert!(s.wake_airtime_us(&c, 8) > FHSS_DWELL_MAX_US);
+        assert!(s.wake_airtime_us(&c, 8).unwrap() > FHSS_DWELL_MAX_US);
         assert_eq!(check(&c, &s, 8), Err(Refusal::DwellExceeded));
     }
 
     #[test]
-    fn a_sleep_too_long_to_encode_is_refused_before_it_is_armed() {
-        let c = cfg();
-        // Past the 24-bit field at 15.625 us a step, which is ~262 s.
-        let s = Sentry::new(&c, 300_000_000, 10_000, DETECT_SYMBOLS);
-        assert!(matches!(
-            check(&c, &s, 8),
-            Err(Refusal::PeriodTooLong | Refusal::PreambleTooLong)
-        ));
-    }
-
-    #[test]
     fn the_register_values_are_the_periods_in_chip_steps() {
-        let s = Sentry::new(&cfg(), 1_000_000, 10_000, DETECT_SYMBOLS);
+        let s = Sentry::new(&cfg(), 1_000_000, 300_000, DETECT_SYMBOLS, 10_000);
         assert_eq!(s.sleep_steps(), 64_000);
         assert_eq!(s.rx_steps(), duty_steps_from_us(s.rx_us));
         // Whatever the rounding, the encoded pair is never longer than what

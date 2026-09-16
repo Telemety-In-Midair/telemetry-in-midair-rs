@@ -129,62 +129,111 @@ other transmission this firmware makes:
 
 ## The sentry arithmetic
 
-`SetRxDutyCycle` (0x94) puts the chip in RX for `rxPeriod`, then sleep
-with retention for `sleepPeriod`, repeating. For a transmission never to
-fall entirely into a sleep phase, the preamble has to span a whole cycle.
-The datasheet's condition, conservatively:
+**Corrected against the SX1261/2 datasheet (DS.SX1261-2.W.APP rev 1.2,
+section 13.1.7) on 2026-09-15.** The first version of this section had the
+preamble constraint inverted, in a way that would have produced a wake
+nothing could ever receive. What follows is what the part actually does.
+
+`SetRxDutyCycle` (0x94) puts the chip in a sniff loop: receive for
+`rxPeriod`, then sleep with context retained for `sleepPeriod`, repeating,
+and it leaves the loop **on `RX_DONE`** - a completed packet - returning to
+`STDBY_RC`. Preamble detection does not end it. What preamble detection does
+is stop the window timer and restart it at `2 * rxPeriod + sleepPeriod`
+while the chip looks for a header.
+
+That restarted timer is the constraint nobody expects:
 
 ```text
-T_preamble >= 2 * T_sleep + T_rx
+Tpreamble + Theader <= 2 * rxPeriod + sleepPeriod
 ```
 
-`T_rx` has to cover the symbols the chip needs to declare a preamble -
-`SetLoRaSymbNumTimeout` (0xA0), four symbols is the usual floor - plus the
-TCXO startup, which on this module is `tcxo_startup_ms = 10` and is paid
-on **every** RX window, because DIO3 drops the oscillator during the
-radio's own sleep.
+**The preamble is bounded above, not below.** A preamble still running when
+that timer expires is abandoned and the packet behind it is never received.
+So the two bounds together are:
 
-That fixed 10 ms is what shapes the table. At the SF12/BW500 default a
-symbol is 8.192 ms, so four symbols is 33 ms and the TCXO is a third of
-the window; at SF7/BW500 a symbol is 256 us, four symbols is 1 ms, and the
-TCXO is the window.
+```text
+sleepPeriod + Ttcxo + Tdetect  <=  Tpreamble  <=  2 * rxPeriod + sleepPeriod - Theader
+```
 
-| Wake modulation | T_sleep | Preamble needed | Wake frame on air | Radio-on per cycle | Sentry average |
+The lower bound is the sampling requirement - the receiver is deaf for the
+sleep phase and the oscillator restart behind it, so a shorter preamble can
+fall entirely inside the gap. The upper bound is the chip's own timer. Past
+either one the wake silently stops working, and **a longer preamble is not
+the safe direction**.
+
+The version of this document written before the datasheet was read asked for
+`2 * sleepPeriod + rxPeriod`, which at a one-second sleep is 2.08 s against
+an upper bound of 1.10 s. Every wake frame would have been abandoned
+mid-preamble, on hardware, with the receiver awake and listening and nothing
+in any counter to say why.
+
+### What the bounds leave
+
+Subtract them and the sleep period cancels:
+
+```text
+margin = 2 * rxPeriod - (Theader + Tdetect + Ttcxo)
+```
+
+**The receive window sets the timing margin; the sleep period sets the
+current.** They are independent knobs, which is the useful shape of this.
+There is also a floor below which no sentry is possible at any sleep period
+or preamble length:
+
+```text
+rxPeriod >= (Theader + Tdetect + Ttcxo) / 2
+```
+
+At the SF12/BW500 default - 8192 us a symbol, four detect symbols, an
+eight-symbol header, and the board's 10 ms oscillator startup - that floor
+is **54 ms**, and the numbers come out:
+
+| sleep | rxPeriod | preamble window | margin | duty | sentry average |
 |-|-|-|-|-|-|
-| SF12/BW500 | 1 s | 250 sym / 2.05 s | ~2.2 s | 43 ms | ~0.25 mA |
-| SF12/BW500 | 2 s | 494 sym / 4.05 s | ~4.2 s | 43 ms | ~0.13 mA |
-| SF7/BW500 | 1 s | 4000 sym / 1.02 s | ~1.1 s | 11 ms | ~0.07 mA |
-| SF7/BW500 | 2 s | 7900 sym / 2.02 s | ~2.1 s | 11 ms | ~0.04 mA |
+| 1 s | 83 ms | 1.043 - 1.100 s | 57 ms | 7.6% | ~0.45 mA |
+| 1 s | 333 ms | 1.043 - 1.600 s | 557 ms | 24.8% | ~1.5 mA |
+| 4 s | 333 ms | 4.043 - 4.600 s | 557 ms | 7.7% | ~0.46 mA |
 
-Against ~25 mA averaged for a 60 s wake-check cadence. Every figure in
-that table is arithmetic from 6 mA of RX current and the datasheet's
-timings, not a measurement; the sentry average in particular ignores the
-SMPS and the wake transient, and the estimates in `POWER.md` have been
-wrong three times in the same direction.
+Against the earlier draft's ~0.25 mA, which assumed a window of 43 ms - under
+the 54 ms floor, so that configuration could not have worked at all.
 
-Two things to read off it.
+**The open question is now the margin, not the current.** The receiver's
+sleep period is timed by the SX1262's own RC oscillator, and the margin has
+to absorb its error over a whole sleep. At ten percent of a one-second sleep
+that is +/-100 ms against a 57 ms window - not enough - and buying margin
+means buying `rxPeriod`, which is the one thing that costs current directly.
+The datasheet does not specify it. Section 4.1.1 says only that the sleep
+timer runs on the RC64k, and 9.2 that RC64k is calibrated against the 32 MHz
+crystal at power-on and on a `Calibrate` command - so it starts accurate and
+drifts with temperature from there, by an amount the part does not commit
+to.
 
-**The duty cycle is not what picks the spreading factor - the TCXO is.**
-Halving the symbol time does not halve the duty, because the 10 ms
-oscillator startup does not move. SF7 is roughly 4x cheaper to listen on
-than SF12 for exactly that reason.
+That makes the margin a measurement rather than a derivation, and it gives
+the cadence half of E1 a better job than the one it was built for. Its
+original question - whether the oscillator startup is added or absorbed - the
+datasheet has now answered. What it can still do, and nothing else can, is
+time the real interval between receive windows against the commanded cycle:
+that ratio *is* the RC64k's rate, and watching it over a warm board is its
+drift. Those two numbers set `rxPeriod`, and `rxPeriod` is the only thing
+that buys margin.
 
-**But SF7 is about 10 dB less sensitive**, so a wake link at SF7 is
-substantially shorter than the SF12 telemetry link, and a board that can
-be heard cannot necessarily be woken. That is the wrong failure to design
-in. Default the wake modulation to the link's own, so wake range and
-telemetry range are the same number, and expose the low-SF variant as a
-config key for someone who knows their boards are close.
+### Two more things the datasheet settles
 
-**The preamble is a long transmission, and that is a band question.** At
-`hop_channels = 1` the node is a digital modulation system under
-15.247(a)(2) and there is no dwell limit, so a 2 s preamble is fine. With
-hopping on it is a frequency hopping system, capped at 400 ms per channel
-per 20 s, and a 2 s wake frame is not legal on one carrier. So: wake
-frames are a single-carrier feature, and the config refuses to arm a
-sentry whose wake frame would not fit the plan it is running - the same
-shape as the DIO2/DIO3 refusals, which is the precedent for the firmware
-declining a config rather than obeying it.
+**The oscillator startup is added, not absorbed.** "When using a TCXO
+controlled by the SX1261/2 itself, the startup delay defined in delay(23:0)
+will be added between the Sleep and Rx periods." So the cycle is `rxPeriod +
+sleepPeriod + tcxo`, the receive window listens for as long as it was
+commanded, and the deaf gap is the sleep plus the startup. That answers the
+question E1's cadence half was built to measure, without the bench.
+
+**Boosted receive gain is lost on every wake unless it is made to persist.**
+The Rx Gain register is not in the retention memory a warm start restores,
+and the datasheet calls the fix mandatory for `SetRxDutyCycle`: write 0x01
+to 0x029F, 0x08 to 0x02A0, 0xAC to 0x02A1. This firmware sets
+`RX_GAIN_BOOSTED` in `init` and `rx_boost` defaults on, so without that
+procedure every sentry window after the first quietly runs about 2 dB less
+sensitive than the link budget says - on the one link where sensitivity is
+the whole point.
 
 ## The fast-reject path
 
@@ -368,6 +417,13 @@ boot` across several boots. That is the second half of the waker's burst
 gap and it was previously a guess labelled four seconds. The wake itself
 is still unmeasured - it needs a board that deep sleeps, which the probe
 build does not.
+
+**The control passed and the duty cycle did not - but the test was
+invalid.** The datasheet since explained it: the sniff loop leaves on
+`RX_DONE`, and an infinite preamble never produces a packet, so the probe
+watched `PreambleDetected` on a signal that could not generate the event the
+mode reports. The table below stands as data; the conclusion drawn from it
+at the time - that the mechanism does not work - does not. It is untested.
 
 **The control passes and the duty cycle does not.** With a second board
 keying a continuous preamble at 0 dBm:
