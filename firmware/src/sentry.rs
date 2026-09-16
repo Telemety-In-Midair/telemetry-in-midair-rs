@@ -74,7 +74,7 @@ const SYMB_TIMEOUT: u8 = 8;
 /// sending frames, i.e. whether it was built `iso-sentry-carrier`.
 ///
 /// The two measurements want opposite signals and a run can only have one.
-const PEER_IS_CARRIER: bool = true;
+const PEER_IS_CARRIER: bool = false;
 
 /// Nominal sleep of the sentry under test, microseconds. What the chip is
 /// asked for is this corrected for its own timer.
