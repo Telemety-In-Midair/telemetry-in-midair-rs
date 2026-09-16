@@ -747,6 +747,22 @@ impl<'d> Sx1262Driver<'d> {
         );
     }
 
+    /// Arm plain continuous receive with `mask` routed to DIO1.
+    ///
+    /// The control for a duty-cycled arm: same radio, same signal, same
+    /// interrupt, but listening the whole time. A source that cannot be
+    /// heard by this either is not on the air or is not on these settings,
+    /// and that is a different problem from a receive window that is too
+    /// short - which the two otherwise report identically.
+    pub fn arm_continuous_rx(&mut self, mask: u16) {
+        self.rx_active = false;
+        self.radio.set_standby(StandbyClk::Rc);
+        self.radio.set_lora_packet_params(RX_MAX_PAYLOAD);
+        self.radio.set_dio_irq_params(mask);
+        self.radio.clear_irq_status(irq::ALL);
+        self.radio.set_rx(RX_CONTINUOUS);
+    }
+
     /// Whether the radio is asserting DIO1.
     pub fn irq_pending(&self) -> bool {
         self.radio.irq_pending()

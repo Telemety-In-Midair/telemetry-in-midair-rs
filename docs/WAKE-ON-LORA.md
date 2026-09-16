@@ -358,6 +358,61 @@ sequenceDiagram
     App->>A: BLE connect
 ```
 
+## What the bench said, 2026-09-15
+
+First run of E1 on two boards. One number, one hard negative, and two
+faults in the probe that had to be fixed before either could be read.
+
+**Boot latency (E3), measured.** `boot: radio up 585-636 ms into this
+boot` across several boots. That is the second half of the waker's burst
+gap and it was previously a guess labelled four seconds. The wake itself
+is still unmeasured - it needs a board that deep sleeps, which the probe
+build does not.
+
+**The control passes and the duty cycle does not.** With a second board
+keying a continuous preamble at 0 dBm:
+
+| Receiver | Preamble detections |
+|-|-|
+| Continuous RX, 10 s | **2 to 21**, `radio rx err 0x0000` |
+| `SetRxDutyCycle`, 90 s | **0** |
+
+Same board, same radio, same interrupt line, same settings, same source,
+minutes apart. So the link, the frequency, the modulation and the source
+are all good, and the thing that does not work is the duty cycle. This is
+risk 1, and it has landed on the wrong side.
+
+**The chip is unreadable over SPI while it is cycling, and reading it
+anyway breaks the cycle.** A status read during the cadence returns
+`0xFFFF` - which this driver already documents as nothing answering rather
+than a mode - because the chip is in its sleep phase between windows. That
+is the intended behavior, but it has a consequence the design has to
+absorb: `sleep.rs` notes the SX1262 leaves sleep on a **falling edge of
+NSS**, so any SPI transaction during a sleep phase pulls the radio out of
+the duty cycle. A sentry therefore cannot be polled, health-checked or
+diagnosed over SPI while it is armed. Every instrument has to be DIO1 or
+nothing, and the "log the chip's mode on every wake" idea under risk 2
+needs rethinking - it is safe on the wake path, where the cycle has already
+ended, and destructive anywhere else.
+
+**Not yet explained.** Why a window of 82.8 ms - 72 ms of listening after
+the 10 ms oscillator startup, against four symbols needing 32.8 ms - hears
+nothing when continuous receive on the same settings hears the same signal
+seconds earlier. The candidates are the TCXO interaction with the
+duty-cycle timer, `SetLoRaSymbNumTimeout` behavior inside the cycle, and
+whether the receiver restarts cleanly each window with a TCXO rather than a
+crystal. That is datasheet work and a scope on the supply, not another
+blind run.
+
+**Two faults in the probe, both found by running it.** A 1 ms poll on the
+second core reset the board under the hardware watchdog by starving the
+monitor on the first - normal firmware on the same board was stable for 70 s
+as the control, and 10 ms took the resets to zero. And the probe could not
+tell a silent source from a dead duty cycle, which is why the control phase
+above now runs first and stops the run when it fails: without it, the
+headline result would have read as "nothing works" rather than "one of these
+two works".
+
 ## Risks, in the order they would sink it
 
 1. **`SetRxDutyCycle` with a TCXO.** The chip restarts DIO3 and waits

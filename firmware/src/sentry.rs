@@ -97,9 +97,17 @@ const SOURCE_MAX_DBM: i8 = 10;
 ///
 /// The pin latches high until the interrupt is cleared, so this sets the
 /// resolution of a timestamp and not whether a detection is seen at all.
-/// One millisecond against a cycle of about a second is a tenth of a
-/// percent, which is well inside the chip's own RC timebase.
-const POLL_MS: u64 = 1;
+/// Ten milliseconds against a cycle of about a second is one percent, which
+/// is inside the chip's own RC timebase and so costs nothing real.
+///
+/// It is not set by the resolution wanted but by what the rest of the board
+/// can afford. Every wait is a timer-queue operation under a critical
+/// section this chip shares between its two cores, so a poll of one
+/// millisecond puts a thousand of them a second against everything else
+/// running - and the task that loses is the watchdog monitor on the other
+/// core, which stops feeding and resets the board. Poll no faster than the
+/// measurement needs.
+const POLL_MS: u64 = 10;
 
 /// Run the probe. Does not return.
 ///
@@ -113,7 +121,23 @@ pub async fn probe(radio: &mut Sx1262Driver<'_>) -> ! {
         t_sym, DETECT_SYMBOLS, listening);
     println!("sentry probe: source must be keying a continuous preamble on the same settings");
 
-    cadence(radio, listening).await;
+    // The control first. Everything after it assumes a signal is reachable,
+    // and without this a silent source and a duty cycle that never ran
+    // produce the same "nothing detected" from every phase below.
+    if !hearing(radio).await {
+        println!("sentry probe: STOPPING - nothing to measure against");
+        loop {
+            watchdog::beat(Task::Loop, Phase::Receive);
+            Timer::after(Duration::from_millis(500)).await;
+        }
+    }
+    if !cadence(radio, listening).await {
+        println!("sentry probe: STOPPING - the sweep is the same arm forty times over");
+        loop {
+            watchdog::beat(Task::Loop, Phase::Receive);
+            Timer::after(Duration::from_millis(500)).await;
+        }
+    }
     let steps = sweep(radio, listening).await;
 
     println!("sentry probe:");
@@ -146,13 +170,48 @@ pub async fn probe(radio: &mut Sx1262Driver<'_>) -> ! {
     }
 }
 
+/// Listen continuously for a few seconds and say whether anything is there.
+///
+/// The control for the whole run: it uses the same radio, the same
+/// interrupt and the same settings as every measurement below, and differs
+/// only in never sleeping. So a failure here is the link - a source that is
+/// off, on other settings, or out of range - and a failure below it with
+/// this passing is the receive window, which is the thing being measured.
+async fn hearing(radio: &mut Sx1262Driver<'_>) -> bool {
+    const LISTEN_S: u64 = 10;
+    println!("sentry probe: listening continuously for {} s as a control", LISTEN_S);
+    radio.arm_continuous_rx(irq::PREAMBLE_DETECTED);
+    let until = Instant::now() + Duration::from_secs(LISTEN_S);
+    let mut seen = 0u32;
+    while Instant::now() < until {
+        watchdog::beat(Task::Loop, Phase::Receive);
+        if radio.irq_pending() {
+            let status = radio.take_irq();
+            if status & irq::PREAMBLE_DETECTED != 0 {
+                seen += 1;
+            }
+        }
+        Timer::after(Duration::from_millis(POLL_MS)).await;
+    }
+    let (mode, err) = radio.health();
+    println!(
+        "sentry probe: control saw {} preamble detections, radio {} err 0x{:04X}",
+        seen, mode, err
+    );
+    if seen == 0 {
+        println!("sentry probe: CONTROL FAILED - the source is not reachable on these settings");
+        println!("sentry probe: check it is still keyed, and that both boards share frequency and modulation");
+    }
+    seen > 0
+}
+
 /// Arm once and time the detections that follow.
 ///
 /// Gaps are tolerated rather than treated as the end of the run. A source
 /// that stops transmitting and a chip that stops cycling look identical
 /// from one timeout, and they are not the same finding - so this keeps
 /// waiting and lets the interval lengths separate them afterwards.
-async fn cadence(radio: &mut Sx1262Driver<'_>, listening: u32) {
+async fn cadence(radio: &mut Sx1262Driver<'_>, listening: u32) -> bool {
     // A generous window: this half is about the cycle, not about how short
     // a window can be, so nothing here should fail for want of listening
     // time.
@@ -163,6 +222,16 @@ async fn cadence(radio: &mut Sx1262Driver<'_>, listening: u32) {
         rx_us, SLEEP_US, commanded
     );
     radio.arm_duty_cycle(rx_us, SLEEP_US, DETECT_SYMBOLS, irq::PREAMBLE_DETECTED);
+
+    // What mode the chip actually went to, sampled across a cycle. The
+    // command either took or it did not, and that is the difference between
+    // a receive window too short to hear anything and a chip that never
+    // entered the cycle at all - which nothing else here can tell apart.
+    for i in 0..6 {
+        Timer::after(Duration::from_millis(200)).await;
+        let (mode, err) = radio.health();
+        println!("sentry probe: armed +{} ms, radio {} err 0x{:04X}", (i + 1) * 200, mode, err);
+    }
 
     // Per-wait deadline, and the budget for the whole collection.
     let wait = Duration::from_micros(u64::from(commanded) * u64::from(TRIAL_CYCLES));
@@ -197,7 +266,7 @@ async fn cadence(radio: &mut Sx1262Driver<'_>, listening: u32) {
             println!("sentry probe: cadence FAILED - detections, but never two a cycle apart");
             println!("sentry probe: the chip is not staying in the cycle, or the source is barely on");
         }
-        return;
+        return false;
     };
     println!(
         "sentry probe: {} at the cycle, {} over it (gaps in the source)",
@@ -225,6 +294,7 @@ async fn cadence(radio: &mut Sx1262Driver<'_>, listening: u32) {
             i.mean_us, commanded
         ),
     }
+    true
 }
 
 /// Walk the window down and count what still detects.
@@ -263,8 +333,16 @@ async fn sweep(radio: &mut Sx1262Driver<'_>, listening: u32) -> heapless::Vec<Sw
 /// `None` if `deadline` passed with the pin quiet.
 async fn wait_for_detect(radio: &mut Sx1262Driver<'_>, deadline: Duration) -> Option<Instant> {
     let give_up = Instant::now() + deadline;
+    // Progress, so a run that stops says where it stopped. Without it a
+    // reset mid-sweep is indistinguishable from one mid-wait, and the sweep
+    // rows only print when a whole step is done.
+    let mut said = Instant::now();
     loop {
         watchdog::beat(Task::Loop, Phase::Receive);
+        if Instant::now() - said > Duration::from_secs(20) {
+            println!("sentry probe: still waiting, {} s into a wait", (Instant::now() - give_up + deadline).as_secs());
+            said = Instant::now();
+        }
         if radio.irq_pending() {
             let at = Instant::now();
             let status = radio.take_irq();
@@ -343,7 +421,15 @@ pub async fn source(radio: &mut Sx1262Driver<'_>) -> ! {
                 park().await
             }
             let left = (until - Instant::now()).as_secs();
-            println!("sentry source: still keyed, radio {}, {} s left", mode, left);
+            // The power is on this line and not only on the one at boot,
+            // because the boot line scrolls away and this is the fact worth
+            // being able to confirm at any moment: a console attached
+            // halfway through a run should still be able to say what the PA
+            // is doing, without trusting that a config push earlier landed.
+            println!(
+                "sentry source: still keyed at {} dBm, radio {}, {} s left",
+                dbm, mode, left
+            );
             said = Instant::now();
         }
         Timer::after(Duration::from_millis(200)).await;
