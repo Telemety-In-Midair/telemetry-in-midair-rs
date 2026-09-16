@@ -541,21 +541,53 @@ because the chip's restarted timer has to contain the whole packet rather
 than the header the datasheet's formula names - the arithmetic here now
 counts the payload, and it is right to - but it was not what was limiting.
 
-**The channel is loud.** This is where the evidence points. Continuous
-receive sees about 36 preamble detections in ten seconds while two real
-frames arrive, so roughly 3.4 false detections a second on an otherwise
-empty channel. A duty cycle listening 16.5 s in 100 s should see about 58 of
-them, and saw 39 - so the preamble counter is measuring noise, not frames.
-Each false detection restarts the chip's timer and holds the receiver
-looking for a header that will never come, which at that rate consumes
-nearly every window before a real frame can land.
+**Not the channel either, though the band is worth knowing.** A survey of
+seven carriers at both gain settings, with nothing transmitting:
 
-That makes the next tests environmental rather than arithmetic: whether the
-rate falls with `rx_boost` off, whether it falls on another carrier, and
-what it is on a quiet bench somewhere else. A wake design that assumes a
-window is free to wait is a different design from one where a window is
-usually already busy - and which of those this band is decides how much of
-the plan above survives.
+| MHz | boost on | boost off |
+|-|-|-|
+| 903 | 0.3/s | 1.3/s |
+| 907 | 1.1 | 1.3 |
+| 911 | 1.6 | 2.0 |
+| 915 | 1.1 | 0.8 |
+| 919 | 1.8 | 2.3 |
+| 923 | 1.1 | 1.1 |
+| **927** | **0.1** | **0.1** |
+
+927 MHz is about ten times quieter than the rest, and the gain barely moves
+any of it - so these are real signals in the band rather than sensitivity
+the receiver is manufacturing, and `rx_boost` is not the lever. Moving both
+boards there made the wake rate *worse*, not better, which rules noise out
+as the limit.
+
+It also corrects an earlier reading in this document. The 3.4 detections a
+second inferred from a control run was inflated: that control ran while the
+source was transmitting, and a 1.2 s preamble re-triggers detection
+repeatedly as the interrupt is cleared, so one frame was counted many times.
+Ambient at 915 is about 1.1/s.
+
+**What the quiet carrier exposed.** With the noise gone the numbers separate
+cleanly, and they say the receive window is worth far less than its length:
+
+| receiver | detections per second *of listening* |
+|-|-|
+| continuous receive | 1.1 |
+| duty cycled, 200 ms window | 0.12 |
+
+Same board, same signal, same carrier, minutes apart - and a duty-cycled
+window detects about nine times less per second spent listening than a
+continuous receiver does. A window is not simply a slice of continuous
+receive: the chip restarts the receiver at every one, and the settling
+appears to consume most of a two-hundred-millisecond window rather than the
+ten milliseconds the oscillator figure in this document assumes.
+
+That is a measurable quantity, and measuring it is what E1's sweep was
+written for - walk the window down and find the shortest one that still
+detects reliably, and the difference between that and the symbols it was
+listening for is the real per-window cost. It has never run: every attempt
+died in the cadence phase ahead of it. It is the next thing to do, and until
+it has a number every window and preamble in this document is sized on an
+assumption the bench has now contradicted.
 
 ## Risks, in the order they would sink it
 

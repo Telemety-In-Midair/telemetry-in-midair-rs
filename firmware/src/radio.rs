@@ -888,6 +888,36 @@ impl<'d> Sx1262Driver<'d> {
         err
     }
 
+    /// Retune the receiver, leaving everything else alone.
+    ///
+    /// For surveying a band rather than for operating in one: the hop plan
+    /// owns the carrier during normal running and will move it back at its
+    /// next slot.
+    pub fn tune(&mut self, hz: u32) {
+        self.radio.set_standby(StandbyClk::Rc);
+        self.radio.set_rf_frequency(hz);
+        self.hop.carrier_hz = hz;
+    }
+
+    /// The carrier the receiver is on.
+    pub fn carrier_hz(&self) -> u32 {
+        self.cfg.frequency_hz
+    }
+
+    /// Boosted receive gain, or the chip's power-saving default.
+    ///
+    /// Boost is about two decibels of sensitivity, and sensitivity is not
+    /// free on a duty cycle: a receiver that hears more also raises more
+    /// false preamble detections, and each of those holds a window open
+    /// hunting a header that will never arrive.
+    pub fn set_rx_boost(&mut self, on: bool) {
+        self.radio.set_standby(StandbyClk::Rc);
+        self.radio.write_reg(
+            reg::RX_GAIN,
+            if on { reg::RX_GAIN_BOOSTED } else { reg::RX_GAIN_POWER_SAVING },
+        );
+    }
+
     /// Latched operational errors, as the chip reports them.
     pub fn device_errors(&mut self) -> u16 {
         self.radio.device_errors()

@@ -195,7 +195,12 @@ pub async fn probe(radio: &mut Sx1262Driver<'_>) -> ! {
         t_sym, DETECT_SYMBOLS, listening);
     println!("sentry probe: source must be keying a continuous preamble on the same settings");
 
-    // The chip's own timebase first: it needs no source, and what it
+    // The band first, because it decides whether the rest is worth
+    // reading: a window that is usually already busy with a false
+    // detection cannot be waiting for a frame.
+    noise_survey(radio).await;
+
+    // The chip's own timebase next: it needs no source, and what it
     // measures is what decides how wide every window below has to be.
     let rc = rc_timebase(radio).await;
 
@@ -414,6 +419,80 @@ fn cfg_of(radio: &Sx1262Driver<'_>) -> midair_proto::radiocfg::RadioConfig {
     let mut cfg = midair_proto::radiocfg::RadioConfig::default();
     cfg.spreading_factor = sf_for(radio.symbol_time_us());
     cfg
+}
+
+/// Count false preamble detections across the band and both gain settings.
+///
+/// A duty-cycled receiver is only listening for a fraction of each cycle,
+/// so it can afford that window to be spent on the signal it is waiting
+/// for and not much else. A false detection is not free: the chip restarts
+/// its timer and holds the receiver hunting a header that will never
+/// arrive, so a channel busy enough will consume most windows before a real
+/// frame lands.
+///
+/// Nothing may be transmitting while this runs, or it measures the source.
+/// What it produces is the one number the wake design needs from the
+/// environment - detections a second - for each carrier and gain, so a
+/// quiet corner of the band can be picked rather than assumed.
+async fn noise_survey(radio: &mut Sx1262Driver<'_>) {
+    /// Seconds of continuous receive per condition.
+    const DWELL_S: u64 = 6;
+    /// Carriers to try, Hz. The 902-928 MHz band, sampled across.
+    const CARRIERS: [u32; 7] = [
+        903_000_000,
+        907_000_000,
+        911_000_000,
+        915_000_000,
+        919_000_000,
+        923_000_000,
+        927_000_000,
+    ];
+
+    let home = radio.carrier_hz();
+    println!("sentry probe: noise survey, {} s a condition, nothing may be transmitting", DWELL_S);
+    println!("sentry probe:      MHz  boost   detections  per second");
+    let mut best = (u32::MAX, home, true);
+    for boost in [true, false] {
+        for hz in CARRIERS {
+            radio.set_rx_boost(boost);
+            radio.tune(hz);
+            radio.arm_continuous_rx(irq::PREAMBLE_DETECTED);
+            let until = Instant::now() + Duration::from_secs(DWELL_S);
+            let mut seen = 0u32;
+            while Instant::now() < until {
+                watchdog::beat(Task::Loop, Phase::Receive);
+                if radio.irq_pending() && radio.take_irq() & irq::PREAMBLE_DETECTED != 0 {
+                    seen += 1;
+                }
+                Timer::after(Duration::from_millis(POLL_MS)).await;
+            }
+            // Tenths, so the table stays integer and still separates a
+            // quiet carrier from a merely quieter one.
+            let per_s_tenths = u64::from(seen) * 10 / DWELL_S;
+            println!(
+                "sentry probe: {:>8}  {:>5}   {:>10}  {}.{}",
+                hz / 1_000_000,
+                if boost { "on" } else { "off" },
+                seen,
+                per_s_tenths / 10,
+                per_s_tenths % 10
+            );
+            if seen < best.0 {
+                best = (seen, hz, boost);
+            }
+        }
+    }
+    println!(
+        "sentry probe: quietest {} MHz with boost {} - {} in {} s",
+        best.1 / 1_000_000,
+        if best.2 { "on" } else { "off" },
+        best.0,
+        DWELL_S
+    );
+    // Put the radio back where the config wants it; the phases below are
+    // about the link, not the band.
+    radio.set_rx_boost(true);
+    radio.tune(home);
 }
 
 /// Time the chip's own sleep timer against the host's crystal.
