@@ -519,6 +519,44 @@ send. A one-in-ten hit rate needs a burst ten frames long, which at 1.2 s a
 frame is a twelve-second wake - workable, but worth understanding before it
 is designed around.
 
+## Why the hit rate is low, as far as it is understood
+
+The wake works and lands about one frame in ten. Four things were tested
+against that, and the useful part is what they ruled out.
+
+**Not the re-arm.** Every arm was verified in its first receive window -
+the one moment a status read cannot disturb the cycle - and all of them
+took. A sentry does not degrade into a one-shot.
+
+**Not the symbol timeout, and it must not be zero.** Four symbols and eight
+behaved the same. Zero woke on nothing at all in 150 s, because a non-zero
+`SetLoRaSymbNumTimeout` is also what holds the window open for the rest of a
+packet once the modem has validated one. The setting whose name reads like
+"listen freely" is the one that guarantees a duty-cycled receiver never
+completes a reception.
+
+**Not the receive window.** Doubling it from 100 ms to 200 ms changed
+nothing: 39 preambles and 2 headers either way. This was expected to help,
+because the chip's restarted timer has to contain the whole packet rather
+than the header the datasheet's formula names - the arithmetic here now
+counts the payload, and it is right to - but it was not what was limiting.
+
+**The channel is loud.** This is where the evidence points. Continuous
+receive sees about 36 preamble detections in ten seconds while two real
+frames arrive, so roughly 3.4 false detections a second on an otherwise
+empty channel. A duty cycle listening 16.5 s in 100 s should see about 58 of
+them, and saw 39 - so the preamble counter is measuring noise, not frames.
+Each false detection restarts the chip's timer and holds the receiver
+looking for a header that will never come, which at that rate consumes
+nearly every window before a real frame can land.
+
+That makes the next tests environmental rather than arithmetic: whether the
+rate falls with `rx_boost` off, whether it falls on another carrier, and
+what it is on a quiet bench somewhere else. A wake design that assumes a
+window is free to wait is a different design from one where a window is
+usually already busy - and which of those this band is decides how much of
+the plan above survives.
+
 ## Risks, in the order they would sink it
 
 1. **`SetRxDutyCycle` with a TCXO.** The chip restarts DIO3 and waits

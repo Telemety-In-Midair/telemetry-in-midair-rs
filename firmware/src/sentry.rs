@@ -53,7 +53,7 @@ fn geometry(radio: &Sx1262Driver<'_>) -> midair_proto::sentry::Sentry {
     // none of it, and the point of a first run is to find out whether the
     // mechanism works at all rather than how cheaply it can be made to.
     let overhead = SENTRY_RX_US.saturating_sub(u32::from(SYMB_TIMEOUT) * radio.symbol_time_us());
-    midair_proto::sentry::Sentry::new(&cfg, SENTRY_SLEEP_US, overhead, SYMB_TIMEOUT, TCXO_US)
+    midair_proto::sentry::Sentry::new(&cfg, SENTRY_SLEEP_US, overhead, SYMB_TIMEOUT, TCXO_US, WAKE_PAYLOAD.len())
 }
 
 /// Symbols the modem is given to validate a signal, for both the chip and
@@ -76,7 +76,13 @@ const SYMB_TIMEOUT: u8 = 8;
 const SENTRY_SLEEP_US: u32 = 1_000_000;
 
 /// Receive window of the sentry under test, microseconds.
-const SENTRY_RX_US: u32 = 100_000;
+///
+/// Two hundred rather than the hundred the first runs used. The chip's
+/// restarted timer has to contain the whole packet and not just its header,
+/// so at a hundred no preamble fits at all - measured as thirty-nine
+/// detected preambles producing two headers, the two being those detected
+/// late enough in the preamble that the rest of the frame still fit.
+const SENTRY_RX_US: u32 = 200_000;
 
 /// Sleep half of the cycle under test, microseconds.
 ///
@@ -134,6 +140,21 @@ const TCXO_US: u32 = 10_000;
 /// point - a real packet is, because only a completed reception ends the
 /// chip's sniff loop.
 const WAKE_PAYLOAD: &[u8] = b"wake";
+
+/// Seconds the source stays off the air before its first frame.
+///
+/// The probe opens by timing its own sleep oscillator, and that measurement
+/// times a receive window against the host clock - so a window that hears a
+/// preamble is no longer measuring an oscillator. Filtering the spoiled
+/// trials is not enough, because a preamble can perturb the receive timer
+/// without leaving an interrupt to filter on: measured beside live traffic
+/// the same chip reads +10686 ppm and -4462 ppm in different runs, both
+/// repeatably.
+///
+/// So the channel is left quiet for long enough that the measurement
+/// finishes first. It costs one silent period per bench run and removes the
+/// whole failure, which no amount of filtering did.
+const QUIET_FIRST_S: u64 = 45;
 
 /// Seconds between wake frames. Long enough that a receiver woken by one is
 /// re-armed well before the next.
@@ -278,6 +299,9 @@ async fn wake_test(radio: &mut Sx1262Driver<'_>, rc: Option<&midair_proto::sentr
     let mut woken = 0u32;
     let mut arms = 0u32;
     let mut arms_verified = 0u32;
+    let mut preambles = 0u32;
+    let mut headers = 0u32;
+    let mut crc_errs = 0u32;
     // Set by the first `arm!` before anything reads it.
     let mut armed_at;
     let mut said = Instant::now();
@@ -291,7 +315,18 @@ async fn wake_test(radio: &mut Sx1262Driver<'_>, rc: Option<&midair_proto::sentr
             // nothing until an NSS edge wakes it - so the arm that follows
             // would otherwise be spent doing that and be lost.
             radio.wake_from_retained_sleep().await;
-            radio.arm_duty_cycle(rx_cmd, sleep_cmd, SYMB_TIMEOUT, irq::RX_DONE);
+            // Every stage of a reception, not just its end. A wake that
+            // does not happen is one of three different failures - a window
+            // that never caught the preamble, a preamble that never became
+            // a header, or a header whose packet failed - and they want
+            // different fixes. All three fire while the chip is awake in a
+            // window, so reading them cannot disturb the cycle.
+            radio.arm_duty_cycle(
+                rx_cmd,
+                sleep_cmd,
+                SYMB_TIMEOUT,
+                irq::RX_DONE | irq::PREAMBLE_DETECTED | irq::HEADER_VALID | irq::CRC_ERR,
+            );
             arms += 1;
             armed_at = Instant::now();
             // Inside the first receive window, so this read cannot disturb
@@ -313,6 +348,15 @@ async fn wake_test(radio: &mut Sx1262Driver<'_>, rc: Option<&midair_proto::sentr
         watchdog::beat(Task::Loop, Phase::Receive);
         if radio.irq_pending() {
             let status = radio.take_irq();
+            if status & irq::PREAMBLE_DETECTED != 0 {
+                preambles += 1;
+            }
+            if status & irq::HEADER_VALID != 0 {
+                headers += 1;
+            }
+            if status & irq::CRC_ERR != 0 {
+                crc_errs += 1;
+            }
             if status & irq::RX_DONE != 0 {
                 woken += 1;
                 println!(
@@ -341,6 +385,21 @@ async fn wake_test(radio: &mut Sx1262Driver<'_>, rc: Option<&midair_proto::sentr
         "sentry probe: {} wakes from {} arms, {} of those arms verified rx",
         woken, arms, arms_verified
     );
+    // Where the frames that did not wake it got to. Each step is a
+    // different failure with a different fix, and the counts say which.
+    println!(
+        "sentry probe: {} preambles -> {} headers -> {} wakes ({} crc errors)",
+        preambles, headers, woken, crc_errs
+    );
+    if preambles == 0 {
+        println!("sentry probe: STAGE windows are not catching the preamble - geometry or margin");
+    } else if headers < preambles / 2 {
+        println!("sentry probe: STAGE preambles caught but not becoming headers - the window closes too early");
+    } else if woken < headers / 2 {
+        println!("sentry probe: STAGE headers decoded but packets not completing - length or crc");
+    } else {
+        println!("sentry probe: STAGE receptions complete once started - the misses are earlier");
+    }
     if arms_verified < arms {
         println!("sentry probe: VERDICT re-arms are being eaten - {} of {} did not take", arms - arms_verified, arms);
     } else if woken == 0 {
@@ -473,14 +532,14 @@ async fn rc_timebase(radio: &mut Sx1262Driver<'_>) -> Option<midair_proto::sentr
 fn min_rx_us_for(t_sym_us: u32) -> u32 {
     let mut cfg = midair_proto::radiocfg::RadioConfig::default();
     cfg.spreading_factor = sf_for(t_sym_us);
-    min_rx_us(&cfg, DETECT_SYMBOLS, TCXO_US)
+    min_rx_us(&cfg, SYMB_TIMEOUT, TCXO_US, WAKE_PAYLOAD.len())
 }
 
 /// The window a measured drift demands, for the running modulation.
 fn min_rx_for_margin_us(t_sym_us: u32, sleep_us: u32, ppm: u32) -> u32 {
     let mut cfg = midair_proto::radiocfg::RadioConfig::default();
     cfg.spreading_factor = sf_for(t_sym_us);
-    min_rx_for_margin(&cfg, DETECT_SYMBOLS, TCXO_US, sleep_us, ppm)
+    min_rx_for_margin(&cfg, SYMB_TIMEOUT, TCXO_US, sleep_us, ppm, WAKE_PAYLOAD.len())
 }
 
 /// Recover the spreading factor from the symbol time at the default 500 kHz
@@ -736,6 +795,12 @@ pub async fn source(radio: &mut Sx1262Driver<'_>) -> ! {
         "sentry source: {} dBm, {}-symbol preamble, {} ms on air, every {} s for {} s",
         dbm, preamble, airtime_ms, SEND_EVERY_S, SOURCE_MAX_KEYED_S
     );
+
+    println!(
+        "sentry source: quiet for {} s so the receiver can time its own oscillator first",
+        QUIET_FIRST_S
+    );
+    hold(QUIET_FIRST_S).await;
 
     let until = Instant::now() + Duration::from_secs(SOURCE_MAX_KEYED_S);
     let mut sent = 0u32;
