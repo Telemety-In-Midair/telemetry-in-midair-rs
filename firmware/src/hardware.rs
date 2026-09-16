@@ -252,7 +252,11 @@ impl Hardware {
     // unreachable on purpose. Scoped to those features so the warning still
     // means something in the build that ships.
     #[cfg_attr(
-        any(feature = "iso-sentry-probe", feature = "iso-sentry-source"),
+        any(
+            feature = "iso-sentry-probe",
+            feature = "iso-sentry-source",
+            feature = "iso-sentry-carrier"
+        ),
         allow(unreachable_code)
     )]
     pub async fn boot(&mut self, boot: Mode, boot_fx: Effects, stored: &Stored) {
@@ -298,6 +302,8 @@ impl Hardware {
         crate::sentry::probe(self.node.radio_mut()).await;
         #[cfg(feature = "iso-sentry-source")]
         crate::sentry::source(self.node.radio_mut()).await;
+        #[cfg(feature = "iso-sentry-carrier")]
+        crate::sentry::carrier(self.node.radio_mut()).await;
 
         match boot {
             Mode::Tracking => status_println!(

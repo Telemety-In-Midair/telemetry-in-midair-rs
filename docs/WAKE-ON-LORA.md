@@ -566,28 +566,39 @@ source was transmitting, and a 1.2 s preamble re-triggers detection
 repeatedly as the interrupt is cleared, so one frame was counted many times.
 Ambient at 915 is about 1.1/s.
 
-**What the quiet carrier exposed.** With the noise gone the numbers separate
-cleanly, and they say the receive window is worth far less than its length:
+**A duty cycle does not report preamble detection at all.** The sweep
+finally ran, and read zero out of fifteen at every window from 33 ms to
+432 ms - twice, once with the arm-eaten bug that had been hiding in it and
+once without. A 432 ms window detecting nothing, on a board whose continuous
+receive hears the same carrier in the same minute, is not a timing effect at
+any plausible per-window cost.
 
-| receiver | detections per second *of listening* |
+| configuration | preamble detections |
 |-|-|
-| continuous receive | 1.1 |
-| duty cycled, 200 ms window | 0.12 |
+| continuous receive, `PreambleDetected` | 5 to 36 per 10 s |
+| duty cycle, `PreambleDetected` alone | **0**, every window length, twice |
+| duty cycle, `RxDone` in the mask | wakes happen |
 
-Same board, same signal, same carrier, minutes apart - and a duty-cycled
-window detects about nine times less per second spent listening than a
-continuous receiver does. A window is not simply a slice of continuous
-receive: the chip restarts the receiver at every one, and the settling
-appears to consume most of a two-hundred-millisecond window rather than the
-ten milliseconds the oscillator figure in this document assumes.
+So `PreambleDetected` is not an observable inside `SetRxDutyCycle`. The only
+thing that reports from a sniff loop is a completed reception, which is
+consistent with the datasheet describing the loop as leaving on `RX_DONE`
+and saying nothing about routing anything else.
 
-That is a measurable quantity, and measuring it is what E1's sweep was
-written for - walk the window down and find the shortest one that still
-detects reliably, and the difference between that and the symbols it was
-listening for is the real per-window cost. It has never run: every attempt
-died in the cadence phase ahead of it. It is the next thing to do, and until
-it has a number every window and preamble in this document is sized on an
-assumption the bench has now contradicted.
+**Two consequences, and the second retracts something above.** The sweep as
+designed cannot measure a duty-cycled window, because the event it counts
+does not occur in that mode: per-window cost can only be inferred from
+reception *rate*, which needs the frame source and is a far coarser
+instrument. And an earlier reading in this document - that a duty-cycled
+window detects about nine times less per second of listening than a
+continuous one - compared a duty-cycle preamble count against a
+continuous-receive preamble count, which are not the same measurement. It is
+withdrawn. Per-window overhead remains unmeasured.
+
+What that leaves is the original question, unexplained: a wake lands about
+one frame in ten where the geometry says nearly all should. Four things have
+been ruled out with evidence - the re-arm, the symbol timeout, the window
+width, and the noise floor - and the instruments that would have narrowed it
+further turn out not to work in the mode being measured.
 
 ## Risks, in the order they would sink it
 

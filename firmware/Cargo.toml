@@ -58,6 +58,12 @@ iso-ble-no-modem-sleep = []
 # first, and never build both into one image.
 iso-sentry-probe = []
 iso-sentry-source = []
+# The source as a bare carrier instead of frames: keys a continuous preamble
+# so a duty-cycled receiver has something always present to detect. That is
+# what the window sweep measures against - it asks whether a window detects,
+# not whether it receives, so a signal that never becomes a packet is the
+# right one. Never build it with iso-sentry-source.
+iso-sentry-carrier = []
 
 # Bench faults, for proving the watchdog and the event log on a board.
 # Twenty seconds after the hardware loop is up, `bench-panic` panics on its

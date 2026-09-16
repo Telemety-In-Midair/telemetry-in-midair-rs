@@ -31,8 +31,7 @@
 use embassy_time::{Duration, Instant, Timer};
 use esp_println::println;
 use midair_proto::sentry::{
-    classify_charge, drift_us, min_rx_for_margin, min_rx_us, rc_rate, summarize_intervals,
-    sweep_floor, SweepStep, TcxoCharge, DETECT_SYMBOLS,
+    drift_us, min_rx_for_margin, min_rx_us, rc_rate, sweep_floor, SweepStep, DETECT_SYMBOLS,
 };
 use midair_proto::supervise::{Phase, Task};
 
@@ -71,6 +70,12 @@ fn geometry(radio: &Sx1262Driver<'_>) -> midair_proto::sentry::Sentry {
 /// sleeps through the rest of a frame it had already heard the start of.
 const SYMB_TIMEOUT: u8 = 8;
 
+/// Whether the other board is keying a continuous carrier rather than
+/// sending frames, i.e. whether it was built `iso-sentry-carrier`.
+///
+/// The two measurements want opposite signals and a run can only have one.
+const PEER_IS_CARRIER: bool = true;
+
 /// Nominal sleep of the sentry under test, microseconds. What the chip is
 /// asked for is this corrected for its own timer.
 const SENTRY_SLEEP_US: u32 = 1_000_000;
@@ -91,20 +96,12 @@ const SENTRY_RX_US: u32 = 200_000;
 /// seconds rather than minutes.
 const SLEEP_US: u32 = 1_000_000;
 
-/// Detections to collect for the cadence measurement.
-const CADENCE_SAMPLES: usize = 16;
 
-/// Longest the cadence half will spend collecting them, seconds.
-///
-/// It tolerates gaps rather than stopping at the first one - a source that
-/// is not on the air is not a receiver that stopped cycling - so it needs a
-/// budget of its own or a dead source would hold it forever.
-const CADENCE_BUDGET_S: u64 = 90;
 
 /// Trials per sweep step. Forty is enough that a window which passes every
 /// one is not passing by luck, and few enough that the whole ladder runs in
 /// a couple of minutes.
-const SWEEP_TRIALS: u32 = 40;
+const SWEEP_TRIALS: u32 = 15;
 
 /// Window overheads to try, microseconds, longest first.
 ///
@@ -113,14 +110,15 @@ const SWEEP_TRIALS: u32 = 40;
 /// modem has to count plus this much headroom, and the shortest step that
 /// still detects every time *is* the overhead. Descending, because
 /// [`sweep_floor`] only accepts a step whose longer neighbors all passed.
-const OVERHEAD_LADDER_US: [u32; 10] = [
-    50_000, 30_000, 20_000, 15_000, 12_000, 10_000, 8_000, 5_000, 2_000, 0,
+const OVERHEAD_LADDER_US: [u32; 12] = [
+    400_000, 300_000, 250_000, 200_000, 150_000, 120_000, 100_000, 80_000, 60_000, 40_000,
+    20_000, 0,
 ];
 
 /// How long a single trial waits for a detection before calling it a miss,
 /// as a multiple of the commanded cycle. Three cycles is generous for
 /// something that should happen on the first.
-const TRIAL_CYCLES: u32 = 3;
+const TRIAL_CYCLES: u32 = 2;
 
 /// Longest the source will hold the PA on before standing down, seconds.
 ///
@@ -216,33 +214,36 @@ pub async fn probe(radio: &mut Sx1262Driver<'_>) -> ! {
         }
     }
 
-    // The mechanism, as the design actually uses it: a real frame behind a
-    // long preamble, and RX_DONE - which is the only thing the sniff loop
-    // reports and the only thing that ends it.
-    wake_test(radio, rc.as_ref()).await;
-    if !cadence(radio, listening).await {
-        println!("sentry probe: STOPPING - the sweep is the same arm forty times over");
-        loop {
-            watchdog::beat(Task::Loop, Phase::Receive);
-            Timer::after(Duration::from_millis(500)).await;
+    // What the peer is transmitting decides what can be measured, and the
+    // two want opposite signals: the sweep asks whether a window *detects*,
+    // so it wants a carrier that is always there, and the wake test asks
+    // whether one *receives*, so it wants frames. A run cannot do both, and
+    // trying costs ten minutes proving the wrong one.
+    if PEER_IS_CARRIER {
+        let steps = sweep(radio, listening).await;
+        println!("sentry probe:");
+        match sweep_floor(&steps, t_sym, DETECT_SYMBOLS) {
+            Some(f) => {
+                println!(
+                    "sentry probe: floor {} us, so {} us of overhead over {} symbols",
+                    f.rx_us, f.overhead_us, DETECT_SYMBOLS
+                );
+                println!(
+                    "sentry probe: a window is worth its length less {} us - size every one that way",
+                    f.overhead_us
+                );
+            }
+            // Either nothing detected at all, or a longer window failed
+            // while a shorter one passed. Both are runs to repeat rather
+            // than numbers to design against, and the table says which.
+            None => println!(
+                "sentry probe: NO FLOOR - nothing detected, or the sweep is not clean from the top"
+            ),
         }
+    } else {
+        wake_test(radio, rc.as_ref()).await;
     }
-    let steps = sweep(radio, listening).await;
 
-    println!("sentry probe:");
-    match sweep_floor(&steps, t_sym, DETECT_SYMBOLS) {
-        Some(f) => {
-            println!(
-                "sentry probe: floor {} us, so {} us of overhead over {} symbols",
-                f.rx_us, f.overhead_us, DETECT_SYMBOLS
-            );
-            println!("sentry probe: size every window as {} symbols + {} us", DETECT_SYMBOLS, f.overhead_us);
-        }
-        // Either nothing detected at all, or a longer window failed while a
-        // shorter one passed. Both are runs to repeat rather than numbers to
-        // design against, and the table above says which happened.
-        None => println!("sentry probe: NO FLOOR - nothing detected, or the sweep is not clean from the top"),
-    }
     // Nothing else on this build has anything to do, and the loop is what
     // keeps the board's watchdog fed while the console output is read off.
     // Says so on a cadence for the reason `park` does: a finished run and a
@@ -668,103 +669,11 @@ async fn hearing(radio: &mut Sx1262Driver<'_>) -> bool {
     seen > 0
 }
 
-/// Arm once and time the detections that follow.
-///
-/// Gaps are tolerated rather than treated as the end of the run. A source
-/// that stops transmitting and a chip that stops cycling look identical
-/// from one timeout, and they are not the same finding - so this keeps
-/// waiting and lets the interval lengths separate them afterwards.
-async fn cadence(radio: &mut Sx1262Driver<'_>, listening: u32) -> bool {
-    // A generous window: this half is about the cycle, not about how short
-    // a window can be, so nothing here should fail for want of listening
-    // time.
-    let rx_us = listening + OVERHEAD_LADDER_US[0];
-    let commanded = rx_us + SLEEP_US;
-    println!(
-        "sentry probe: cadence, rx {} us sleep {} us, commanded cycle {} us",
-        rx_us, SLEEP_US, commanded
-    );
-    radio.arm_duty_cycle(rx_us, SLEEP_US, DETECT_SYMBOLS, irq::PREAMBLE_DETECTED);
-
-    // What mode the chip actually went to, sampled across a cycle. The
-    // command either took or it did not, and that is the difference between
-    // a receive window too short to hear anything and a chip that never
-    // entered the cycle at all - which nothing else here can tell apart.
-    for i in 0..6 {
-        Timer::after(Duration::from_millis(200)).await;
-        let (mode, err) = radio.health();
-        println!("sentry probe: armed +{} ms, radio {} err 0x{:04X}", (i + 1) * 200, mode, err);
-    }
-
-    // Per-wait deadline, and the budget for the whole collection.
-    let wait = Duration::from_micros(u64::from(commanded) * u64::from(TRIAL_CYCLES));
-    let give_up = Instant::now() + Duration::from_secs(CADENCE_BUDGET_S);
-    let mut intervals: heapless::Vec<u32, CADENCE_SAMPLES> = heapless::Vec::new();
-    let mut last: Option<Instant> = None;
-    let mut detections = 0u32;
-    while intervals.len() < CADENCE_SAMPLES && Instant::now() < give_up {
-        // Deliberately no re-arm: whether the chip keeps cycling on its own
-        // is half of what this measures, and re-arming would start the
-        // cycle at its receive phase and measure the window instead.
-        match wait_for_detect(radio, wait).await {
-            Some(at) => {
-                detections += 1;
-                if let Some(prev) = last {
-                    let _ = intervals.push((at - prev).as_micros() as u32);
-                }
-                last = Some(at);
-            }
-            // Nothing this time. The next detection's interval spans the
-            // gap, which is what marks it as one.
-            None => continue,
-        }
-    }
-
-    println!("sentry probe: {} detections, {} intervals", detections, intervals.len());
-    let Some(i) = summarize_intervals(&intervals, commanded) else {
-        if detections == 0 {
-            println!("sentry probe: cadence FAILED - nothing detected at all");
-            println!("sentry probe: no signal, wrong settings, or the cycle never ran");
-        } else {
-            println!("sentry probe: cadence FAILED - detections, but never two a cycle apart");
-            println!("sentry probe: the chip is not staying in the cycle, or the source is barely on");
-        }
-        return false;
-    };
-    println!(
-        "sentry probe: {} at the cycle, {} over it (gaps in the source)",
-        i.tight, i.loose
-    );
-    println!(
-        "sentry probe: cycle mean {} us, min {} us, max {} us",
-        i.mean_us, i.min_us, i.max_us
-    );
-    // Two consecutive windows both hearing is the chip cycling unaided; a
-    // run of them is it keeping that up.
-    println!(
-        "sentry probe: the chip stays in the cycle by itself ({} consecutive pairs)",
-        i.tight
-    );
-    match classify_charge(commanded, i.mean_us, OVERHEAD_LADDER_US[0]) {
-        TcxoCharge::Added => println!(
-            "sentry probe: oscillator restart is ADDED - a window listens for as long as commanded"
-        ),
-        TcxoCharge::Absorbed => println!(
-            "sentry probe: oscillator restart is ABSORBED - every window must grow by the overhead"
-        ),
-        TcxoCharge::Unclear => println!(
-            "sentry probe: cadence UNCLEAR - {} us against a commanded {} us, look at the run",
-            i.mean_us, commanded
-        ),
-    }
-    true
-}
-
 /// Walk the window down and count what still detects.
 async fn sweep(radio: &mut Sx1262Driver<'_>, listening: u32) -> heapless::Vec<SweepStep, 16> {
     println!("sentry probe: sweep, {} trials a step", SWEEP_TRIALS);
     println!("sentry probe:  overhead_us     rx_us  detects");
-    let mut steps = heapless::Vec::new();
+    let mut steps: heapless::Vec<SweepStep, 16> = heapless::Vec::new();
     for overhead in OVERHEAD_LADDER_US {
         let rx_us = listening + overhead;
         let deadline =
@@ -773,7 +682,18 @@ async fn sweep(radio: &mut Sx1262Driver<'_>, listening: u32) -> heapless::Vec<Sw
         for _ in 0..SWEEP_TRIALS {
             // Re-armed per trial, so each one is an independent question:
             // does a window of this length catch a signal that is already
-            // there? The cycle's own continuation is the other half's job.
+            // there?
+            //
+            // The wake first is not optional. Every trial but the first
+            // arms a chip left mid-sleep by the one before, where it holds
+            // BUSY high and accepts nothing until an NSS edge wakes it - so
+            // the arm is spent waking it and the window never opens. Without
+            // this the sweep reads 0 of 15 at every length including 432 ms,
+            // on a board whose continuous receive hears the same carrier
+            // perfectly well, and that reads as a receiver that cannot
+            // detect rather than an arm that never landed.
+            watchdog::beat(Task::Loop, Phase::Receive);
+            radio.wake_from_retained_sleep().await;
             radio.arm_duty_cycle(rx_us, SLEEP_US, DETECT_SYMBOLS, irq::PREAMBLE_DETECTED);
             if wait_for_detect(radio, deadline).await.is_some() {
                 detects += 1;
@@ -919,6 +839,65 @@ async fn hold(secs: u64) {
         watchdog::beat(Task::Loop, Phase::Receive);
         Timer::after(Duration::from_millis(200)).await;
     }
+}
+
+/// Key a continuous preamble, as the signal the window sweep measures
+/// against. Does not return.
+///
+/// The sweep asks whether a receive window *detects*, not whether it
+/// receives, so a signal that is always present and never becomes a packet
+/// is exactly right for it - every window that opens should detect, and the
+/// ones that do not are the measurement.
+///
+/// The same guards as the frame source: the power is checked because this
+/// holds the PA on, the device errors are read because DIO3 supplies the
+/// antenna switch on this module, and the keying is bounded so a board left
+/// plugged in does not transmit until somebody remembers it.
+#[cfg(feature = "iso-sentry-carrier")]
+pub async fn carrier(radio: &mut Sx1262Driver<'_>) -> ! {
+    let dbm = radio.power_dbm();
+    if dbm > SOURCE_MAX_DBM {
+        println!(
+            "sentry carrier: REFUSING to key at {} dBm - {} dBm or less",
+            dbm, SOURCE_MAX_DBM
+        );
+        park().await
+    }
+    println!(
+        "sentry carrier: quiet for {} s, then keyed at {} dBm for {} s",
+        QUIET_FIRST_S, dbm, SOURCE_MAX_KEYED_S
+    );
+    hold(QUIET_FIRST_S).await;
+    let err = radio.key_infinite_preamble();
+    if err != 0 {
+        println!("sentry carrier: REFUSING to key, device errors 0x{:04X}", err);
+        radio.standby();
+        park().await
+    }
+    let until = Instant::now() + Duration::from_secs(SOURCE_MAX_KEYED_S);
+    let mut said = Instant::now();
+    while Instant::now() < until {
+        watchdog::beat(Task::Loop, Phase::Receive);
+        if Instant::now() - said > Duration::from_secs(30) {
+            let (mode, err) = radio.health();
+            if err != 0 {
+                println!("sentry carrier: STANDING DOWN, radio latched 0x{:04X}", err);
+                radio.standby();
+                park().await
+            }
+            println!(
+                "sentry carrier: keyed at {} dBm, radio {}, {} s left",
+                dbm,
+                mode,
+                (until - Instant::now()).as_secs()
+            );
+            said = Instant::now();
+        }
+        Timer::after(Duration::from_millis(200)).await;
+    }
+    println!("sentry carrier: standing down");
+    radio.standby();
+    park().await
 }
 
 /// Sit still, keeping the heartbeat up. For a source that declined to key.
