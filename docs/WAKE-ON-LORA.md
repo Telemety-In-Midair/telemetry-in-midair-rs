@@ -594,11 +594,35 @@ continuous one - compared a duty-cycle preamble count against a
 continuous-receive preamble count, which are not the same measurement. It is
 withdrawn. Per-window overhead remains unmeasured.
 
+**The oscillator settling, tested because of the module's own pin table.**
+DIO3 supplies the TCXO *and* is the VDD of the SKY13453-385LF antenna
+switch, whose truth table needs VDD high for either path - so one pin gates
+the reference and the antenna together, and a duty cycle drops it on every
+sleep. If the configured settling were short for this module, every window
+would open off-frequency with the switch still coming up, which would
+explain the thing nothing else did: why a 432 ms window is no better than a
+33 ms one. The fault would be at the start of a window rather than anywhere
+in its length.
+
+It was the only hypothesis that accounted for every observation. Ten
+milliseconds against a hundred made no difference - no wakes either way - so
+it is wrong as well.
+
 What that leaves is the original question, unexplained: a wake lands about
-one frame in ten where the geometry says nearly all should. Four things have
-been ruled out with evidence - the re-arm, the symbol timeout, the window
-width, and the noise floor - and the instruments that would have narrowed it
-further turn out not to work in the mode being measured.
+one frame in ten where the geometry says nearly all should. **Five** things
+have now been ruled out with evidence - the re-arm, the symbol timeout, the
+window width, the noise floor and the oscillator settling - and three
+readings taken along the way had to be withdrawn because the instrument was
+measuring something other than what it appeared to.
+
+**This is where firmware iteration stops paying.** A sniff loop will not
+answer SPI, reports nothing but a completed reception, and has now disagreed
+with five plausible models of itself. What would move this is watching the
+part rather than asking it: DIO3 and DIO1 on a scope across one cycle says
+directly when the reference comes up, when the antenna switch goes live and
+when the receiver is really listening - none of which is observable from
+inside the firmware at all. `ref/rm0461` describes the same radio die as
+ST's SUBGHZ peripheral, and is the other place a documented answer might be.
 
 ## Risks, in the order they would sink it
 
