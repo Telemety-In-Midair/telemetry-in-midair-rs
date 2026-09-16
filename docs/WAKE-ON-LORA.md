@@ -469,6 +469,56 @@ above now runs first and stops the run when it fails: without it, the
 headline result would have read as "nothing works" rather than "one of these
 two works".
 
+## The mechanism works, 2026-09-16
+
+Two boards, a real frame behind a long preamble, and a receiver in
+`SetRxDutyCycle` watching `RX_DONE`:
+
+```
+control saw 33 preamble detections, radio rx err 0x0000
+armed, radio rx err 0x0000 (want rx)
+WOKEN by a frame (1 so far)
+WOKEN by a frame (2 so far)
+WAKE WORKS - 2 wakes, 3 arms in 90 s
+```
+
+Geometry: sleep 1 s, receive window 100 ms, oscillator 10 ms, preamble
+window 1.043-1.134 s, preamble 132 symbols (1.081 s), source sending every
+~4.2 s at 0 dBm. Both periods commanded with the measured +10682 ppm divided
+out, so the sleep the chip took was the one the preamble was sized against.
+
+So risk 1 is retired. **The sniff loop can be woken by a wake frame on this
+part**, and the earlier negative was a test that could not have passed -
+an infinite preamble never becomes a packet, and `RX_DONE` is the only thing
+the loop reports.
+
+**The hit rate is the open question.** Two wakes from roughly twenty frames
+is about one in ten, where the arithmetic says nearly every frame should
+land: a preamble of 1.081 s against a deaf period of 1.010 s leaves 71 ms of
+preamble inside the window that follows, and detection needs 33. Three
+candidates, in the order they are worth testing:
+
+- **The re-arm.** Three arms produced two wakes and then fifty seconds of
+  nothing, which looks more like an arm that did not take than like frames
+  that were not heard. A reception leaves the chip in its fallback mode and
+  the re-arm is issued immediately; if that command is being eaten the way
+  commands into a sleeping chip are, the sentry stops after its first wake -
+  which for a sleeping board is the difference between a doorbell and a
+  one-shot.
+- **Phase.** The source's period and the receiver's cycle are two
+  free-running periodic processes, and which frames land can depend on their
+  relative phase rather than on the geometry. Sending at an interval that is
+  not a near-multiple of the cycle, or jittering it, separates this from the
+  rest.
+- **Margin at the window edges.** 71 ms of preamble inside a window against
+  33 ms of detection is a factor of two, not an order of magnitude, and the
+  oscillator restart is a figure taken from the config rather than measured.
+
+None of these threaten the design; they decide how many times a waker has to
+send. A one-in-ten hit rate needs a burst ten frames long, which at 1.2 s a
+frame is a twelve-second wake - workable, but worth understanding before it
+is designed around.
+
 ## Risks, in the order they would sink it
 
 1. **`SetRxDutyCycle` with a TCXO.** The chip restarts DIO3 and waits

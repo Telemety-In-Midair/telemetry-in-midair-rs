@@ -735,6 +735,10 @@ impl<'d> Sx1262Driver<'d> {
     /// that decided the receiver needed re-arming would take the chip
     /// straight back out of the cycle.
     pub fn arm_duty_cycle(&mut self, rx_us: u32, sleep_us: u32, detect_symbols: u8, mask: u16) {
+        // Both halves are counted by the chip's RC64k, so both are what the
+        // caller asked for only if the caller corrected for its offset.
+        // Nothing here does that on the caller's behalf - the correction
+        // needs a measurement this driver does not hold.
         self.rx_active = false;
         self.radio.set_standby(StandbyClk::Rc);
         // The receiver gain is outside the chip's warm-start retention set,
@@ -767,6 +771,52 @@ impl<'d> Sx1262Driver<'d> {
         self.radio.set_rx(RX_CONTINUOUS);
     }
 
+    /// Transmit `data` behind a preamble of `preamble_syms`, and wait for it
+    /// to leave. No hop clock, no slot, no turn.
+    ///
+    /// A wake frame is not network traffic. It goes on a rendezvous channel
+    /// to a receiver with no clock at all - that is what makes it a wake -
+    /// so the slot machinery [`send`](Self::send) exists for has nothing to
+    /// say about it, and the preamble runs to hundreds of symbols where the
+    /// network uses eight.
+    pub async fn send_wake(&mut self, data: &[u8], preamble_syms: u16) -> Result<(), Sx1262Error> {
+        self.rx_active = false;
+        self.gate.clear();
+        let clk = self.standby_clk();
+        self.radio.set_standby(clk);
+        self.radio.clear_irq_status(irq::ALL);
+        self.radio.write_buffer(0x00, data);
+        self.radio
+            .set_lora_packet_params_preamble(data.len() as u8, preamble_syms);
+        self.radio.set_dio_irq_params(irq::TX_DONE | irq::TIMEOUT);
+        // The preamble alone can be seconds, so the chip timeout is taken
+        // from the airtime rather than from the constant a network frame
+        // uses.
+        let airtime_ms = self
+            .cfg
+            .time_on_air_preamble_us(data.len(), u32::from(preamble_syms))
+            .div_ceil(1000);
+        let budget = airtime_ms + self.tx_chip_timeout_ms;
+        self.radio.set_tx(crate::sx1262::timeout_from_millis(budget));
+
+        let deadline = Instant::now() + Duration::from_millis(u64::from(budget));
+        while Instant::now() < deadline {
+            crate::watchdog::beat(Task::Loop, Phase::TxSend);
+            if self.radio.irq_pending() {
+                let status = self.radio.irq_status();
+                self.radio.clear_irq_status(irq::ALL);
+                if status & irq::TX_DONE != 0 {
+                    return Ok(());
+                }
+                if status & irq::TIMEOUT != 0 {
+                    return Err(Sx1262Error::Timeout);
+                }
+            }
+            Timer::after(Duration::from_millis(10)).await;
+        }
+        Err(Sx1262Error::Timeout)
+    }
+
     /// Arm one receive window of `timeout_ms`, with `mask` routed to DIO1.
     ///
     /// The instrument for the chip's own timebase. This timeout is counted
@@ -782,6 +832,26 @@ impl<'d> Sx1262Driver<'d> {
         self.radio.set_dio_irq_params(mask);
         self.radio.clear_irq_status(irq::ALL);
         self.radio.set_rx(crate::sx1262::timeout_from_millis(timeout_ms));
+    }
+
+    /// Bring the chip back from a retained sleep so the next command lands.
+    ///
+    /// A duty cycle spends most of its time in sleep with BUSY held high,
+    /// where the part accepts nothing and is woken only by a falling edge
+    /// on NSS. The first transaction after that is therefore spent waking
+    /// it, and whatever it carried is lost - which is why an arm issued
+    /// straight after a duty cycle appears to do nothing and the status
+    /// afterwards reads as an absent radio.
+    ///
+    /// Sends a cheap command for its NSS edge alone, gives the part its
+    /// documented wake-up time, and then puts it somewhere known.
+    pub async fn wake_from_retained_sleep(&mut self) {
+        // The status byte is the cheapest transaction there is, and its
+        // value is not wanted - only the edge that carries it.
+        let _ = self.radio.status();
+        Timer::after(Duration::from_millis(2)).await;
+        self.radio.set_standby(StandbyClk::Rc);
+        let _ = self.radio.status();
     }
 
     /// Whether the radio is asserting DIO1.
@@ -816,6 +886,11 @@ impl<'d> Sx1262Driver<'d> {
             self.radio.set_tx_infinite_preamble();
         }
         err
+    }
+
+    /// Latched operational errors, as the chip reports them.
+    pub fn device_errors(&mut self) -> u16 {
+        self.radio.device_errors()
     }
 
     /// Transmit power the radio is configured for, dBm.
