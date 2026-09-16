@@ -52,9 +52,24 @@ fn geometry(radio: &Sx1262Driver<'_>) -> midair_proto::sentry::Sentry {
     // A generous window on purpose. The measured timebase needs almost
     // none of it, and the point of a first run is to find out whether the
     // mechanism works at all rather than how cheaply it can be made to.
-    let overhead = SENTRY_RX_US.saturating_sub(u32::from(DETECT_SYMBOLS) * radio.symbol_time_us());
-    midair_proto::sentry::Sentry::new(&cfg, SENTRY_SLEEP_US, overhead, DETECT_SYMBOLS, TCXO_US)
+    let overhead = SENTRY_RX_US.saturating_sub(u32::from(SYMB_TIMEOUT) * radio.symbol_time_us());
+    midair_proto::sentry::Sentry::new(&cfg, SENTRY_SLEEP_US, overhead, SYMB_TIMEOUT, TCXO_US)
 }
+
+/// Symbols the modem is given to validate a signal, for both the chip and
+/// the arithmetic that sizes the window around it.
+///
+/// One constant, not two: the window has to contain exactly the symbols the
+/// modem validates on, so a receiver told to validate on eight and a
+/// preamble sized for four disagree about the only number they share.
+///
+/// **It must not be zero.** Zero disables the check, and measured on
+/// hardware that takes a duty cycle from waking on most frames to waking on
+/// none - because a non-zero value is also what makes the chip hold the
+/// window open "for the full duration of the packet" once it has validated.
+/// With it off, the window simply ends at its own length and the chip
+/// sleeps through the rest of a frame it had already heard the start of.
+const SYMB_TIMEOUT: u8 = 8;
 
 /// Nominal sleep of the sentry under test, microseconds. What the chip is
 /// asked for is this corrected for its own timer.
@@ -230,7 +245,7 @@ pub async fn probe(radio: &mut Sx1262Driver<'_>) -> ! {
 /// is followed by a re-arm. That is not a workaround - it is what a sleeping
 /// board will have to do on the far side of every wake.
 async fn wake_test(radio: &mut Sx1262Driver<'_>, rc: Option<&midair_proto::sentry::RcRate>) {
-    const WAKE_WAIT_S: u64 = 90;
+    const WAKE_WAIT_S: u64 = 150;
     let g = geometry(radio);
     let Some(preamble) = g.preamble_symbols(&cfg_of(radio)) else {
         println!("sentry probe: no preamble fits this geometry - nothing to test");
@@ -243,8 +258,8 @@ async fn wake_test(radio: &mut Sx1262Driver<'_>, rc: Option<&midair_proto::sentr
         None => (g.rx_us, g.sleep_us),
     };
     println!(
-        "sentry probe: wake test, rx {} us sleep {} us (commanded {} / {})",
-        g.rx_us, g.sleep_us, rx_cmd, sleep_cmd
+        "sentry probe: wake test, rx {} us sleep {} us (commanded {} / {}), symb timeout {}",
+        g.rx_us, g.sleep_us, rx_cmd, sleep_cmd, SYMB_TIMEOUT
     );
     println!(
         "sentry probe: source must send frames with a {}-symbol preamble ({} us, window {} to {} us)",
@@ -254,49 +269,84 @@ async fn wake_test(radio: &mut Sx1262Driver<'_>, rc: Option<&midair_proto::sentr
         g.preamble_max_us
     );
 
+    // Every arm is verified and every arm's outcome is recorded, because
+    // the question is which of the two is failing: frames that are not
+    // heard, or an arm after a reception that never took. A sentry whose
+    // re-arm is eaten wakes once and then never again, which for a sleeping
+    // board is a doorbell that works one time.
     let until = Instant::now() + Duration::from_secs(WAKE_WAIT_S);
     let mut woken = 0u32;
-    let mut rearms = 0u32;
-    radio.arm_duty_cycle(rx_cmd, sleep_cmd, DETECT_SYMBOLS, irq::RX_DONE);
-    rearms += 1;
-    // One read, inside the first receive window, before the chip has slept
-    // for the first time. Safe there and nowhere else: during a sleep phase
-    // the transaction's own NSS edge would end the cycle. `rx` means the
-    // command took; anything else means it never started, and the ninety
-    // seconds below would be measuring nothing.
-    {
-        let (mode, err) = radio.health();
-        println!("sentry probe: armed, radio {} err 0x{:04X} (want rx)", mode, err);
-        if mode != "rx" {
-            println!("sentry probe: the duty cycle did not engage - not a reception problem");
-        }
-    }
+    let mut arms = 0u32;
+    let mut arms_verified = 0u32;
+    // Set by the first `arm!` before anything reads it.
+    let mut armed_at;
     let mut said = Instant::now();
+
+    // A closure would need the radio mutably twice; a small helper keeps it
+    // readable and is used for the first arm and every re-arm alike, so the
+    // two cannot drift apart.
+    macro_rules! arm {
+        () => {{
+            // The chip is most likely in a retained sleep, where it accepts
+            // nothing until an NSS edge wakes it - so the arm that follows
+            // would otherwise be spent doing that and be lost.
+            radio.wake_from_retained_sleep().await;
+            radio.arm_duty_cycle(rx_cmd, sleep_cmd, SYMB_TIMEOUT, irq::RX_DONE);
+            arms += 1;
+            armed_at = Instant::now();
+            // Inside the first receive window, so this read cannot disturb
+            // the cycle it is checking.
+            let (mode, err) = radio.health();
+            if mode == "rx" {
+                arms_verified += 1;
+            } else {
+                println!(
+                    "sentry probe: ARM {} DID NOT TAKE - radio {} err 0x{:04X}",
+                    arms, mode, err
+                );
+            }
+        }};
+    }
+
+    arm!();
     while Instant::now() < until {
         watchdog::beat(Task::Loop, Phase::Receive);
         if radio.irq_pending() {
             let status = radio.take_irq();
             if status & irq::RX_DONE != 0 {
                 woken += 1;
-                println!("sentry probe: WOKEN by a frame ({} so far)", woken);
-                // The reception ended the cycle; the chip is in standby.
-                radio.arm_duty_cycle(rx_cmd, sleep_cmd, DETECT_SYMBOLS, irq::RX_DONE);
-                rearms += 1;
+                println!(
+                    "sentry probe: woken after {} ms on arm {}",
+                    (Instant::now() - armed_at).as_millis(),
+                    arms
+                );
+                arm!();
             }
         }
         if Instant::now() - said > Duration::from_secs(20) {
-            println!("sentry probe: {} s left, {} wakes so far", (until - Instant::now()).as_secs(), woken);
+            println!(
+                "sentry probe: {} s left, {} wakes, {} arms ({} verified)",
+                (until - Instant::now()).as_secs(),
+                woken,
+                arms,
+                arms_verified
+            );
             said = Instant::now();
         }
         Timer::after(Duration::from_millis(POLL_MS)).await;
     }
-    // Whatever happened, the chip is most likely mid-sleep; bring it back
-    // so anything after this can talk to it.
+
     radio.wake_from_retained_sleep().await;
-    if woken == 0 {
-        println!("sentry probe: NOT WOKEN in {} s - the mechanism did not work here", WAKE_WAIT_S);
+    println!(
+        "sentry probe: {} wakes from {} arms, {} of those arms verified rx",
+        woken, arms, arms_verified
+    );
+    if arms_verified < arms {
+        println!("sentry probe: VERDICT re-arms are being eaten - {} of {} did not take", arms - arms_verified, arms);
+    } else if woken == 0 {
+        println!("sentry probe: VERDICT every arm took and nothing was heard - not the re-arm");
     } else {
-        println!("sentry probe: WAKE WORKS - {} wakes, {} arms in {} s", woken, rearms, WAKE_WAIT_S);
+        println!("sentry probe: VERDICT every arm took; the misses are frames not heard, not arms lost");
     }
 }
 
@@ -327,8 +377,17 @@ async fn rc_timebase(radio: &mut Sx1262Driver<'_>) -> Option<midair_proto::sentr
     println!("sentry probe: timing the chip's RC64k, {} trials of {} ms", RC_TRIALS, RC_TIMEOUT_MS);
     let commanded_us = RC_TIMEOUT_MS * 1_000;
     let mut measured: heapless::Vec<u32, RC_TRIALS> = heapless::Vec::new();
+    let mut spoiled = 0u32;
     for _ in 0..RC_TRIALS {
-        radio.arm_rx_timeout(RC_TIMEOUT_MS, irq::TIMEOUT);
+        // Everything that could end a receive window is latched, not just
+        // the timeout, so a trial that was cut short by traffic can be told
+        // from one that ran its length. Measuring only the timeout hides
+        // the contaminated trials instead of discarding them, and a wrong
+        // rate here mis-sizes every sleep that is corrected by it.
+        radio.arm_rx_timeout(
+            RC_TIMEOUT_MS,
+            irq::TIMEOUT | irq::RX_DONE | irq::PREAMBLE_DETECTED | irq::HEADER_VALID,
+        );
         let started = Instant::now();
         // Generous: a timer that runs very long must be measured, not cut
         // off at the value being checked.
@@ -338,7 +397,14 @@ async fn rc_timebase(radio: &mut Sx1262Driver<'_>) -> Option<midair_proto::sentr
             watchdog::beat(Task::Loop, Phase::Receive);
             if radio.irq_pending() {
                 let at = Instant::now();
-                if radio.take_irq() & irq::TIMEOUT != 0 {
+                let status = radio.take_irq();
+                // A window that saw a signal was not timing the oscillator,
+                // it was receiving. Discard it rather than average it in.
+                if status & (irq::RX_DONE | irq::PREAMBLE_DETECTED | irq::HEADER_VALID) != 0 {
+                    spoiled += 1;
+                    break;
+                }
+                if status & irq::TIMEOUT != 0 {
                     got = Some((at - started).as_micros() as u32);
                     break;
                 }
@@ -358,9 +424,13 @@ async fn rc_timebase(radio: &mut Sx1262Driver<'_>) -> Option<midair_proto::sentr
         return None;
     };
     println!(
-        "sentry probe: RC64k {} trials, mean {} ppm, min {} ppm, max {} ppm",
-        r.trials, r.mean_ppm, r.min_ppm, r.max_ppm
+        "sentry probe: RC64k {} clean trials ({} spoiled by traffic), mean {} ppm, min {} ppm, max {} ppm",
+        r.trials, spoiled, r.mean_ppm, r.min_ppm, r.max_ppm
     );
+    if r.trials < 3 {
+        println!("sentry probe: RC64k UNRELIABLE - too few clean trials to correct with");
+        return None;
+    }
     // The offset and the spread are different things and only one of them
     // costs anything. An offset is the same every cycle and divides out of
     // the period commanded; the spread is what a window has to be wide

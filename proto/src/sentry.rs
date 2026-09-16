@@ -43,6 +43,13 @@ pub const PREAMBLE_SYMBOLS_MAX: u32 = u16::MAX as u32;
 /// rather than noise, and it is what the receive window is sized around. A
 /// larger value is a longer window for the same confidence, which on a
 /// sentry is paid on every cycle for the life of the board.
+///
+/// **Zero is not a setting here.** It disables the modem's validation, and
+/// on hardware that takes a duty cycle from waking on most frames to waking
+/// on none: a non-zero value is also what makes the chip hold its receive
+/// window open for the rest of a packet once it has validated one, so with
+/// the check off the window ends at its own length and the chip sleeps
+/// through a frame it had already heard the start of.
 pub const DETECT_SYMBOLS: u8 = 4;
 
 /// Longest one transmission may hold a single carrier when the node is
