@@ -693,6 +693,44 @@ timeout, the receive window width, the noise floor, the oscillator settling,
 and the preamble length. What is left is inside the part, between two events
 the host can only count.
 
+## At range, and what the rate actually is
+
+The same sweep with the boards a few metres apart instead of a few
+centimetres. Nothing else changed - same builds, same carrier, same 0 dBm,
+same config.
+
+| | 5 cm | few metres |
+|-|-|-|
+| control detections, 10 s | 59 | 53 |
+| preambles -> headers | 77 -> 4 | 75 -> 2 |
+| wakes from ~154 frames | 4 | 2 |
+| lengths that woke it | 160, 180, 290, 290 | 80, 120 |
+
+**Range is not a cliff.** The control is essentially unchanged, which is
+what the link budget says it should be: 0 dBm against about 41 dB of path
+loss at 3 m leaves the receiver near -41 dBm against an SF12 sensitivity
+close to -137. There is no reason for distance to matter until far beyond
+a bench, and it does not.
+
+**The rate is lower than the earlier figure and it is random.** Six wakes in
+308 frames across the two runs is about **2%**, not the one-in-ten quoted
+before - that came from a smaller and luckier sample. And the preamble
+lengths that worked share nothing between the two runs, on identical setups.
+A geometry effect would repeat; this does not. It is a low-probability
+stochastic event somewhere between a detected preamble and a decoded header.
+
+### What that does to the "accept it as a design input" option
+
+At 2% per frame, 95% confidence needs about 150 frames - **three to six
+minutes of near-continuous transmission to wake one board**, during which
+every other node on the channel loses its beacons. That is not a doorbell,
+and it is not a duty cycle anybody would run: the waker spends more air time
+and energy than the sleeping board saves.
+
+So the option is withdrawn rather than recommended. The measurement that was
+supposed to make it defensible made it untenable instead, which is what it
+was for.
+
 ## Risks, in the order they would sink it
 
 1. **`SetRxDutyCycle` with a TCXO.** The chip restarts DIO3 and waits
