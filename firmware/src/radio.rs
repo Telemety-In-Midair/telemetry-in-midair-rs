@@ -888,6 +888,20 @@ impl<'d> Sx1262Driver<'d> {
         err
     }
 
+    /// Read whatever the receiver last landed, without any of the framing,
+    /// dedup or hop-clock work a real receive path does.
+    ///
+    /// For a bench that needs to know which transmission woke it and
+    /// nothing else about it.
+    pub fn read_payload(&mut self, out: &mut [u8]) -> usize {
+        let (len, start) = self.radio.rx_buffer_status();
+        let n = (len as usize).min(out.len());
+        if n > 0 {
+            self.radio.read_buffer(start, &mut out[..n]);
+        }
+        n
+    }
+
     /// Retune the receiver, leaving everything else alone.
     ///
     /// For surveying a band rather than for operating in one: the hop plan

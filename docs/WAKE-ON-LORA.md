@@ -653,6 +653,46 @@ It says nothing about a duty cycle receiving only a fraction of what
 continuous receive does, and nothing that contradicts the geometry being
 used. The open question survives both vendors' documentation.
 
+## The preamble length is not the variable
+
+The one number in this design that had always been computed rather than
+measured - from a model that had by then been wrong twice - was finally
+swept. The source walks fourteen preamble lengths from 60 to 320 symbols,
+four frames each, with the length written into every payload so a wake
+reports its own cause rather than being matched up by wall clock.
+
+| symbols | ms | wakes | in the model's window |
+|-|-|-|-|
+| 60 - 130 | 0.49 - 1.06 | 0 | |
+| 140 | 1.15 | 0 | yes |
+| 150 | 1.23 | 0 | yes |
+| 160 | 1.31 | 1 | yes |
+| 180 | 1.47 | 1 | |
+| 200 - 260 | 1.64 - 2.13 | 0 | |
+| 290 | 2.38 | 2 | |
+| 320 | 2.62 | 0 | |
+
+Four wakes from about 154 frames. **No length works reliably** - the best is
+2 of 11 - and the wakes that do happen sit both inside and outside the
+predicted window with no structure to them. The model's own window managed
+one wake in some thirty-three frames.
+
+The funnel is unchanged and now much better bounded: 77 preamble detections
+produced 4 headers, with no CRC errors, which is the same five percent
+conversion every previous run showed. **It does not move with preamble
+length across a five-fold range.**
+
+That is worth more than another explanation. It eliminates the whole family
+of geometry-tuning answers - too short, too long, wrong window, wrong margin
+- which is where most of the work above went. Whatever fails, fails between
+a detected preamble and a decoded header, and is indifferent to how much
+preamble precedes it.
+
+Six things have now been ruled out with evidence: the re-arm, the symbol
+timeout, the receive window width, the noise floor, the oscillator settling,
+and the preamble length. What is left is inside the part, between two events
+the host can only count.
+
 ## Risks, in the order they would sink it
 
 1. **`SetRxDutyCycle` with a TCXO.** The chip restarts DIO3 and waits

@@ -134,6 +134,23 @@ const SOURCE_MAX_KEYED_S: u64 = 1_200;
 /// widens the deaf gap a preamble has to span.
 const TCXO_US: u32 = 10_000;
 
+/// Preamble lengths the source walks through, in symbols.
+///
+/// The one number in this design that has always been computed rather than
+/// measured, from a model of the chip that has been wrong more than once.
+/// So it is swept: wide enough to bracket whatever the real window is, and
+/// each frame says which length it was sent with so a wake reports its own
+/// cause.
+const PREAMBLE_SWEEP: [u16; 14] = [
+    60, 80, 100, 120, 130, 140, 150, 160, 180, 200, 230, 260, 290, 320,
+];
+
+/// Frames sent at each preamble length.
+const FRAMES_PER_PREAMBLE: u32 = 4;
+
+/// Tag byte in front of the preamble length a wake frame carries.
+const WAKE_TAG: u8 = 0x57;
+
 /// What a wake frame carries for the mechanism test. The payload is not the
 /// point - a real packet is, because only a completed reception ends the
 /// chip's sniff loop.
@@ -153,10 +170,6 @@ const WAKE_PAYLOAD: &[u8] = b"wake";
 /// finishes first. It costs one silent period per bench run and removes the
 /// whole failure, which no amount of filtering did.
 const QUIET_FIRST_S: u64 = 45;
-
-/// Seconds between wake frames. Long enough that a receiver woken by one is
-/// re-armed well before the next.
-const SEND_EVERY_S: u64 = 3;
 
 /// Most transmit power the source will key at, dBm.
 ///
@@ -308,6 +321,8 @@ async fn wake_test(radio: &mut Sx1262Driver<'_>, rc: Option<&midair_proto::sentr
     let mut preambles = 0u32;
     let mut headers = 0u32;
     let mut crc_errs = 0u32;
+    // Which preamble lengths actually woke it, against the lengths sent.
+    let mut hits = [0u32; PREAMBLE_SWEEP.len()];
     // Set by the first `arm!` before anything reads it.
     let mut armed_at;
     let mut said = Instant::now();
@@ -365,10 +380,23 @@ async fn wake_test(radio: &mut Sx1262Driver<'_>, rc: Option<&midair_proto::sentr
             }
             if status & irq::RX_DONE != 0 {
                 woken += 1;
+                // The frame says what preamble it was sent with, so a wake
+                // reports its own cause. Read before the re-arm, which
+                // rewrites the packet parameters.
+                let mut buf = [0u8; 8];
+                let n = radio.read_payload(&mut buf);
+                let syms = if n >= 3 && buf[0] == WAKE_TAG {
+                    u16::from(buf[1]) | (u16::from(buf[2]) << 8)
+                } else {
+                    0
+                };
+                if let Some(slot) = PREAMBLE_SWEEP.iter().position(|p| *p == syms) {
+                    hits[slot] += 1;
+                }
                 println!(
-                    "sentry probe: woken after {} ms on arm {}",
-                    (Instant::now() - armed_at).as_millis(),
-                    arms
+                    "sentry probe: woken by a {} symbol preamble after {} ms",
+                    syms,
+                    (Instant::now() - armed_at).as_millis()
                 );
                 arm!();
             }
@@ -397,6 +425,26 @@ async fn wake_test(radio: &mut Sx1262Driver<'_>, rc: Option<&midair_proto::sentr
         "sentry probe: {} preambles -> {} headers -> {} wakes ({} crc errors)",
         preambles, headers, woken, crc_errs
     );
+    // The measurement this run exists for: the feasible preamble window as
+    // the hardware reports it, rather than as the geometry predicts it.
+    println!("sentry probe: wakes by preamble length -");
+    let g = geometry(radio);
+    for (i, p) in PREAMBLE_SWEEP.iter().enumerate() {
+        let us = u32::from(*p) * radio.symbol_time_us();
+        let predicted = us >= g.preamble_min_us && us <= g.preamble_max_us;
+        println!(
+            "sentry probe: {:>4} symbols ({:>7} us) {:>3} wakes  {}",
+            p,
+            us,
+            hits[i],
+            if predicted { "<- model says this should work" } else { "" }
+        );
+    }
+    println!(
+        "sentry probe: model predicts {} to {} us",
+        g.preamble_min_us, g.preamble_max_us
+    );
+
     if preambles == 0 {
         println!("sentry probe: STAGE windows are not catching the preamble - geometry or margin");
     } else if headers < preambles / 2 {
@@ -770,7 +818,7 @@ pub async fn source(radio: &mut Sx1262Driver<'_>) -> ! {
     let dbm = radio.power_dbm();
     if dbm > SOURCE_MAX_DBM {
         println!(
-            "sentry source: REFUSING to send at {} dBm - {} dBm or less (board-config --set power_dbm=0)",
+            "sentry source: REFUSING to send at {} dBm - {} dBm or less",
             dbm, SOURCE_MAX_DBM
         );
         park().await
@@ -781,63 +829,53 @@ pub async fn source(radio: &mut Sx1262Driver<'_>) -> ! {
         park().await
     }
 
-    let g = geometry(radio);
-    let Some(preamble) = g.preamble_symbols(&cfg_of(radio)) else {
-        println!("sentry source: no preamble fits this geometry");
-        park().await
-    };
-    let preamble = preamble.min(u32::from(u16::MAX)) as u16;
-    let airtime_ms = cfg_of(radio)
-        .time_on_air_preamble_us(WAKE_PAYLOAD.len(), u32::from(preamble))
-        .div_ceil(1000);
-    println!(
-        "sentry source: {} dBm, {}-symbol preamble, {} ms on air, every {} s for {} s",
-        dbm, preamble, airtime_ms, SEND_EVERY_S, SOURCE_MAX_KEYED_S
-    );
-
     println!(
         "sentry source: quiet for {} s so the receiver can time its own oscillator first",
         QUIET_FIRST_S
     );
     hold(QUIET_FIRST_S).await;
+    println!(
+        "sentry source: sweeping {} preamble lengths, {} frames each at {} dBm",
+        PREAMBLE_SWEEP.len(),
+        FRAMES_PER_PREAMBLE,
+        dbm
+    );
 
     let until = Instant::now() + Duration::from_secs(SOURCE_MAX_KEYED_S);
-    let mut sent = 0u32;
-    while Instant::now() < until {
-        watchdog::beat(Task::Loop, Phase::TxSend);
-        match radio.send_wake(WAKE_PAYLOAD, preamble).await {
-            Ok(()) => sent += 1,
-            Err(_) => println!("sentry source: a transmit did not complete"),
+    loop {
+        for preamble in PREAMBLE_SWEEP {
+            if Instant::now() >= until {
+                println!("sentry source: budget spent, standing down");
+                radio.standby();
+                park().await
+            }
+            // The frame says what it was sent with, so a receiver woken by
+            // it can report which length worked rather than leaving the two
+            // ends to be matched up by wall clock.
+            let payload = [WAKE_TAG, preamble as u8, (preamble >> 8) as u8];
+            let mut ok = 0u32;
+            for _ in 0..FRAMES_PER_PREAMBLE {
+                watchdog::beat(Task::Loop, Phase::TxSend);
+                if radio.send_wake(&payload, preamble).await.is_ok() {
+                    ok += 1;
+                }
+                hold(1).await;
+            }
+            let (mode, err) = radio.health();
+            if err != 0 {
+                println!("sentry source: STANDING DOWN, radio latched 0x{:04X}", err);
+                radio.standby();
+                park().await
+            }
+            println!(
+                "sentry source: {} symbols, {}/{} sent, radio {}, {} s left",
+                preamble,
+                ok,
+                FRAMES_PER_PREAMBLE,
+                mode,
+                (until - Instant::now()).as_secs()
+            );
         }
-        let (mode, err) = radio.health();
-        if err != 0 {
-            // Acted on rather than printed: on this module DIO3 supplies
-            // the antenna switch, so a latched error while transmitting is
-            // a PA driving an isolated port.
-            println!("sentry source: STANDING DOWN, radio latched 0x{:04X}", err);
-            radio.standby();
-            park().await
-        }
-        println!(
-            "sentry source: sent {} ({} ms on air), radio {}, {} s left",
-            sent,
-            airtime_ms,
-            mode,
-            (until - Instant::now()).as_secs()
-        );
-        hold(SEND_EVERY_S).await;
-    }
-    println!("sentry source: {} frames, standing down", sent);
-    radio.standby();
-    park().await
-}
-
-/// Wait `secs`, keeping the heartbeat up across it.
-async fn hold(secs: u64) {
-    let until = Instant::now() + Duration::from_secs(secs);
-    while Instant::now() < until {
-        watchdog::beat(Task::Loop, Phase::Receive);
-        Timer::after(Duration::from_millis(200)).await;
     }
 }
 
@@ -898,6 +936,15 @@ pub async fn carrier(radio: &mut Sx1262Driver<'_>) -> ! {
     println!("sentry carrier: standing down");
     radio.standby();
     park().await
+}
+
+/// Wait `secs`, keeping the heartbeat up across it.
+async fn hold(secs: u64) {
+    let until = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < until {
+        watchdog::beat(Task::Loop, Phase::Receive);
+        Timer::after(Duration::from_millis(200)).await;
+    }
 }
 
 /// Sit still, keeping the heartbeat up. For a source that declined to key.
