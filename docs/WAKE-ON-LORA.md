@@ -624,6 +624,35 @@ when the receiver is really listening - none of which is observable from
 inside the firmware at all. `ref/rm0461` describes the same radio die as
 ST's SUBGHZ peripheral, and is the other place a documented answer might be.
 
+## What RM0461 added, and what it did not
+
+ST's reference manual documents the same radio die as the SUBGHZ
+peripheral, and its account of the sniff loop is clearer than Semtech's. It
+settles three things and answers none of the open ones.
+
+- **The upper bound counts the header alone**, as Semtech's does. A payload
+  term had been added here to explain a geometry that met the documented
+  bound and failed anyway; it is withdrawn. Doubling the receive window had
+  already disproved it, and inventing a bound to cover an unexplained
+  failure only hid the failure. The test for that geometry is kept, now
+  asserting that the documented bound *admits* it - because the hardware
+  disagreeing with both vendors is the open question, not a number to be
+  adjusted until it matches.
+- **`Set_StopRxTimerOnPreamble` defaults to stopping on header detection**,
+  not on preamble. That is the safe setting, and this firmware never touches
+  it, so it was never the fault. Had it been set the other way a single
+  false preamble would hold the receiver in Receive "for an unexpected long
+  period, until stopped by a mode configuration command".
+- **A warm start skips calibration and loses the buffer base addresses.**
+  Calibration results live in retained data RAM, so a duty cycle does not
+  re-run the 1.6 ms calibration each window. `TxBaseAddr` and `RxBaseAddr`
+  are lost and revert to 0x80 and 0x00; this firmware sets both to 0x00, so
+  the receive path is unaffected by that.
+
+It says nothing about a duty cycle receiving only a fraction of what
+continuous receive does, and nothing that contradicts the geometry being
+used. The open question survives both vendors' documentation.
+
 ## Risks, in the order they would sink it
 
 1. **`SetRxDutyCycle` with a TCXO.** The chip restarts DIO3 and waits

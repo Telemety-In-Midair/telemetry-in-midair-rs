@@ -409,14 +409,17 @@ pub const HEADER_SYMBOLS: u32 = 8;
 ///   it at `2 * rxPeriod + sleepPeriod`; anything still arriving when that
 ///   expires is abandoned, and the packet is never received.
 ///
-/// The datasheet writes the upper bound as
-/// `Tpreamble + Theader <= 2 * rxPeriod + sleepPeriod`, which leaves out the
-/// payload. Measured on hardware it is the **whole packet** that has to fit:
-/// with a geometry satisfying the datasheet's form by 37 ms but over it by
-/// 110 ms once the payload is counted, 39 detected preambles produced 2
-/// headers - and the two that survived were the ones detected late in the
-/// preamble, where less of it remained to transmit. So the payload is
-/// counted here.
+/// Both the Semtech datasheet and ST's RM0461, which documents the same die
+/// as the SUBGHZ peripheral, write this bound the same way and count only
+/// the header: `Tpreamble + Theader < 2 * rxPeriod + sleepPeriod`. The
+/// restarted timer exists to find a header, not to finish a packet.
+///
+/// A payload term was briefly added here to explain a geometry that met the
+/// documented bound and still failed on hardware. It was wrong twice over:
+/// doubling the receive window afterwards changed nothing, which the theory
+/// said it should, and RM0461 states the header-only form explicitly. What
+/// made that geometry fail is still unexplained, and inventing a bound to
+/// cover it only hid the fact.
 ///
 /// So a longer preamble is not the safe direction. Past the upper bound the
 /// wake stops working again, and it fails the same way it fails below the
@@ -460,9 +463,10 @@ impl Sentry {
         let detect_us = u32::from(detect_symbols).saturating_mul(t_sym_us);
         let header_us = HEADER_SYMBOLS.saturating_mul(t_sym_us);
         let rx_us = detect_us.saturating_add(overhead_us);
-        // Everything after the preamble that still has to arrive inside the
-        // restarted timer: the header, and the payload behind it.
-        let tail_us = header_us.saturating_add(payload_us);
+        // Only the header: the restarted timer is there to find one, and
+        // both vendors' documents say so.
+        let tail_us = header_us;
+        let _ = payload_us;
         // Deaf for the sleep phase plus the oscillator restart behind it;
         // a window then needs its detect symbols inside what is left.
         let preamble_min_us = sleep_us
@@ -590,10 +594,8 @@ pub fn min_rx_us(cfg: &RadioConfig, detect_symbols: u8, tcxo_us: u32, payload_le
     let t_sym_us = cfg.symbol_time_us().max(1);
     let detect_us = u32::from(detect_symbols) * t_sym_us;
     let header_us = HEADER_SYMBOLS * t_sym_us;
-    let payload_us = cfg
-        .time_on_air_preamble_us(payload_len, 0)
-        .saturating_sub(cfg.time_on_air_preamble_us(0, 0));
-    (tcxo_us + detect_us + header_us + payload_us).div_ceil(2)
+    let _ = payload_len;
+    (tcxo_us + detect_us + header_us).div_ceil(2)
 }
 
 #[cfg(test)]
@@ -845,9 +847,9 @@ mod tests {
         // detect symbols have to fit in what is left of the preamble.
         assert_eq!(s.preamble_min_us, 1_000_000 + TCXO_US + 4 * t_sym);
         // Above: the chip's restarted timer, less the header behind it.
-        // The tail is the header and the payload, both of which still have
-        // to arrive inside the chip's restarted timer.
-        assert!(s.preamble_max_us < 2 * s.rx_us + 1_000_000 - 8 * t_sym);
+        // Above: the chip's restarted timer, less the header it still has
+        // to find inside it. Only the header - both vendors say so.
+        assert_eq!(s.preamble_max_us, 2 * s.rx_us + 1_000_000 - 8 * t_sym);
         assert!(s.feasible());
         let syms = s.preamble_symbols(&c).unwrap();
         assert!(syms * t_sym >= s.preamble_min_us);
@@ -855,29 +857,18 @@ mod tests {
     }
 
     #[test]
-    fn a_hundred_millisecond_window_cannot_carry_a_wake_frame() {
-        // Measured, not derived. A window of this size satisfies the bound
-        // the datasheet writes down - preamble plus header - and fails on
-        // hardware, because the payload has to arrive inside the same
-        // restarted timer. Thirty-nine detected preambles produced two
-        // headers, and the two were the ones detected late in the preamble
-        // where less of it was left to send.
+    fn a_hundred_millisecond_window_is_within_the_documented_bound() {
+        // Kept because the hardware disagrees with it, and that is the open
+        // question rather than a bound to be adjusted until it matches.
+        // Both vendors' documents make this geometry legal; on the bench it
+        // produced two headers from thirty-nine detected preambles, and
+        // doubling the window did not improve it.
         let c = cfg();
-        // Eight validation symbols, which is what the run used: the modem
-        // has to see that many inside the window, so they come out of the
-        // preamble the window can still be opening on.
         const SYMBS: u8 = 8;
         let rx_100ms = 100_000 - u32::from(SYMBS) * c.symbol_time_us();
         let s = Sentry::new(&c, 1_000_000, rx_100ms, SYMBS, TCXO_US, WAKE_LEN);
-        assert!(!s.feasible(), "no preamble fits a window this short");
-        assert_eq!(check(&c, &s, WAKE_LEN), Err(Refusal::NoPreambleFits));
-        // Two hundred milliseconds is enough, which is the fix.
-        let wide = Sentry::new(&c, 1_000_000, 200_000, SYMBS, TCXO_US, WAKE_LEN);
-        assert!(wide.feasible());
-        // Counting only the header, as the datasheet's form does, would have
-        // called it fine - which is how it reached hardware.
-        let header_only = 2 * s.rx_us + s.sleep_us - HEADER_SYMBOLS * c.symbol_time_us();
-        assert!(header_only > s.preamble_min_us);
+        assert!(s.feasible(), "the documented bound admits this");
+        assert_eq!(check(&c, &s, WAKE_LEN), Ok(()));
     }
 
     #[test]
