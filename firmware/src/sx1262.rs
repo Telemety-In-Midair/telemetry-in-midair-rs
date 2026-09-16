@@ -76,6 +76,19 @@ pub mod reg {
     /// "Modulation quality with 500 kHz LoRa bandwidth").
     pub const TX_MODULATION: u16 = 0x0889;
 
+    /// First register of the warm-start retention list: how many registers
+    /// follow, then their addresses, high byte first.
+    ///
+    /// What makes a duty cycle keep its receiver gain. The chip restores the
+    /// listed registers when it wakes from a retained sleep, and [`RX_GAIN`]
+    /// is not in that set by default - so without this every window after
+    /// the first runs at the power-up gain instead of the boosted one.
+    pub const RETENTION_COUNT: u16 = 0x029F;
+    /// Where the list's addresses start.
+    pub const RETENTION_LIST: u16 = 0x02A0;
+    /// Registers the list holds. The datasheet's procedure uses one.
+    pub const RETENTION_MAX: usize = 4;
+
     /// Receiver gain. Not covered by warm-start retention, so it has to be
     /// rewritten on every init.
     pub const RX_GAIN: u16 = 0x08AC;
@@ -430,6 +443,25 @@ impl<'d> Sx1262<'d> {
 
     pub fn set_buffer_base_address(&mut self, tx: u8, rx: u8) {
         self.cmd(op::SET_BUFFER_BASE_ADDRESS, &[tx, rx]);
+    }
+
+    /// Name the registers the chip restores when it wakes from a sleep that
+    /// kept its context.
+    ///
+    /// Only a duty cycle needs this, and for it the datasheet calls it
+    /// mandatory: the receiver gain register is outside the retention set,
+    /// so a sentry that boosted its gain at init loses the boost on its
+    /// first sleep and listens about 2 dB deafer for every window after -
+    /// on the one link where sensitivity is the whole point, and with
+    /// nothing anywhere to say it happened.
+    pub fn set_retention_list(&mut self, regs: &[u16]) {
+        let n = regs.len().min(reg::RETENTION_MAX);
+        self.write_reg(reg::RETENTION_COUNT, n as u8);
+        for (i, addr) in regs.iter().take(n).enumerate() {
+            let at = reg::RETENTION_LIST + (i as u16) * 2;
+            self.write_reg(at, (addr >> 8) as u8);
+            self.write_reg(at + 1, *addr as u8);
+        }
     }
 
     /// Enable `mask` and route the same bits to DIO1, so [`Self::irq_pending`]

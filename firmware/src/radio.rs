@@ -737,6 +737,10 @@ impl<'d> Sx1262Driver<'d> {
     pub fn arm_duty_cycle(&mut self, rx_us: u32, sleep_us: u32, detect_symbols: u8, mask: u16) {
         self.rx_active = false;
         self.radio.set_standby(StandbyClk::Rc);
+        // The receiver gain is outside the chip's warm-start retention set,
+        // so without this the boost set at init survives only until the
+        // first sleep phase and every window after it listens deafer.
+        self.radio.set_retention_list(&[reg::RX_GAIN]);
         self.radio.set_lora_packet_params(RX_MAX_PAYLOAD);
         self.radio.set_lora_symb_num_timeout(detect_symbols);
         self.radio.set_dio_irq_params(mask);
@@ -761,6 +765,23 @@ impl<'d> Sx1262Driver<'d> {
         self.radio.set_dio_irq_params(mask);
         self.radio.clear_irq_status(irq::ALL);
         self.radio.set_rx(RX_CONTINUOUS);
+    }
+
+    /// Arm one receive window of `timeout_ms`, with `mask` routed to DIO1.
+    ///
+    /// The instrument for the chip's own timebase. This timeout is counted
+    /// in the same 15.625 us steps off the same RC64k that times a duty
+    /// cycle's sleep, so timing it against the host's crystal measures the
+    /// oscillator that decides how wide a wake preamble has to be - and it
+    /// needs no second board, because the answer does not depend on hearing
+    /// anything.
+    pub fn arm_rx_timeout(&mut self, timeout_ms: u32, mask: u16) {
+        self.rx_active = false;
+        self.radio.set_standby(StandbyClk::Rc);
+        self.radio.set_lora_packet_params(RX_MAX_PAYLOAD);
+        self.radio.set_dio_irq_params(mask);
+        self.radio.clear_irq_status(irq::ALL);
+        self.radio.set_rx(crate::sx1262::timeout_from_millis(timeout_ms));
     }
 
     /// Whether the radio is asserting DIO1.

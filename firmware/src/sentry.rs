@@ -31,7 +31,8 @@
 use embassy_time::{Duration, Instant, Timer};
 use esp_println::println;
 use midair_proto::sentry::{
-    classify_charge, summarize_intervals, sweep_floor, SweepStep, TcxoCharge, DETECT_SYMBOLS,
+    classify_charge, drift_us, min_rx_for_margin, min_rx_us, rc_rate, summarize_intervals,
+    sweep_floor, SweepStep, TcxoCharge, DETECT_SYMBOLS,
 };
 use midair_proto::supervise::{Phase, Task};
 
@@ -86,6 +87,11 @@ const TRIAL_CYCLES: u32 = 3;
 /// that needs longer can be restarted deliberately.
 const SOURCE_MAX_KEYED_S: u64 = 1_200;
 
+/// The board's configured oscillator startup, microseconds. The datasheet
+/// adds this between the sleep and receive phases of a duty cycle, so it
+/// widens the deaf gap a preamble has to span.
+const TCXO_US: u32 = 10_000;
+
 /// Most transmit power the source will key at, dBm.
 ///
 /// Two boards on a bench need milliwatts, and this is what makes keeping
@@ -121,7 +127,11 @@ pub async fn probe(radio: &mut Sx1262Driver<'_>) -> ! {
         t_sym, DETECT_SYMBOLS, listening);
     println!("sentry probe: source must be keying a continuous preamble on the same settings");
 
-    // The control first. Everything after it assumes a signal is reachable,
+    // The chip's own timebase first: it needs no source, and what it
+    // measures is what decides how wide every window below has to be.
+    rc_timebase(radio).await;
+
+    // The control next. Everything after it assumes a signal is reachable,
     // and without this a silent source and a duty cycle that never ran
     // produce the same "nothing detected" from every phase below.
     if !hearing(radio).await {
@@ -168,6 +178,123 @@ pub async fn probe(radio: &mut Sx1262Driver<'_>) -> ! {
         }
         Timer::after(Duration::from_millis(200)).await;
     }
+}
+
+/// Time the chip's own sleep timer against the host's crystal.
+///
+/// The receive timeout is counted in the same 15.625 us steps off the same
+/// RC64k that times a duty cycle's sleep phase, so a timeout commanded and
+/// then measured says what that oscillator is really running at. Nothing
+/// has to be on the air for this, which is why it goes first.
+///
+/// The number matters because the preamble window has to absorb this error
+/// over a whole sleep. The window is tens of milliseconds; one percent of a
+/// one-second sleep is ten. So this is what sets the receive window, and
+/// the receive window is what the sentry's current is proportional to.
+async fn rc_timebase(radio: &mut Sx1262Driver<'_>) {
+    /// Commanded timeout per trial, ms. Long enough that the fixed costs of
+    /// arming and of the poll period are a small part of it.
+    const RC_TIMEOUT_MS: u32 = 2_000;
+    const RC_TRIALS: usize = 8;
+
+    println!("sentry probe: timing the chip's RC64k, {} trials of {} ms", RC_TRIALS, RC_TIMEOUT_MS);
+    let commanded_us = RC_TIMEOUT_MS * 1_000;
+    let mut measured: heapless::Vec<u32, RC_TRIALS> = heapless::Vec::new();
+    for _ in 0..RC_TRIALS {
+        radio.arm_rx_timeout(RC_TIMEOUT_MS, irq::TIMEOUT);
+        let started = Instant::now();
+        // Generous: a timer that runs very long must be measured, not cut
+        // off at the value being checked.
+        let give_up = started + Duration::from_millis(u64::from(RC_TIMEOUT_MS) * 3);
+        let mut got = None;
+        while Instant::now() < give_up {
+            watchdog::beat(Task::Loop, Phase::Receive);
+            if radio.irq_pending() {
+                let at = Instant::now();
+                if radio.take_irq() & irq::TIMEOUT != 0 {
+                    got = Some((at - started).as_micros() as u32);
+                    break;
+                }
+            }
+            Timer::after(Duration::from_millis(POLL_MS)).await;
+        }
+        match got {
+            Some(us) => {
+                let _ = measured.push(us);
+            }
+            None => println!("sentry probe: a timeout never fired - the chip is not counting"),
+        }
+    }
+
+    let Some(r) = rc_rate(commanded_us, &measured) else {
+        println!("sentry probe: RC64k NOT MEASURED - no trial completed");
+        return;
+    };
+    println!(
+        "sentry probe: RC64k {} trials, mean {} ppm, min {} ppm, max {} ppm",
+        r.trials, r.mean_ppm, r.min_ppm, r.max_ppm
+    );
+    // The offset and the spread are different things and only one of them
+    // costs anything. An offset is the same every cycle and divides out of
+    // the period commanded; the spread is what a window has to be wide
+    // enough to absorb.
+    let sleep = SLEEP_US;
+    let spread = r.spread_ppm();
+    println!(
+        "sentry probe: offset {} ppm (correctable: command {} us for a {} us sleep)",
+        r.mean_ppm,
+        r.correct_us(sleep),
+        sleep
+    );
+    println!(
+        "sentry probe: spread {} ppm is {} us over a {} ms sleep - this is what needs margin",
+        spread,
+        drift_us(sleep, spread),
+        sleep / 1000
+    );
+    let t_sym = radio.symbol_time_us();
+    let floor = min_rx_us_for(t_sym);
+    for (label, ppm) in [("corrected", spread), ("uncorrected", r.worst_abs_ppm())] {
+        let needed = min_rx_for_margin_us(t_sym, sleep, ppm);
+        println!(
+            "sentry probe: {} - window >= {} us ({} over the {} us floor), {} permille duty",
+            label,
+            needed,
+            needed.saturating_sub(floor),
+            floor,
+            (u64::from(needed) * 1000 / u64::from(needed + sleep + TCXO_US)) as u32
+        );
+    }
+    // Said plainly, because it is the finding: these trials ran seconds
+    // apart on a board at one temperature, and a stored board does not sit
+    // at one temperature for a month.
+    println!("sentry probe: NOTE the spread above is short-term only - temperature drift is unmeasured");
+}
+
+/// The fixed floor, for the running modulation.
+fn min_rx_us_for(t_sym_us: u32) -> u32 {
+    let mut cfg = midair_proto::radiocfg::RadioConfig::default();
+    cfg.spreading_factor = sf_for(t_sym_us);
+    min_rx_us(&cfg, DETECT_SYMBOLS, TCXO_US)
+}
+
+/// The window a measured drift demands, for the running modulation.
+fn min_rx_for_margin_us(t_sym_us: u32, sleep_us: u32, ppm: u32) -> u32 {
+    let mut cfg = midair_proto::radiocfg::RadioConfig::default();
+    cfg.spreading_factor = sf_for(t_sym_us);
+    min_rx_for_margin(&cfg, DETECT_SYMBOLS, TCXO_US, sleep_us, ppm)
+}
+
+/// Recover the spreading factor from the symbol time at the default 500 kHz
+/// bandwidth, so the arithmetic above is done on what the radio is running
+/// rather than on the config default.
+fn sf_for(t_sym_us: u32) -> u8 {
+    // t_sym = 2^sf / bw, and at 500 kHz that is 2^sf * 2 us.
+    let mut sf = 5u8;
+    while sf < 12 && (1u32 << sf) * 2 < t_sym_us {
+        sf += 1;
+    }
+    sf
 }
 
 /// Listen continuously for a few seconds and say whether anything is there.

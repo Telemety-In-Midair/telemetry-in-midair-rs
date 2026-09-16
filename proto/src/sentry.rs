@@ -262,6 +262,129 @@ pub fn sweep_floor(steps: &[SweepStep], t_sym_us: u32, detect_symbols: u8) -> Op
     })
 }
 
+/// What the chip's own sleep timer runs at, against the commanded value.
+///
+/// The sleep half of a duty cycle is counted by the SX126x's RC64k, which
+/// the datasheet calibrates against the crystal at power-on and on a
+/// `Calibrate` command - and then does not specify. It is an RC oscillator,
+/// so it drifts with temperature from wherever calibration left it, by an
+/// amount the part does not commit to.
+///
+/// That matters because the preamble window has to absorb the error over a
+/// whole sleep period: a sleep that runs 1% fast moves the instant a window
+/// opens by 1% of the sleep, and the window is only a few tens of
+/// milliseconds wide. So this is measured rather than assumed, and it is
+/// what sets the receive window through [`min_rx_for_margin`].
+///
+/// Positive parts-per-million means the timer ran *long* - the measured
+/// interval was more than the commanded one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RcRate {
+    pub mean_ppm: i32,
+    pub min_ppm: i32,
+    pub max_ppm: i32,
+    pub trials: u32,
+}
+
+impl RcRate {
+    /// The largest error either side of nominal, in parts per million.
+    ///
+    /// What a margin must cover only if the commanded period is left
+    /// uncorrected. Usually it should not be - see [`spread_ppm`](Self::spread_ppm).
+    pub fn worst_abs_ppm(&self) -> u32 {
+        self.min_ppm.unsigned_abs().max(self.max_ppm.unsigned_abs())
+    }
+
+    /// The part of the error a margin actually has to absorb: how far the
+    /// trials sit from their own mean, rather than from nominal.
+    ///
+    /// The distinction is worth real current. An RC oscillator's error
+    /// splits into an offset, which is the same every cycle and can simply
+    /// be divided out of the period commanded, and a spread, which cannot.
+    /// Sizing a receive window against the offset buys margin for a drift
+    /// that does not happen, and the window is what the sentry's current is
+    /// proportional to.
+    ///
+    /// What this cannot see is temperature. These trials run seconds apart
+    /// on a board at one temperature, so the spread they show is short-term
+    /// jitter; a board stored for weeks moves with its surroundings, and
+    /// that is a longer measurement than this one.
+    pub fn spread_ppm(&self) -> u32 {
+        (self.max_ppm - self.mean_ppm)
+            .unsigned_abs()
+            .max((self.mean_ppm - self.min_ppm).unsigned_abs())
+    }
+
+    /// The period to command so the chip produces `want_us`.
+    ///
+    /// Divides the measured offset back out: a timer running long by its
+    /// mean error is asked for proportionally less.
+    pub fn correct_us(&self, want_us: u32) -> u32 {
+        let scaled = i64::from(want_us) * 1_000_000 / (1_000_000 + i64::from(self.mean_ppm));
+        scaled.clamp(0, i64::from(u32::MAX)) as u32
+    }
+}
+
+/// Summarize measured timer intervals against what was asked for.
+///
+/// `measured_us` are the real elapsed times, by a clock that can be
+/// trusted - the host's crystal - for a timeout commanded as
+/// `commanded_us` and counted by the chip.
+pub fn rc_rate(commanded_us: u32, measured_us: &[u32]) -> Option<RcRate> {
+    if commanded_us == 0 || measured_us.is_empty() {
+        return None;
+    }
+    let mut sum = 0i64;
+    let mut min_ppm = i32::MAX;
+    let mut max_ppm = i32::MIN;
+    for &m in measured_us {
+        // (measured - commanded) / commanded, in parts per million, with
+        // the multiply first so integer division does not eat the result.
+        let ppm = ((i64::from(m) - i64::from(commanded_us)) * 1_000_000
+            / i64::from(commanded_us)) as i32;
+        sum += i64::from(ppm);
+        min_ppm = min_ppm.min(ppm);
+        max_ppm = max_ppm.max(ppm);
+    }
+    Some(RcRate {
+        mean_ppm: (sum / measured_us.len() as i64) as i32,
+        min_ppm,
+        max_ppm,
+        trials: measured_us.len() as u32,
+    })
+}
+
+/// How far a sleep of `sleep_us` can land off its nominal instant when the
+/// timer counting it is wrong by `ppm_abs`, in microseconds.
+///
+/// The preamble window has to be at least this wide, or a wake that was
+/// sized correctly on paper misses because the receiver woke at the wrong
+/// moment.
+pub fn drift_us(sleep_us: u32, ppm_abs: u32) -> u32 {
+    ((u64::from(sleep_us) * u64::from(ppm_abs)) / 1_000_000) as u32
+}
+
+/// The receive window a sentry needs so its preamble window covers both the
+/// timer's error over one sleep and the fixed costs of detection.
+///
+/// Inverts `margin = 2 * rxPeriod - (Theader + Tdetect + Ttcxo)`: the margin
+/// wanted is the drift, so the window follows from it. This is the number
+/// the whole design hangs on, because the receive window is the only lever
+/// on margin and it is also what the sentry's current is proportional to.
+pub fn min_rx_for_margin(
+    cfg: &RadioConfig,
+    detect_symbols: u8,
+    tcxo_us: u32,
+    sleep_us: u32,
+    ppm_abs: u32,
+) -> u32 {
+    let fixed = min_rx_us(cfg, detect_symbols, tcxo_us) * 2;
+    // Two-sided: the sleep may run long or short, so the window has to hold
+    // the drift in either direction.
+    let need = fixed.saturating_add(drift_us(sleep_us, ppm_abs).saturating_mul(2));
+    need.div_ceil(2)
+}
+
 /// Symbols the LoRa explicit header occupies, which the chip must also
 /// receive inside its restarted timer once it has heard a preamble.
 pub const HEADER_SYMBOLS: u32 = 8;
@@ -601,6 +724,87 @@ mod tests {
 
     /// The board's configured oscillator startup, microseconds.
     const TCXO_US: u32 = 10_000;
+
+    #[test]
+    fn a_timer_that_runs_long_reads_positive() {
+        // 1 s commanded, 1.01 s measured: the chip's timer is 1% slow, so
+        // the interval it produced is 1% long.
+        let r = rc_rate(1_000_000, &[1_010_000]).unwrap();
+        assert_eq!(r.mean_ppm, 10_000);
+        assert_eq!(r.worst_abs_ppm(), 10_000);
+        // And short reads negative, with the same magnitude on the margin.
+        let r = rc_rate(1_000_000, &[990_000]).unwrap();
+        assert_eq!(r.mean_ppm, -10_000);
+        assert_eq!(r.worst_abs_ppm(), 10_000);
+    }
+
+    #[test]
+    fn a_steady_offset_is_corrected_rather_than_covered() {
+        // What the bench measured: a large, very consistent error. Covering
+        // it with margin would size the receive window for 1% of the sleep
+        // when the cycle-to-cycle variation is a small fraction of that.
+        let r = rc_rate(2_000_000, &[2_021_374, 2_021_314, 2_021_502]).unwrap();
+        assert!(r.mean_ppm > 10_000, "a large offset");
+        assert!(r.spread_ppm() < 100, "but a tiny spread");
+        assert!(r.worst_abs_ppm() > 100 * r.spread_ppm());
+        // Commanding the corrected period gets the interval actually wanted.
+        let asked = r.correct_us(1_000_000);
+        assert!(asked < 1_000_000, "a timer running long is asked for less");
+        let produced = asked + drift_us(asked, r.mean_ppm.unsigned_abs());
+        assert!(produced.abs_diff(1_000_000) < 1_000);
+    }
+
+    #[test]
+    fn the_spread_is_what_the_window_has_to_pay_for() {
+        let c = cfg();
+        let r = rc_rate(2_000_000, &[2_021_374, 2_021_314, 2_021_502]).unwrap();
+        let uncorrected = min_rx_for_margin(&c, DETECT_SYMBOLS, TCXO_US, 1_000_000, r.worst_abs_ppm());
+        let corrected = min_rx_for_margin(&c, DETECT_SYMBOLS, TCXO_US, 1_000_000, r.spread_ppm());
+        assert!(corrected < uncorrected);
+        // And with the offset divided out the window is essentially the
+        // fixed floor, which is the cheapest a sentry can be.
+        assert!(corrected - min_rx_us(&c, DETECT_SYMBOLS, TCXO_US) < 1_000);
+    }
+
+    #[test]
+    fn the_margin_covers_the_worse_side_not_the_average() {
+        // A timer that mostly runs fast but sometimes runs slow has to be
+        // covered at its worst, in whichever direction that falls - an
+        // average near zero would size the window for a drift that does
+        // not happen.
+        let r = rc_rate(1_000_000, &[1_020_000, 980_000, 1_001_000]).unwrap();
+        assert!(r.mean_ppm.abs() < 5_000, "the average hides it");
+        assert_eq!(r.worst_abs_ppm(), 20_000);
+    }
+
+    #[test]
+    fn rc_rate_needs_something_to_measure() {
+        assert_eq!(rc_rate(1_000_000, &[]), None);
+        assert_eq!(rc_rate(0, &[1_000]), None);
+    }
+
+    #[test]
+    fn drift_scales_with_the_sleep_it_is_measured_over() {
+        // The reason a long sleep is not free: the same timer error costs
+        // proportionally more margin the longer it is counting for.
+        assert_eq!(drift_us(1_000_000, 10_000), 10_000);
+        assert_eq!(drift_us(4_000_000, 10_000), 40_000);
+    }
+
+    #[test]
+    fn a_drifting_timer_buys_its_margin_with_receive_window() {
+        let c = cfg();
+        let steady = min_rx_for_margin(&c, DETECT_SYMBOLS, TCXO_US, 1_000_000, 0);
+        let sloppy = min_rx_for_margin(&c, DETECT_SYMBOLS, TCXO_US, 1_000_000, 10_000);
+        // With a perfect timer the window is just the fixed costs.
+        assert_eq!(steady, min_rx_us(&c, DETECT_SYMBOLS, TCXO_US));
+        // At 1% over a one-second sleep it has to grow by the drift.
+        assert_eq!(sloppy, steady + drift_us(1_000_000, 10_000));
+        // And a sentry built to it actually admits a preamble.
+        let s = Sentry::new(&c, 1_000_000, sloppy - 4 * c.symbol_time_us(), DETECT_SYMBOLS, TCXO_US);
+        assert!(s.feasible());
+        assert!(s.preamble_window_us() >= 2 * drift_us(1_000_000, 10_000));
+    }
 
     #[test]
     fn the_preamble_is_bounded_at_both_ends() {
