@@ -392,6 +392,69 @@ impl Ping {
     }
 }
 
+/// A request that a sleeping node come back.
+///
+/// The one message sent on the wake sync word rather than the network's,
+/// behind a preamble sized to a sleeping receiver's whole duty cycle. The
+/// receiver that hears it is asleep in every sense but the radio's: the
+/// chip that owns it is in deep sleep and is woken by the radio's DIO1,
+/// reads this from the radio's buffer before doing anything else, and
+/// decides from the target whether the rest of a boot is worth paying for.
+pub const MSG_WAKE: u8 = 0x53;
+
+/// Encoded length of a wake message. Fixed.
+pub const WAKE_MSG_LEN: usize = 4;
+
+/// A wake meant for every sleeping node in earshot.
+pub const WAKE_BROADCAST: u8 = 0;
+
+/// Set in [`Wake::flags`] when the woken node should come up tracking
+/// rather than merely reachable.
+pub const WAKE_FLAG_TRACKING: u8 = 1 << 0;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Wake {
+    /// The address to wake, or [`WAKE_BROADCAST`].
+    pub target: u8,
+    /// Come up tracking - GPS and beacon - instead of idle.
+    pub tracking: bool,
+    /// Tells one burst from the next, so a node that hears the same burst
+    /// twice knows it is one request. Wraps.
+    pub nonce: u8,
+}
+
+impl Wake {
+    pub fn flags(&self) -> u8 {
+        if self.tracking {
+            WAKE_FLAG_TRACKING
+        } else {
+            0
+        }
+    }
+
+    pub fn encode(&self) -> [u8; WAKE_MSG_LEN] {
+        [MSG_WAKE, self.target, self.flags(), self.nonce]
+    }
+
+    /// Decode a wake, or `None` if the payload is something else or short.
+    /// Unknown flag bits are ignored.
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.first() != Some(&MSG_WAKE) || data.len() < WAKE_MSG_LEN {
+            return None;
+        }
+        Some(Self {
+            target: data[1],
+            tracking: data[2] & WAKE_FLAG_TRACKING != 0,
+            nonce: data[3],
+        })
+    }
+
+    /// Whether a node at `address` is being asked for.
+    pub fn is_for(&self, address: u8) -> bool {
+        self.target == WAKE_BROADCAST || self.target == address
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,5 +672,33 @@ mod tests {
         let hop2 = Frame::decode(&out[..n2]).unwrap();
         assert_eq!((hop2.src, hop2.id, hop2.hops_left), (7, 9, 1));
         assert_eq!(decode_position(hop2.payload), Some(sample()));
+    }
+}
+
+#[cfg(test)]
+mod wake_tests {
+    use super::*;
+
+    #[test]
+    fn wake_round_trips_and_ignores_unknown_flags() {
+        let w = Wake { target: 7, tracking: true, nonce: 200 };
+        let b = w.encode();
+        assert_eq!(b, [MSG_WAKE, 7, WAKE_FLAG_TRACKING, 200]);
+        assert_eq!(Wake::decode(&b), Some(w));
+        let mut noisy = b;
+        noisy[2] |= 0x80;
+        assert_eq!(Wake::decode(&noisy), Some(w));
+        assert_eq!(Wake::decode(&b[..3]), None);
+        assert_eq!(Wake::decode(&[MSG_PING, 7, 0, 0]), None);
+    }
+
+    #[test]
+    fn broadcast_is_for_everyone_and_a_target_for_one() {
+        let all = Wake { target: WAKE_BROADCAST, ..Wake::default() };
+        assert!(all.is_for(1) && all.is_for(255));
+        let one = Wake { target: 9, ..Wake::default() };
+        assert!(one.is_for(9));
+        assert!(!one.is_for(10));
+        assert!(!one.is_for(0));
     }
 }

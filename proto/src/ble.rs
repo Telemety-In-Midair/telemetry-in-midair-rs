@@ -513,12 +513,21 @@ pub const CFG_ESP_SLEEP_S: u8 = 0x13;
 
 /// Clamp range for [`CFG_ESP_SLEEP_S`].
 ///
-/// The ceiling is the worst case for reaching a sleeping board, since
-/// deep sleep has no wake source but the timer - nothing over the air can
-/// interrupt it. Five minutes keeps that wait short enough that a sleeping
-/// board is always a wait rather than a lockout.
+/// The ceiling is the worst case for reaching a sleeping board that cannot
+/// be woken over LoRa - one whose radio config has `wake_enabled` off, or
+/// is hopping. With the sentry armed the cadence is a backstop rather than
+/// the only way in, and an hour between wake checks is what makes storing
+/// a board cheap. Without it, an hour is an hour of lockout, which is why
+/// the default cadence a store borrows stays at five minutes.
 pub const ESP_SLEEP_MIN_S: u32 = 5;
-pub const ESP_SLEEP_MAX_S: u32 = 5 * 60;
+pub const ESP_SLEEP_MAX_S: u32 = 60 * 60;
+
+/// The cadence a board told to store itself borrows when it has none set.
+///
+/// The ceiling used to be five minutes and this was it; the ceiling grew
+/// for boards that can be woken over LoRa, and a board with no cadence
+/// configured has not said it is one of those.
+pub const STORE_DEFAULT_S: u32 = 5 * 60;
 
 /// `u32` seconds: how long each sleep-mode wake check advertises before
 /// going back to deep sleep. Only meaningful while [`CFG_ESP_SLEEP_S`] is
@@ -701,6 +710,17 @@ pub const BLE_ON_DEFAULT_S: u32 = 15;
 /// length of 0 means the name was cleared. What the board is actually
 /// called comes back on [`NAME_UUID`].
 pub const CFG_NAME: u8 = 0x19;
+
+/// Write: call another node over LoRa. Two bytes: the target's address
+/// (0 for every sleeping node in earshot) and flags, of which bit 0 asks
+/// the woken node to come up tracking rather than idle.
+///
+/// A command rather than a setting: nothing is stored. The hardware loop
+/// sends a burst of wake frames on the target's sentry preamble and
+/// listens for its answer between them, and says on the console how it
+/// went. Refused with a bad-state ack on a node whose radio is not up or
+/// whose role never transmits.
+pub const CFG_WAKE: u8 = 0x1B;
 
 /// What [`CFG_SLEEP_NOW`] with a value of 0 resolves to when sleep mode is
 /// off. Long enough to be an unmistakable sleep on a bench and short enough

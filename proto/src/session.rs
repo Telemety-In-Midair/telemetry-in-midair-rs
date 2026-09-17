@@ -22,6 +22,7 @@
 
 use crate::ble::{self, Mode};
 use crate::link;
+use crate::lora;
 use crate::posture::Request;
 use gps_proto::packet;
 
@@ -176,7 +177,7 @@ pub const KNOBS: [KnobSpec; 5] = [
         since: 2,
         record_at: 8,
         wire_at: 4,
-        doc: "Seconds between wake checks while the board is stored, 0 or 5-300. 0 means the board never stores itself on its own: with no cadence to sleep on, the idle timeout has nowhere to send it and it stays awake and reachable. That is the bench setting. A board explicitly told to store itself still sleeps, on the 300 s ceiling. Deep sleep takes the whole chip down rather than just the BLE controller, so it is the larger saving and the larger cost: the board stops beaconing, stops logging, and every wake is a full reset. Ignored while tracking - a tracker that deep-sleeps is not tracking.",
+        doc: "Seconds between wake checks while the board is stored, 0 or 5-3600. 0 means the board never stores itself on its own: with no cadence to sleep on, the idle timeout has nowhere to send it and it stays awake and reachable. That is the bench setting. A board explicitly told to store itself still sleeps, on a 300 s default. Deep sleep takes the whole chip down rather than just the BLE controller, so it is the larger saving and the larger cost: the board stops beaconing, stops logging, and every wake is a full reset. With wake_enabled on in the radio config the radio keeps listening for a wake frame through the sleep, so this cadence is a backstop and an hour is a fine value; with it off, this is the only way back in. Ignored while tracking - a tracker that deep-sleeps is not tracking.",
         get: |s| s.sleep_interval_s,
         set: |s, v| s.sleep_interval_s = v,
         wire_get: |w| w.sleep_interval_s,
@@ -395,12 +396,12 @@ impl Stored {
     /// `sleep_interval_s` when it is set. When it is not, an explicit
     /// `CFG_MODE stored` is still an unambiguous instruction - the same
     /// reading [`ble::resolve_sleep_now`] gives a commanded nap - so it
-    /// borrows the ceiling rather than being ignored. The passive path (an
+    /// borrows a default rather than being ignored. The passive path (an
     /// idle timeout) does not do this: nobody asked for that one, so a
     /// board with deep sleep off simply stays awake.
     pub fn sleep_cadence(&self) -> u32 {
         match self.sleep_interval_s {
-            0 => ble::ESP_SLEEP_MAX_S,
+            0 => ble::STORE_DEFAULT_S,
             s => s,
         }
     }
@@ -662,6 +663,10 @@ pub enum Action {
     /// response catches up at the next advertising window, since the one
     /// running was handed to the controller before the write arrived.
     Name,
+    /// Call `target` over LoRa: a burst of wake frames on its sentry
+    /// preamble, ending at its answer. `tracking` asks it to come up
+    /// tracking rather than idle. Nothing stored.
+    WakeNode { target: u8, tracking: bool },
     /// Nothing to do - the write was rejected, and the ack says why.
     None,
 }
@@ -797,6 +802,20 @@ pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
                     id,
                     packet::ACK_OK,
                     &[value.len() as u8],
+                );
+            }
+            ble::CFG_WAKE => {
+                let Some(&target) = value.first() else {
+                    return Outcome::reject(id, packet::ACK_BAD_VALUE);
+                };
+                let flags = value.get(1).copied().unwrap_or(0);
+                let tracking = flags & lora::WAKE_FLAG_TRACKING != 0;
+                return Outcome::new(
+                    Action::WakeNode { target, tracking },
+                    false,
+                    id,
+                    packet::ACK_OK,
+                    &[target, flags],
                 );
             }
             ble::CFG_SLEEP_NOW => {
@@ -1231,6 +1250,8 @@ pub struct Dispatch {
     /// The position notify interval, which is session state rather than a
     /// stored setting.
     pub notify_interval_ms: Option<u32>,
+    /// A node to call over LoRa: `(target, tracking)`.
+    pub wake: Option<(u8, bool)>,
 }
 
 /// What `action` sets in motion, given the settings as they are after the
@@ -1249,6 +1270,7 @@ pub fn dispatch(action: Action, stored: &Stored) -> Dispatch {
             d.request = Some(Request::Mode(mode));
             d.command = Some(ServeCommand::ModeChanged);
         }
+        Action::WakeNode { target, tracking } => d.wake = Some((target, tracking)),
         // Settings the loops read for themselves when they next decide.
         Action::Knob(..) | Action::Name | Action::None => {}
     }
@@ -2035,11 +2057,11 @@ mod tests {
             sleep_interval_s: 0,
             ..Stored::new()
         };
-        assert_eq!(s.sleep_cadence(), ble::ESP_SLEEP_MAX_S);
+        assert_eq!(s.sleep_cadence(), ble::STORE_DEFAULT_S);
         assert_eq!(
             s.at_expiry(),
             Next::Sleep {
-                interval_s: ble::ESP_SLEEP_MAX_S
+                interval_s: ble::STORE_DEFAULT_S
             }
         );
         assert_eq!(cadence(120).sleep_cadence(), 120);
@@ -2578,7 +2600,7 @@ mod tests {
         );
         assert_eq!(
             dispatch(Action::SetMode(Mode::Stored), &Stored::new()).command,
-            Some(ServeCommand::SleepNow(ble::ESP_SLEEP_MAX_S))
+            Some(ServeCommand::SleepNow(ble::STORE_DEFAULT_S))
         );
         assert_eq!(
             dispatch(Action::SleepNow(30), &s),

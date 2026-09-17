@@ -150,6 +150,11 @@ pub enum Radio {
     /// Initialized from the running config and, on a listening role, in
     /// continuous receive.
     Up,
+    /// Duty-cycling on its own timers with the wake sync word, waiting
+    /// for a wake frame while the chip sleeps. Only ever entered by a park,
+    /// and from then on nothing may touch the radio over SPI: a transaction
+    /// during its sleep phase ends the cycle.
+    Sentry,
 }
 
 /// Where the GPS receiver is.
@@ -192,6 +197,10 @@ pub enum Effect {
     RadioStandby,
     /// Put the radio into cold sleep.
     RadioSleep,
+    /// Arm the radio's sniff loop for a wake frame and leave it running.
+    /// The task falls back to [`Effect::RadioSleep`] if the config's
+    /// sentry cannot be armed.
+    RadioSentry,
     /// Blank the status panel.
     PanelBlank,
     /// Adopt the pushed config: re-init the radio and the node from it and
@@ -266,6 +275,11 @@ pub struct Posture {
     /// Parked for a deep sleep: everything down, and staying down
     /// whatever arrives until the chip goes.
     pub parked: bool,
+    /// Whether a park arms the radio as a sentry rather than sleeping it.
+    /// The config's `wake_enabled`, once the config has been read; the
+    /// default until then, so a wake check that has never read its config
+    /// arms one and lets the task's own check of the config decide.
+    pub sentry: bool,
 }
 
 impl Posture {
@@ -288,6 +302,7 @@ impl Posture {
                     gps: Gps::Parked,
                     config: Config::Unread,
                     parked: false,
+                    sentry: true,
                 }
             }
             Mode::Idle => {
@@ -300,6 +315,7 @@ impl Posture {
                     gps: Gps::Parked,
                     config: Config::Read,
                     parked: false,
+                    sentry: true,
                 }
             }
             Mode::Tracking | Mode::Listening => {
@@ -312,6 +328,7 @@ impl Posture {
                     gps: Gps::Awake,
                     config: Config::Read,
                     parked: false,
+                    sentry: true,
                 }
             }
         };
@@ -328,6 +345,11 @@ impl Posture {
         self.move_gps(want_gps, fx);
         let want_radio = if stored.radio_standby() { Radio::Standby } else { Radio::Up };
         self.move_radio(want_radio, fx);
+    }
+
+    /// What the config, once read, says a park does with the radio.
+    pub fn set_sentry(&mut self, on: bool) {
+        self.sentry = on;
     }
 
     /// Read the stored config a wake check left unread.
@@ -360,10 +382,18 @@ impl Posture {
             // radio that lost its configuration in cold sleep is brought
             // up first, exactly as the boot path does.
             Radio::Standby => {
-                if self.radio == Radio::Asleep {
+                if self.radio != Radio::Up {
                     fx.push(Effect::RadioInit);
                 }
                 fx.push(Effect::RadioStandby);
+            }
+            // Arming needs a configured radio, and a config to configure
+            // it from: a wake check has read neither.
+            Radio::Sentry => {
+                if self.radio != Radio::Up && self.radio != Radio::Standby {
+                    fx.push(Effect::RadioInit);
+                }
+                fx.push(Effect::RadioSentry);
             }
         }
         self.radio = want;
@@ -426,6 +456,10 @@ impl Posture {
                     Radio::Up => {}
                     Radio::Standby => fx.push(Effect::RadioStandby),
                     Radio::Asleep => fx.push(Effect::RadioSleep),
+                    // Unreachable in practice - a sentry only exists on a
+                    // parked board, and a parked board takes no config -
+                    // but if it were, the new config is what to listen on.
+                    Radio::Sentry => fx.push(Effect::RadioSentry),
                 }
             }
             Request::PrepareSleep => {
@@ -440,11 +474,21 @@ impl Posture {
                 // reset leaves the driver believing the module is awake,
                 // and the module is not obliged to agree with either.
                 fx.push(Effect::GpsPark);
-                fx.push(Effect::RadioSleep);
+                self.gps = Gps::Parked;
+                if self.sentry {
+                    // The sentry listens on the config's carrier with the
+                    // config's modulation, so the config has to be read
+                    // and the radio initialized from it before the arm -
+                    // which for a wake check is the first time either
+                    // happens.
+                    self.load(&mut fx);
+                    self.move_radio(Radio::Sentry, &mut fx);
+                } else {
+                    fx.push(Effect::RadioSleep);
+                    self.radio = Radio::Asleep;
+                }
                 fx.push(Effect::PanelBlank);
                 fx.push(Effect::SleepReady);
-                self.gps = Gps::Parked;
-                self.radio = Radio::Asleep;
                 self.parked = true;
             }
             // The posture is not moved because the reset follows.
@@ -526,7 +570,24 @@ impl Posture {
     pub fn consistent(&self, stored: &Stored) -> Result<(), &'static str> {
         let down = self.radio == Radio::Asleep && self.gps == Gps::Parked;
         if self.parked {
-            return if down { Ok(()) } else { Err("parked for sleep with something still up") };
+            // A sentry is the one thing a parked board leaves running. It
+            // is armed on the strength of a config the park may have had
+            // to read in the same breath, so whether it was asked for is
+            // the arm's own check, not this rule's: the task sleeps the
+            // radio cold when the config it just read says no.
+            let radio_down = match self.radio {
+                Radio::Asleep => true,
+                Radio::Sentry => self.config == Config::Read,
+                Radio::Standby | Radio::Up => false,
+            };
+            return if radio_down && self.gps == Gps::Parked {
+                Ok(())
+            } else {
+                Err("parked for sleep with something still up")
+            };
+        }
+        if self.radio == Radio::Sentry {
+            return Err("a sentry outside a park");
         }
         match self.live {
             Mode::Stored => {
@@ -783,6 +844,7 @@ mod tests {
     fn a_park_lowers_everything_and_signals() {
         let s = Stored::new();
         let (mut p, _) = Posture::at_boot(Mode::Tracking, &s);
+        p.set_sentry(false);
         assert_eq!(
             fx(p.on(Request::PrepareSleep, &s)),
             vec![
@@ -796,9 +858,68 @@ mod tests {
         assert_eq!(p.consistent(&s), Ok(()));
         // A receiver that should already be parked is probed first.
         let (mut p, _) = Posture::at_boot(Mode::Stored, &s);
+        p.set_sentry(false);
         let e = p.on(Request::PrepareSleep, &s);
         assert_eq!(e.iter().next(), Some(Effect::CheckParkHeld));
         assert_eq!(e.len(), 5);
+    }
+
+    /// With the config asking for one, a park arms the radio as a sentry
+    /// instead of sleeping it - from a radio that is up, directly; from a
+    /// wake check that has read nothing, after reading the config and
+    /// initializing the radio from it.
+    #[test]
+    fn a_park_arms_a_sentry_when_the_config_asks() {
+        let s = Stored::new();
+        let (mut p, _) = Posture::at_boot(Mode::Tracking, &s);
+        assert_eq!(
+            fx(p.on(Request::PrepareSleep, &s)),
+            vec![
+                Effect::GpsPark,
+                Effect::RadioSentry,
+                Effect::PanelBlank,
+                Effect::SleepReady
+            ]
+        );
+        assert!(p.parked);
+        assert_eq!(p.radio, Radio::Sentry);
+        assert_eq!(p.consistent(&s), Ok(()));
+
+        let (mut p, _) = Posture::at_boot(Mode::Stored, &s);
+        assert_eq!(
+            fx(p.on(Request::PrepareSleep, &s)),
+            vec![
+                Effect::CheckParkHeld,
+                Effect::GpsPark,
+                Effect::LoadConfig,
+                Effect::RadioInit,
+                Effect::RadioSentry,
+                Effect::PanelBlank,
+                Effect::SleepReady
+            ]
+        );
+        assert_eq!(p.consistent(&s), Ok(()));
+
+        // A radio parked in standby is configured already.
+        let (mut p, _) = Posture::at_boot(Mode::Tracking, &s);
+        p.on(Request::RadioStandby(true), &s);
+        let e = fx(p.on(Request::PrepareSleep, &s));
+        assert!(!e.contains(&Effect::RadioInit), "{e:?}");
+        assert!(e.contains(&Effect::RadioSentry));
+    }
+
+    /// A sentry belongs to a park and nowhere else.
+    #[test]
+    fn a_sentry_outside_a_park_is_inconsistent() {
+        let s = Stored::new();
+        let (mut p, _) = Posture::at_boot(Mode::Idle, &s);
+        p.radio = Radio::Sentry;
+        assert!(p.consistent(&s).is_err());
+        p.parked = true;
+        assert_eq!(p.consistent(&s), Ok(()));
+        // Never from a config that was not read: the arm needs one.
+        p.config = Config::Unread;
+        assert!(p.consistent(&s).is_err());
     }
 
     #[test]

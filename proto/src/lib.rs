@@ -77,7 +77,7 @@ pub fn wire_consts_json() -> String {
   \"usb\": {{\"ping\": {}, \"bulk\": {}, \"bulk_ack\": {}, \"info\": {}, \"sleep\": {}, \"cfg\": {}, \"wipe\": {}, \"evlog\": {}}},\n\
   \"bulk\": {{\"begin\": {}, \"data\": {}, \"end\": {}, \"abort\": {}, \"kind_toml\": {}, \"kind_ota\": {}, \"data_max\": {}, \"config_max\": {}, \"ack_id\": {}}},\n\
   \"ack\": {{\"ok\": {}, \"unknown_id\": {}, \"bad_value\": {}, \"board_error\": {}, \"bad_state\": {}}},\n\
-  \"cfg\": {{\"notify_interval_ms\": {}, \"radio_standby\": {}, \"gps_sleep\": {}, \"sleep_now\": {}, \"mode\": {}, \"name\": {}}},\n\
+  \"cfg\": {{\"notify_interval_ms\": {}, \"radio_standby\": {}, \"gps_sleep\": {}, \"sleep_now\": {}, \"mode\": {}, \"name\": {}, \"wake\": {}}},\n\
   \"evlog\": {{\"record_len\": {}, \"header_len\": {}, \"text_max\": {}, \"magic\": {}, \"erase_index\": {}, \"kinds\": {{{}}}, \"tasks\": {{{}}}}},\n\
   \"knobs\": [\n{}\n  ]\n\
 }}\n",
@@ -112,6 +112,7 @@ pub fn wire_consts_json() -> String {
         ble::CFG_SLEEP_NOW,
         ble::CFG_MODE,
         ble::CFG_NAME,
+        ble::CFG_WAKE,
         evlog::RECORD_LEN,
         evlog::HEADER_LEN,
         evlog::TEXT_MAX,

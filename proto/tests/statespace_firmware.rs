@@ -130,6 +130,10 @@ enum Event {
     Sleep,
     /// The RTC timer fires.
     Wake,
+    /// The radio, left as a sentry, heard a wake frame for this board:
+    /// DIO1 woke the chip and the boot comes up idle rather than as a
+    /// wake check.
+    WakeLora,
 }
 
 /// The whole board.
@@ -157,10 +161,19 @@ struct Board {
     /// The last request drained was one the posture ignored because the
     /// board was already parked - kept so a transition check can say so.
     ignored_while_parked: bool,
+    /// The radio config's `wake_enabled`: whether a park leaves the radio
+    /// listening as a sentry. A property of the board, re-applied to the
+    /// posture at every boot as the config load does on the firmware.
+    wake_enabled: bool,
+    /// What the arm actually did: the firmware's sentry effect checks the
+    /// config itself and sleeps the radio cold when it says no, which is
+    /// how a wake check that parked before reading its config ends up
+    /// honoring it. This is the flag the sleep path reads.
+    sentry_armed: bool,
 }
 
 impl Board {
-    fn cold_boot(stored: Stored) -> Self {
+    fn cold_boot(stored: Stored, wake_enabled: bool) -> Self {
         let mut b = Self {
             stored,
             serve: Serve::new(0, &stored),
@@ -173,6 +186,8 @@ impl Board {
             transfer: None,
             tx: false,
             ignored_while_parked: false,
+            wake_enabled,
+            sentry_armed: false,
         };
         b.boot(false);
         b
@@ -182,8 +197,26 @@ impl Board {
     /// wake cause, raise what it raises, start serving on its budget.
     fn boot(&mut self, woke_from_sleep: bool) {
         let mode = boot_mode(self.stored.mode, woke_from_sleep);
+        self.boot_into(mode);
+    }
+
+    /// A LoRa wake: the boot path read the frame, found it was for this
+    /// board, and comes up reachable instead of as a wake check.
+    fn boot_lora(&mut self) {
+        self.boot_into(Mode::Idle);
+    }
+
+    fn boot_into(&mut self, mode: Mode) {
         self.stored.mode = mode;
+        self.sentry_armed = false;
         self.posture = Posture::at_boot(mode, &self.stored).0;
+        // What the config load tells the posture on the firmware. A wake
+        // check has not read its config, and the firmware's arm re-checks
+        // the config before it arms, so the posture's default is what a
+        // wake check parks with.
+        if self.posture.config == Config::Read {
+            self.posture.set_sentry(self.wake_enabled);
+        }
         self.requests = Requests::new();
         self.pending_sleep = None;
         self.sleep_asked = false;
@@ -281,6 +314,15 @@ impl Board {
             }
             for e in fx {
                 match e {
+                    // The config is read: the posture learns what a park
+                    // does with the radio, as the firmware's load does.
+                    Effect::LoadConfig => self.posture.set_sentry(self.wake_enabled),
+                    // The firmware's arm checks the config itself and
+                    // sleeps the radio cold when it says no - which is
+                    // what happens on a wake check, whose park decided on
+                    // the sentry before the config load in the same pass
+                    // could say otherwise.
+                    Effect::RadioSentry => self.sentry_armed = self.wake_enabled,
                     Effect::SleepReady => self.sleep_ready = true,
                     Effect::Reboot => {
                         // A reset: the persisted mode comes back, and the
@@ -299,6 +341,11 @@ impl Board {
         !matches!(self.ble, Ble::Asleep)
     }
 
+    /// Whether the radio is down for a park: cold sleep, or a sentry.
+    fn radio_parked(&self) -> bool {
+        matches!(self.posture.radio, Radio::Asleep | Radio::Sentry)
+    }
+
     fn bounded(&self) -> bool {
         !self.stored.at_expiry().advertises()
     }
@@ -311,28 +358,30 @@ impl Machine for Firmware {
     type Event = Event;
 
     /// Every persisted mode, every override flag combination, on a bench
-    /// board and on a deployed one.
+    /// board and on a deployed one, with and without a sentry.
     fn initial(&self) -> Vec<Board> {
         let mut out = Vec::new();
         for mode in [Mode::Stored, Mode::Tracking, Mode::Listening] {
             for flags in [0, PFLAG_GPS_SLEEP, PFLAG_RADIO_STANDBY, PFLAG_GPS_SLEEP | PFLAG_RADIO_STANDBY] {
-                let bench = Stored {
-                    mode,
-                    flags,
-                    ..Stored::new()
-                };
-                let deployed = Stored {
-                    mode,
-                    flags,
-                    sleep_interval_s: 120,
-                    adv_window_s: 15,
-                    idle_timeout_s: 600,
-                    ble_off_s: 30,
-                    ble_on_s: 20,
-                    ..Stored::new()
-                };
-                out.push(Board::cold_boot(bench));
-                out.push(Board::cold_boot(deployed));
+                for wake_enabled in [false, true] {
+                    let bench = Stored {
+                        mode,
+                        flags,
+                        ..Stored::new()
+                    };
+                    let deployed = Stored {
+                        mode,
+                        flags,
+                        sleep_interval_s: 120,
+                        adv_window_s: 15,
+                        idle_timeout_s: 600,
+                        ble_off_s: 30,
+                        ble_on_s: 20,
+                        ..Stored::new()
+                    };
+                    out.push(Board::cold_boot(bench, wake_enabled));
+                    out.push(Board::cold_boot(deployed, wake_enabled));
+                }
             }
         }
         out
@@ -366,7 +415,12 @@ impl Machine for Firmware {
                     ev.push(Event::Sleep);
                 }
             }
-            Ble::Asleep => ev.push(Event::Wake),
+            Ble::Asleep => {
+                ev.push(Event::Wake);
+                if b.sentry_armed {
+                    ev.push(Event::WakeLora);
+                }
+            }
         }
         if b.awake() {
             // The console is alive whenever the chip is.
@@ -447,6 +501,7 @@ impl Machine for Firmware {
             }
             Event::Sleep => b.ble = Ble::Asleep,
             Event::Wake => b.boot(true),
+            Event::WakeLora => b.boot_lora(),
         }
         b
     }
@@ -460,19 +515,30 @@ impl Machine for Firmware {
                 .consistent(&b.stored)
                 .map_err(|e| format!("posture: {e}"))?;
         }
-        if b.posture.parked && (b.posture.radio != Radio::Asleep || b.posture.gps != Gps::Parked) {
+        if b.posture.parked && (!b.radio_parked() || b.posture.gps != Gps::Parked) {
             return Err("parked for sleep with something still up".into());
         }
         if b.ble == Ble::Asleep {
             if !b.sleep_ready {
                 return Err("asleep without the park having finished".into());
             }
-            if !b.posture.parked
-                || b.posture.radio != Radio::Asleep
-                || b.posture.gps != Gps::Parked
-            {
+            if !b.posture.parked || !b.radio_parked() || b.posture.gps != Gps::Parked {
                 return Err("asleep with something still up".into());
             }
+        }
+        // A board whose config asks for a sentry always sleeps with one -
+        // otherwise it is reachable only on its cadence, which is the
+        // thing the sentry exists to remove - and one whose config does
+        // not never does, whatever the posture decided before reading it.
+        if b.ble == Ble::Asleep && b.wake_enabled != b.sentry_armed {
+            return Err(if b.wake_enabled {
+                "asleep without the sentry the config asked for".into()
+            } else {
+                "asleep with a sentry the config did not ask for".into()
+            });
+        }
+        if b.sentry_armed && !b.posture.parked {
+            return Err("a sentry armed on a board that is not parked".into());
         }
         if b.sleep_ready && !b.posture.parked {
             return Err("the park signaled done with the board not parked".into());
@@ -549,7 +615,7 @@ impl Machine for Firmware {
             Event::Write(Via::Usb, _) | Event::TransferBegin(Via::Usb) => "usb",
             Event::TransferEnd(_) => "transfer",
             Event::LoopPass | Event::TxStart | Event::TxEnd => "hardware loop",
-            Event::Sleep | Event::Wake => "power",
+            Event::Sleep | Event::Wake | Event::WakeLora => "power",
         }
     }
 }
@@ -602,6 +668,22 @@ fn every_reachable_board_state_is_sound() {
     x.assert_some(
         |b| b.ble == Ble::Parking && !b.requests.is_empty() && b.posture.parked,
         "a request arriving after the park",
+    );
+    x.assert_some(
+        |b| b.ble == Ble::Asleep && b.sentry_armed,
+        "asleep with the radio listening as a sentry",
+    );
+    x.assert_some(
+        |b| b.ble == Ble::Asleep && !b.sentry_armed,
+        "asleep with the radio cold",
+    );
+    x.assert_some(
+        |b| b.ble == Ble::Asleep && b.posture.radio == Radio::Sentry && !b.sentry_armed,
+        "a wake check that decided on a sentry and read a config that said no",
+    );
+    x.assert_some(
+        |b| b.posture.live == Mode::Idle && b.posture.radio == Radio::Asleep && b.stored.sleep_interval_s == 0,
+        "a board woken over LoRa is idle and reachable",
     );
 
     // Liveness: nothing leaves the board dark for good, and nothing keeps

@@ -521,6 +521,16 @@ pub struct RadioConfig {
     /// too short and the radio runs off an oscillator that has not settled,
     /// which shows up as a receiver that works warm and fails cold.
     pub tcxo_startup_ms: u16,
+    /// Whether a stored board leaves its radio listening for a wake frame
+    /// while the chip sleeps, so it can be reached on demand rather than
+    /// on its wake-check cadence. See [`crate::sentry`].
+    pub wake_enabled: bool,
+    /// The sentry's receive window, ms: how long each listen lasts. What
+    /// buys margin against the drift of the radio's own timer.
+    pub wake_rx_ms: u16,
+    /// The sentry's sleep between windows, ms. What buys current: the
+    /// receiver is off for this long out of every cycle.
+    pub wake_sleep_ms: u16,
     /// GPS receiver configuration.
     pub gps: GpsConfig,
     /// Duty cycle, i.e. how much of the time the board is reachable.
@@ -612,6 +622,13 @@ impl Default for RadioConfig {
             // undefined on every transmission.
             tcxo_volts: TcxoVolts::V3_3,
             tcxo_startup_ms: 10,
+            // On: a stored board that can be called is the point of
+            // storing one. The two periods are the measured shape - a
+            // 300 ms window every 3 s listens 9% of the time and tolerates
+            // several percent of timer drift either way.
+            wake_enabled: true,
+            wake_rx_ms: 300,
+            wake_sleep_ms: 3_000,
             gps: GpsConfig::default(),
             // All-absent: a file that says nothing about the duty cycle
             // leaves whatever the board is running untouched.
@@ -822,7 +839,7 @@ pub const MAX_HOPS_LIMIT: u8 = 8;
 // with no stored file at all.
 
 /// Wire length of the [`RadioConfig`] read-back blob.
-pub const RADIO_CONFIG_LEN: usize = 34;
+pub const RADIO_CONFIG_LEN: usize = 38;
 
 /// Length of the blob before the hop plan was appended. A board on that
 /// firmware sends this much, and its byte 27 - now `hop_channels` - was a
@@ -834,6 +851,8 @@ pub const RADIO_CONFIG_LEN: usize = 34;
 pub const RADIO_CONFIG_LEN_V1: usize = 28;
 /// Length with the hop plan but before the ping interval.
 const RADIO_CONFIG_LEN_HOP: usize = 32;
+/// Length with the ping interval but before the wake sentry's periods.
+const RADIO_CONFIG_LEN_PING: usize = 34;
 
 /// Layout version in byte 0, so an app meeting a newer firmware can reject
 /// the blob rather than misread it.
@@ -847,6 +866,7 @@ const RCFG_RX_BOOST: u8 = 1 << 0;
 const RCFG_VERBOSE: u8 = 1 << 2;
 const RCFG_DCDC: u8 = 1 << 3;
 const RCFG_DIO2_RF_SWITCH: u8 = 1 << 4;
+const RCFG_WAKE: u8 = 1 << 5;
 // byte 2 (GPS constellations)
 const RCFG_GPS: u8 = 1 << 0;
 const RCFG_GLONASS: u8 = 1 << 1;
@@ -873,6 +893,9 @@ impl RadioConfig {
         }
         if self.dio2_rf_switch {
             flags |= RCFG_DIO2_RF_SWITCH;
+        }
+        if self.wake_enabled {
+            flags |= RCFG_WAKE;
         }
         b[1] = flags;
         let mut g = 0u8;
@@ -915,6 +938,8 @@ impl RadioConfig {
         b[28..30].copy_from_slice(&self.hop_step_khz.to_le_bytes());
         b[30..32].copy_from_slice(&self.hop_dwell_ms.to_le_bytes());
         b[32..34].copy_from_slice(&self.ping_interval_s.to_le_bytes());
+        b[34..36].copy_from_slice(&self.wake_rx_ms.to_le_bytes());
+        b[36..38].copy_from_slice(&self.wake_sleep_ms.to_le_bytes());
         b
     }
 
@@ -932,7 +957,8 @@ impl RadioConfig {
         let g = b[2];
         let u16at = |i: usize| u16::from_le_bytes([b[i], b[i + 1]]);
         let hopping = b.len() >= RADIO_CONFIG_LEN_HOP;
-        let has_ping = b.len() >= RADIO_CONFIG_LEN;
+        let has_ping = b.len() >= RADIO_CONFIG_LEN_PING;
+        let has_wake = b.len() >= RADIO_CONFIG_LEN;
         let defaults = Self::default();
         Some(Self {
             frequency_hz: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
@@ -959,6 +985,11 @@ impl RadioConfig {
             dio2_rf_switch: flags & RCFG_DIO2_RF_SWITCH != 0,
             tcxo_volts: TcxoVolts::from_trim(b[20])?,
             tcxo_startup_ms: u16at(21),
+            // A board from before the sentry existed reads as one without:
+            // its flag byte never had the bit, and the periods default.
+            wake_enabled: has_wake && flags & RCFG_WAKE != 0,
+            wake_rx_ms: if has_wake { u16at(34) } else { defaults.wake_rx_ms },
+            wake_sleep_ms: if has_wake { u16at(36) } else { defaults.wake_sleep_ms },
             gps: GpsConfig {
                 gps_enabled: g & RCFG_GPS != 0,
                 glonass_enabled: g & RCFG_GLONASS != 0,
@@ -1060,6 +1091,11 @@ pub const SECTIONS: &[Section] = &[
         name: "beacon",
         title: "Beacon",
         doc: "What goes out, and how often.",
+    },
+    Section {
+        name: "wake",
+        title: "Wake on LoRa",
+        doc: "How a stored board is reached without waiting for its wake check. With wake_enabled on, the park before every deep sleep leaves the SX1262 in its own sniff loop - listening for wake_rx_ms, sleeping for wake_sleep_ms, on frequency_hz and a sync word ordinary traffic never uses - and the S3 sleeps until the radio pulls DIO1 with a completed wake frame. A board that wants another woken sends a burst of wake frames behind a preamble sized to the target's cycle: cd tools && pixi run board-wake --target 3. The woken board comes up idle, answers with a ping, and can then be connected to over BLE. The timer wake-check stays armed as a backstop. The window sets the tolerance for the radio's timer drift (half of 2*rx - 10 ms - 24 symbols, either way) and the sleep sets the current: at the defaults the receiver is on 9% of the time, and a wake frame is about 3.4 s on air. Both boards must share these values, because the preamble one sends is computed from them. Refused on a hopping plan, since a wake frame would hold one channel far longer than hopping allows.",
     },
     Section {
         name: "debug",
@@ -1223,6 +1259,30 @@ pub const KEYS: &[Key] = &[
         commented: true,
         doc: "How long the radio waits for the TCXO to settle before using the clock, 1-1000 ms.",
         show: |c, w| write!(w, "{}", c.tcxo_startup_ms),
+    },
+    Key {
+        section: "wake",
+        name: "wake_enabled",
+        kind: Kind::Bool,
+        commented: false,
+        doc: "Leave the radio listening for a wake frame through every deep sleep. Off, a stored board is reachable only during its wake checks.",
+        show: |c, w| write!(w, "{}", c.wake_enabled),
+    },
+    Key {
+        section: "wake",
+        name: "wake_rx_ms",
+        kind: Kind::Int { min: 50, max: 5_000 },
+        commented: false,
+        doc: "The sentry's receive window, 50-5000 ms. Longer tolerates more drift in the radio's own timer and costs proportionally more current; under about 105 ms at the default modulation no wake preamble fits at all and the sentry is refused.",
+        show: |c, w| write!(w, "{}", c.wake_rx_ms),
+    },
+    Key {
+        section: "wake",
+        name: "wake_sleep_ms",
+        kind: Kind::Int { min: 200, max: 30_000 },
+        commented: false,
+        doc: "The sentry's sleep between windows, 200-30000 ms. Longer is cheaper and makes every wake frame longer by the same amount, so a waker spends more air time per attempt.",
+        show: |c, w| write!(w, "{}", c.wake_sleep_ms),
     },
     Key {
         section: "network",
@@ -1605,6 +1665,9 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
             "dio2_rf_switch" => cfg.dio2_rf_switch = bool_of(value, lineno)?,
             "tcxo_volts" => cfg.tcxo_volts = TCXO[choice_of(name, value, lineno)?],
             "tcxo_startup_ms" => cfg.tcxo_startup_ms = int_of(name, value, lineno)? as u16,
+            "wake_enabled" => cfg.wake_enabled = bool_of(value, lineno)?,
+            "wake_rx_ms" => cfg.wake_rx_ms = int_of(name, value, lineno)? as u16,
+            "wake_sleep_ms" => cfg.wake_sleep_ms = int_of(name, value, lineno)? as u16,
             // The card is gone; a file that still carries its key is not
             // wrong, only out of date, and the value is what it always
             // would have been.
@@ -2258,6 +2321,9 @@ mod tests {
             dio2_rf_switch: true,
             tcxo_volts: TcxoVolts::V3_3,
             tcxo_startup_ms: 250,
+            wake_enabled: false,
+            wake_rx_ms: 450,
+            wake_sleep_ms: 7_500,
             gps: GpsConfig {
                 gps_enabled: true,
                 glonass_enabled: true,
@@ -2332,8 +2398,12 @@ mod tests {
         // Such a board pinged on its beacon interval, so that is what it
         // reads back as pinging on.
         assert_eq!(old.ping_interval_s, 20);
+        // And it had no sentry: the flag byte's bit was never set, so it
+        // reads as off rather than as the default that came later.
+        assert!(!old.wake_enabled);
+        assert_eq!(old.wake_rx_ms, RadioConfig::default().wake_rx_ms);
         assert_eq!(
-            RadioConfig { ping_interval_s: 5, ..old },
+            RadioConfig { ping_interval_s: 5, wake_enabled: true, ..old },
             RadioConfig { beacon_interval_s: 20, ..RadioConfig::default() }
         );
         // A blob with the plan but not the ping interval: hopping as sent,
@@ -2343,7 +2413,9 @@ mod tests {
         assert_eq!(hop_only.ping_interval_s, 20);
         // Cut inside a field, the field is absent rather than half-read.
         let cut = RadioConfig::decode(&good[..RADIO_CONFIG_LEN - 1]).unwrap();
-        assert_eq!(cut.ping_interval_s, 20);
+        assert_eq!(cut.wake_sleep_ms, RadioConfig::default().wake_sleep_ms);
+        assert!(!cut.wake_enabled);
+        assert_eq!(RadioConfig::decode(&good[..RADIO_CONFIG_LEN_PING - 1]).unwrap().ping_interval_s, 20);
         assert_eq!(RadioConfig::decode(&good[..RADIO_CONFIG_LEN_HOP - 1]).unwrap().hop_channels, 1);
     }
 
@@ -2434,7 +2506,7 @@ mod tests {
             "ble_off_s = 301",
             "adv_window_s = 61",
             "sleep_interval_s = 1",
-            "sleep_interval_s = 301",
+            "sleep_interval_s = 3601",
             "idle_timeout_s = 9",
             "idle_timeout_s = 3601",
             "ble_on_s = 61",

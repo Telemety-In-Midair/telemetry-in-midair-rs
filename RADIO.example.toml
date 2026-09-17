@@ -165,6 +165,39 @@ ping_interval_s = 5
 # time.
 fields = "lat,lon"
 
+# -- Wake on LoRa ----------------------------------------------------------
+# How a stored board is reached without waiting for its wake check. With
+# wake_enabled on, the park before every deep sleep leaves the SX1262 in its
+# own sniff loop - listening for wake_rx_ms, sleeping for wake_sleep_ms, on
+# frequency_hz and a sync word ordinary traffic never uses - and the S3
+# sleeps until the radio pulls DIO1 with a completed wake frame. A board
+# that wants another woken sends a burst of wake frames behind a preamble
+# sized to the target's cycle: cd tools && pixi run board-wake --target 3.
+# The woken board comes up idle, answers with a ping, and can then be
+# connected to over BLE. The timer wake-check stays armed as a backstop. The
+# window sets the tolerance for the radio's timer drift (half of 2*rx - 10
+# ms - 24 symbols, either way) and the sleep sets the current: at the
+# defaults the receiver is on 9% of the time, and a wake frame is about 3.4
+# s on air. Both boards must share these values, because the preamble one
+# sends is computed from them. Refused on a hopping plan, since a wake frame
+# would hold one channel far longer than hopping allows.
+[wake]
+
+# Leave the radio listening for a wake frame through every deep sleep. Off,
+# a stored board is reachable only during its wake checks.
+wake_enabled = true
+
+# The sentry's receive window, 50-5000 ms. Longer tolerates more drift in
+# the radio's own timer and costs proportionally more current; under about
+# 105 ms at the default modulation no wake preamble fits at all and the
+# sentry is refused.
+wake_rx_ms = 300
+
+# The sentry's sleep between windows, 200-30000 ms. Longer is cheaper and
+# makes every wake frame longer by the same amount, so a waker spends more
+# air time per attempt.
+wake_sleep_ms = 3000
+
 # -- Debug -----------------------------------------------------------------
 [debug]
 
@@ -250,14 +283,17 @@ dynamic_model = "portable"
 # Only read while tracking, and only with ble_off_s set.
 # ble_on_s = 0
 
-# Seconds between wake checks while the board is stored, 0 or 5-300. 0 means
-# the board never stores itself on its own: with no cadence to sleep on, the
-# idle timeout has nowhere to send it and it stays awake and reachable. That
-# is the bench setting. A board explicitly told to store itself still
-# sleeps, on the 300 s ceiling. Deep sleep takes the whole chip down rather
-# than just the BLE controller, so it is the larger saving and the larger
-# cost: the board stops beaconing, stops logging, and every wake is a full
-# reset. Ignored while tracking - a tracker that deep-sleeps is not
+# Seconds between wake checks while the board is stored, 0 or 5-3600. 0
+# means the board never stores itself on its own: with no cadence to sleep
+# on, the idle timeout has nowhere to send it and it stays awake and
+# reachable. That is the bench setting. A board explicitly told to store
+# itself still sleeps, on a 300 s default. Deep sleep takes the whole chip
+# down rather than just the BLE controller, so it is the larger saving and
+# the larger cost: the board stops beaconing, stops logging, and every wake
+# is a full reset. With wake_enabled on in the radio config the radio keeps
+# listening for a wake frame through the sleep, so this cadence is a
+# backstop and an hour is a fine value; with it off, this is the only way
+# back in. Ignored while tracking - a tracker that deep-sleeps is not
 # tracking.
 # sleep_interval_s = 0
 
