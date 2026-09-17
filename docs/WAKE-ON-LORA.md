@@ -830,6 +830,54 @@ And a longer window needs a proportionally longer preamble to cover it, so
 the two costs move together: the transmitter pays air time for whatever the
 receiver saves in current.
 
+## The configuration does not survive the sleep
+
+The test that separates the two halves of a duty cycle - the sleeping and
+the shortened window - by putting them on different hooks. Listen
+continuously and count receptions; then push the chip through a sleep and a
+restore, listen continuously again *without re-initializing*, and count
+again.
+
+```
+CONTROL            24 frames received, 0 crc errors in 90 s
+after warm start   radio rx err 0x0020
+AFTER WARM START    0 received, 0 crc errors in 90 s
+```
+
+Twenty-four before a sleep. **Zero after one.** Same receiver, same source,
+same continuous listening - the only thing between them is one sleep and one
+restore.
+
+And `0x0020` is bit 5, `XOSC_START_ERR`: the 32 MHz oscillator did not
+start. The datasheet says that flag is expected "at POR or at wake-up from
+Sleep mode **in a cold-start condition**, when a TCXO is used", and a duty
+cycle is supposed to sleep *with retention* - a warm start, where the
+configuration is restored and the calibration skipped.
+
+A cold-start error after a duty cycle's sleep says the retention is not
+doing what it is meant to. Every window after the first is then listening on
+whatever the chip powers up with: not the configured frequency, not the
+configured modulation, and with DIO3 not supplying the TCXO - which on this
+module is also the antenna switch's VDD.
+
+**This is the cause, and it subsumes the whole investigation.** The 2% rate,
+the preamble lengths that worked once and never again, the 39 preambles
+producing 2 headers, continuous receive being flawless, and every one of the
+seven parameters swept to no effect - all of them sit downstream of a
+receiver that stopped being configured after its first sleep. The window
+arithmetic was right. The geometry was right. They were being applied to a
+radio that was no longer listening on the right settings.
+
+### What to do with it
+
+The next question is narrow and answerable: *what exactly is lost?* Read the
+frequency, modulation and packet-parameter registers back after a warm start
+and compare them against what was written. That says whether retention is
+failing entirely or only for particular registers - and the latter is the
+same shape as the Rx gain problem, which the datasheet fixes with the
+retention list at 0x029F. The list holds four entries and only one is spoken
+for.
+
 ## Risks, in the order they would sink it
 
 1. **`SetRxDutyCycle` with a TCXO.** The chip restarts DIO3 and waits

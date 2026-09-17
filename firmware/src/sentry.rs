@@ -254,7 +254,30 @@ pub async fn probe(radio: &mut Sx1262Driver<'_>) -> ! {
             ),
         }
     } else {
-        wake_test(radio, rc.as_ref()).await;
+        // The control that was never run: whether a receiver which never
+        // sleeps can complete a reception of these frames at all. Every
+        // earlier control counted preamble detections, which prove only
+        // that the preamble arrives - a frame the receiver cannot finish
+        // would detect perfectly and never complete, and would look
+        // exactly like a duty cycle that fails to receive.
+        let continuous = receives_continuously(radio).await;
+        // Then the same thing again, but only after the chip has been
+        // through a duty cycle's sleep and warm start. Continuous receive
+        // completes these frames perfectly from a cold configuration; if it
+        // stops completing them once a warm start has happened, the fault
+        // is what the restore leaves behind rather than how long a window
+        // lasts - and those want entirely different fixes.
+        let after_warm = receives_after_warm_start(radio).await;
+        println!(
+            "sentry probe: WARM continuous {} before a sleep, {} after one",
+            continuous, after_warm
+        );
+        if continuous > 0 && after_warm == 0 {
+            println!("sentry probe: the warm start breaks reception - not the window length");
+        } else if after_warm > 0 {
+            println!("sentry probe: reception survives a warm start - the window itself is the cost");
+        }
+        wake_test(radio, rc.as_ref(), continuous).await;
     }
 
     // Nothing else on this build has anything to do, and the loop is what
@@ -284,7 +307,11 @@ pub async fn probe(radio: &mut Sx1262Driver<'_>) -> ! {
 /// A reception ends the cycle and leaves the chip in standby, so every wake
 /// is followed by a re-arm. That is not a workaround - it is what a sleeping
 /// board will have to do on the far side of every wake.
-async fn wake_test(radio: &mut Sx1262Driver<'_>, rc: Option<&midair_proto::sentry::RcRate>) {
+async fn wake_test(
+    radio: &mut Sx1262Driver<'_>,
+    rc: Option<&midair_proto::sentry::RcRate>,
+    continuous: u32,
+) {
     const WAKE_WAIT_S: u64 = 150;
     let g = geometry(radio);
     let Some(preamble) = g.preamble_symbols(&cfg_of(radio)) else {
@@ -458,6 +485,19 @@ async fn wake_test(radio: &mut Sx1262Driver<'_>, rc: Option<&midair_proto::sentr
         println!("sentry probe: VERDICT re-arms are being eaten - {} of {} did not take", arms - arms_verified, arms);
     } else if woken == 0 {
         println!("sentry probe: VERDICT every arm took and nothing was heard - not the re-arm");
+    }
+    // The comparison this run exists for: the same source and the same
+    // interrupt, judged once without sleeping and once with.
+    println!(
+        "sentry probe: A/B continuous {} received, duty cycled {} woken",
+        continuous, woken
+    );
+    if continuous == 0 && woken == 0 {
+        println!("sentry probe: neither completes - the frame, not the duty cycle");
+    } else if continuous > 0 && woken.saturating_mul(4) < continuous {
+        println!("sentry probe: continuous completes and duty cycled does not - the window, not the frame");
+    } else if woken > 0 && continuous > 0 {
+        println!("sentry probe: both complete at comparable rates - the duty cycle is not the cost");
     } else {
         println!("sentry probe: VERDICT every arm took; the misses are frames not heard, not arms lost");
     }
@@ -680,6 +720,121 @@ fn sf_for(t_sym_us: u32) -> u8 {
         sf += 1;
     }
     sf
+}
+
+/// Put the chip through a duty cycle's sleep and warm start, then listen
+/// continuously and count what it can still receive.
+///
+/// The one thing that separates a receiver which never sleeps from one that
+/// does is the restore on the far side of a sleep. Continuous receive
+/// completes these frames perfectly from a cold configuration, so if it
+/// cannot complete them after a warm start the fault is in what the restore
+/// leaves behind - and no amount of window or preamble arithmetic would
+/// ever have found it.
+async fn receives_after_warm_start(radio: &mut Sx1262Driver<'_>) -> u32 {
+    const LISTEN_S: u64 = 90;
+    let g = geometry(radio);
+
+    // A short cycle, purely to force a sleep and a restore quickly.
+    println!("sentry probe: forcing a sleep and warm start, then listening continuously");
+    radio.wake_from_retained_sleep().await;
+    radio.arm_duty_cycle(g.rx_us, 200_000, SYMB_TIMEOUT, irq::RX_DONE);
+    // Long enough for several sleep/restore cycles to have happened.
+    let spin = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < spin {
+        watchdog::beat(Task::Loop, Phase::Receive);
+        Timer::after(Duration::from_millis(POLL_MS)).await;
+    }
+    // Out of the cycle and into plain continuous receive, without
+    // re-initializing the radio: the point is to listen with whatever the
+    // warm start left in place.
+    radio.wake_from_retained_sleep().await;
+    radio.arm_continuous_rx(irq::RX_DONE | irq::CRC_ERR);
+    let (mode, err) = radio.health();
+    println!("sentry probe: after warm start radio {} err 0x{:04X}", mode, err);
+
+    let until = Instant::now() + Duration::from_secs(LISTEN_S);
+    let mut got = 0u32;
+    let mut crc = 0u32;
+    while Instant::now() < until {
+        watchdog::beat(Task::Loop, Phase::Receive);
+        if radio.irq_pending() {
+            let status = radio.take_irq();
+            if status & irq::CRC_ERR != 0 {
+                crc += 1;
+            }
+            if status & irq::RX_DONE != 0 {
+                got += 1;
+                println!("sentry probe: post-warm reception {}", got);
+                radio.arm_continuous_rx(irq::RX_DONE | irq::CRC_ERR);
+            }
+        }
+        Timer::after(Duration::from_millis(POLL_MS)).await;
+    }
+    println!(
+        "sentry probe: AFTER WARM START {} received, {} crc errors in {} s",
+        got, crc, LISTEN_S
+    );
+    got
+}
+
+/// Listen without ever sleeping, and count completed receptions.
+///
+/// Judged on `RxDone`, the same interrupt the duty cycle is judged on, so
+/// the two numbers mean the same thing. Anything else compares a preamble
+/// against a packet - which is what every earlier control here did, and why
+/// it could never have told a frame the receiver cannot finish from a duty
+/// cycle that fails to receive one.
+async fn receives_continuously(radio: &mut Sx1262Driver<'_>) -> u32 {
+    const LISTEN_S: u64 = 90;
+    println!(
+        "sentry probe: control - continuous receive for {} s, counting RxDone",
+        LISTEN_S
+    );
+    radio.wake_from_retained_sleep().await;
+    radio.arm_continuous_rx(irq::RX_DONE | irq::CRC_ERR);
+    let until = Instant::now() + Duration::from_secs(LISTEN_S);
+    let mut got = 0u32;
+    let mut crc = 0u32;
+    let mut said = Instant::now();
+    while Instant::now() < until {
+        watchdog::beat(Task::Loop, Phase::Receive);
+        if radio.irq_pending() {
+            let status = radio.take_irq();
+            if status & irq::CRC_ERR != 0 {
+                crc += 1;
+            }
+            if status & irq::RX_DONE != 0 {
+                got += 1;
+                let mut buf = [0u8; 8];
+                let n = radio.read_payload(&mut buf);
+                let syms = if n >= 3 && buf[0] == WAKE_TAG {
+                    u16::from(buf[1]) | (u16::from(buf[2]) << 8)
+                } else {
+                    0
+                };
+                println!(
+                    "sentry probe: control received a {} symbol frame ({} so far)",
+                    syms, got
+                );
+                // A reception drops the chip into standby; put it back.
+                radio.arm_continuous_rx(irq::RX_DONE | irq::CRC_ERR);
+            }
+        }
+        if Instant::now() - said > Duration::from_secs(30) {
+            println!("sentry probe: control {} received, {} crc so far", got, crc);
+            said = Instant::now();
+        }
+        Timer::after(Duration::from_millis(POLL_MS)).await;
+    }
+    println!(
+        "sentry probe: CONTROL {} frames received, {} crc errors in {} s",
+        got, crc, LISTEN_S
+    );
+    if got == 0 {
+        println!("sentry probe: a receiver that never sleeps cannot finish these frames either");
+    }
+    got
 }
 
 /// Listen continuously for a few seconds and say whether anything is there.
@@ -1023,6 +1178,30 @@ pub async fn mirror(radio: &mut Sx1262Driver<'_>) -> ! {
     const SYMB_SWEEP: [u8; 7] = [0, 4, 8, 16, 32, 64, 128];
     const SWEEP_RX_US: u32 = 1_000_000;
     const PER_STEP_S: u64 = 12;
+
+    // Prove the wires before measuring through them. Each mirror pin is
+    // pulsed a different number of times, so a monitor on the far end can
+    // tell not only that a line is connected but which line it is - a
+    // swapped pair otherwise reads as a perfectly plausible measurement.
+    //
+    // DIO1 especially: it only moves when a reception happens, so in a run
+    // with nothing transmitting a disconnected wire and a correct one look
+    // exactly alike. That is not a distinction to discover afterwards.
+    println!("sentry mirror: wiring self-test - BUSY x1, DIO1 x2, MARK x3 pulses of 50 ms");
+    for (pin, times) in [
+        (&mut out_busy as &mut Output, 1u8),
+        (&mut out_dio1 as &mut Output, 2),
+        (&mut out_mark as &mut Output, 3),
+    ] {
+        for _ in 0..times {
+            pin.set_high();
+            Timer::after(Duration::from_millis(50)).await;
+            pin.set_low();
+            Timer::after(Duration::from_millis(50)).await;
+        }
+        Timer::after(Duration::from_millis(200)).await;
+    }
+    println!("sentry mirror: self-test done");
 
     let g = geometry(radio);
     println!(
