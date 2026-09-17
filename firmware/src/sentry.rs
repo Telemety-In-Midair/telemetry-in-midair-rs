@@ -1,962 +1,497 @@
-//! The bench probe for a duty-cycled receiver.
+//! The bench for a duty-cycled receiver.
 //!
 //! One question decides whether a radio can usefully listen while the chip
-//! that owns it is asleep: what a receive window costs beyond the symbols
-//! it is meant to hear. The part restarts its oscillator on every window,
-//! and whether that time is added to the commanded window or taken out of
-//! it changes how long every window in such a design has to be. Reading it
-//! off a datasheet is guessing; this measures it.
+//! that owns it is asleep: does a receive window opened at an arbitrary
+//! point in a long preamble go on to complete the reception? The chip's
+//! own sniff loop, `SetRxDutyCycle`, is the only thing on the part that
+//! runs without the host, and two of its settings decide the answer -
+//! the symbol timeout and which event stops the window timer. Read off the
+//! datasheet those two look like tuning; measured, they are the difference
+//! between a wake rate of two percent and one that works.
 //!
-//! The instrument is the radio. With a second board keying a continuous
-//! preamble, every receive window that opens should detect - so DIO1
-//! becomes a readout of the receiver's own schedule, and neither a scope
-//! nor a current probe is needed for either half of the answer:
+//! The instrument is the radio. A second board sends frames behind a
+//! preamble longer than the receiver's whole cycle, each carrying a
+//! sequence number, and the receiver is armed exactly as a sleeping board
+//! would arm it: DIO1 carrying `RxDone` and nothing else, and not one SPI
+//! transaction while the cycle runs. What it counts is what a sleeping
+//! board would count - wakes - and the sequence numbers say which frames
+//! were missed.
 //!
-//! - **Cadence.** Arm once and watch. The interval between detections is
-//!   the real cycle, and comparing it against the commanded one says which
-//!   way the oscillator restart is charged. Whether detections keep coming
-//!   at all says whether the chip stays in the cycle after a reception,
-//!   which decides whether a sleeping board has to re-arm on every wake.
-//! - **Sweep.** Walk the window down until detection stops being reliable.
-//!   The shortest window that still catches every cycle, less the symbols
-//!   it was listening for, is the overhead - the number the design needs.
+//! Nothing is read over SPI while a cycle is running because the chip will
+//! not answer during its sleep phase and the asking ends the cycle: a
+//! falling edge on NSS wakes it into standby, and the loop does not resume.
+//! Every earlier version of this probe read the interrupt register whenever
+//! DIO1 rose, which with preamble detection routed there could end a sentry
+//! on a noise burst. `BUSY` is the one thing that can be watched for free -
+//! it is an input to the host - so the window lengths are taken from it.
 //!
-//! The analysis is [`midair_proto::sentry`], host-tested, because picking
-//! the wrong step out of a sweep gives a plausible number that is wrong,
-//! and a wrong number here sizes every preamble in the system.
-//!
-//! Both halves need a source. See [`source`], and read what it says about
-//! keying the PA before running it.
+//! Both halves need the same radio settings at each end, and the source
+//! keys a PA, so read what [`source`] says before running it.
 
 use embassy_time::{Duration, Instant, Timer};
+use esp_hal::gpio::{Level, Output, OutputConfig};
 use esp_println::println;
-use midair_proto::sentry::{
-    drift_us, min_rx_for_margin, min_rx_us, rc_rate, sweep_floor, SweepStep, DETECT_SYMBOLS,
-};
 use midair_proto::supervise::{Phase, Task};
 
 use crate::radio::Sx1262Driver;
 use crate::sx1262::irq;
 use crate::watchdog;
 
-/// The sentry both halves of the bench agree on.
-///
-/// One function rather than two constants, because the probe and the source
-/// have to derive the same preamble from the same numbers - the receiver's
-/// window and the transmitter's preamble are one choice, and two boards that
-/// disagree about it produce a silence neither can explain.
-fn geometry(radio: &Sx1262Driver<'_>) -> midair_proto::sentry::Sentry {
-    let mut cfg = midair_proto::radiocfg::RadioConfig::default();
-    cfg.spreading_factor = sf_for(radio.symbol_time_us());
-    // A generous window on purpose. The measured timebase needs almost
-    // none of it, and the point of a first run is to find out whether the
-    // mechanism works at all rather than how cheaply it can be made to.
-    let overhead = SENTRY_RX_US.saturating_sub(u32::from(SYMB_TIMEOUT) * radio.symbol_time_us());
-    midair_proto::sentry::Sentry::new(&cfg, SENTRY_SLEEP_US, overhead, SYMB_TIMEOUT, TCXO_US, WAKE_PAYLOAD.len())
-}
-
-/// Symbols the modem is given to validate a signal, for both the chip and
-/// the arithmetic that sizes the window around it.
-///
-/// One constant, not two: the window has to contain exactly the symbols the
-/// modem validates on, so a receiver told to validate on eight and a
-/// preamble sized for four disagree about the only number they share.
-///
-/// **It must not be zero.** Zero disables the check, and measured on
-/// hardware that takes a duty cycle from waking on most frames to waking on
-/// none - because a non-zero value is also what makes the chip hold the
-/// window open "for the full duration of the packet" once it has validated.
-/// With it off, the window simply ends at its own length and the chip
-/// sleeps through the rest of a frame it had already heard the start of.
-const SYMB_TIMEOUT: u8 = 8;
-
-/// Whether the other board is keying a continuous carrier rather than
-/// sending frames, i.e. whether it was built `iso-sentry-carrier`.
-///
-/// The two measurements want opposite signals and a run can only have one.
-const PEER_IS_CARRIER: bool = false;
-
-/// Nominal sleep of the sentry under test, microseconds. What the chip is
-/// asked for is this corrected for its own timer.
-const SENTRY_SLEEP_US: u32 = 1_000_000;
-
-/// Receive window of the sentry under test, microseconds.
-///
-/// Two hundred rather than the hundred the first runs used. The chip's
-/// restarted timer has to contain the whole packet and not just its header,
-/// so at a hundred no preamble fits at all - measured as thirty-nine
-/// detected preambles producing two headers, the two being those detected
-/// late enough in the preamble that the rest of the frame still fit.
-const SENTRY_RX_US: u32 = 200_000;
-
-/// Sleep half of the cycle under test, microseconds.
-///
-/// Long enough that a window is a small part of the cycle, so a detection
-/// is unambiguously one window's, and short enough that a sweep step is
-/// seconds rather than minutes.
-const SLEEP_US: u32 = 1_000_000;
-
-
-
-/// Trials per sweep step. Forty is enough that a window which passes every
-/// one is not passing by luck, and few enough that the whole ladder runs in
-/// a couple of minutes.
-const SWEEP_TRIALS: u32 = 15;
-
-/// Window overheads to try, microseconds, longest first.
-///
-/// The ladder is in overhead rather than in absolute window length, so the
-/// same sweep runs at any spreading factor: each step is the symbols the
-/// modem has to count plus this much headroom, and the shortest step that
-/// still detects every time *is* the overhead. Descending, because
-/// [`sweep_floor`] only accepts a step whose longer neighbors all passed.
-const OVERHEAD_LADDER_US: [u32; 12] = [
-    400_000, 300_000, 250_000, 200_000, 150_000, 120_000, 100_000, 80_000, 60_000, 40_000,
-    20_000, 0,
-];
-
-/// How long a single trial waits for a detection before calling it a miss,
-/// as a multiple of the commanded cycle. Three cycles is generous for
-/// something that should happen on the first.
-const TRIAL_CYCLES: u32 = 2;
-
-/// Longest the source will hold the PA on before standing down, seconds.
-///
-/// Keying with no end to it was a convenience, and it is the wrong default
-/// for a thing that lives on a bench: a board left plugged in stays keyed
-/// until somebody remembers it, which is exactly the state nobody is
-/// watching. Twenty minutes covers a full probe run with room, and a run
-/// that needs longer can be restarted deliberately.
-const SOURCE_MAX_KEYED_S: u64 = 1_200;
-
-/// The board's configured oscillator startup, microseconds. The datasheet
-/// adds this between the sleep and receive phases of a duty cycle, so it
-/// widens the deaf gap a preamble has to span.
-const TCXO_US: u32 = 10_000;
-
-/// Preamble lengths the source walks through, in symbols.
-///
-/// The one number in this design that has always been computed rather than
-/// measured, from a model of the chip that has been wrong more than once.
-/// So it is swept: wide enough to bracket whatever the real window is, and
-/// each frame says which length it was sent with so a wake reports its own
-/// cause.
-const PREAMBLE_SWEEP: [u16; 14] = [
-    60, 80, 100, 120, 130, 140, 150, 160, 180, 200, 230, 260, 290, 320,
-];
-
-/// Frames sent at each preamble length.
-const FRAMES_PER_PREAMBLE: u32 = 4;
-
-/// Tag byte in front of the preamble length a wake frame carries.
+/// Tag byte in front of the sequence number a wake frame carries.
 const WAKE_TAG: u8 = 0x57;
 
-/// What a wake frame carries for the mechanism test. The payload is not the
-/// point - a real packet is, because only a completed reception ends the
-/// chip's sniff loop.
-const WAKE_PAYLOAD: &[u8] = b"wake";
+/// Preamble the source sends every frame with, in symbols.
+///
+/// Sized against the trials below: it has to be longer than the longest
+/// cycle so that some window always opens inside it, and shorter than the
+/// shortest restarted timer less the header so that the packet behind it
+/// still fits. At SF12/BW500 this is 1352 ms.
+const SOURCE_PREAMBLE_SYMBOLS: u16 = 165;
 
-/// Seconds the source stays off the air before its first frame.
+/// Longest the source will transmit before standing down, seconds.
 ///
-/// The probe opens by timing its own sleep oscillator, and that measurement
-/// times a receive window against the host clock - so a window that hears a
-/// preamble is no longer measuring an oscillator. Filtering the spoiled
-/// trials is not enough, because a preamble can perturb the receive timer
-/// without leaving an interrupt to filter on: measured beside live traffic
-/// the same chip reads +10686 ppm and -4462 ppm in different runs, both
-/// repeatably.
-///
-/// So the channel is left quiet for long enough that the measurement
-/// finishes first. It costs one silent period per bench run and removes the
-/// whole failure, which no amount of filtering did.
-const QUIET_FIRST_S: u64 = 45;
+/// A board left plugged in stays keyed until somebody remembers it, which
+/// is exactly the state nobody is watching. Twenty minutes covers a full
+/// probe run with room, and a run that needs longer can be restarted
+/// deliberately.
+const SOURCE_MAX_KEYED_S: u64 = 1_200;
 
-/// Most transmit power the source will key at, dBm.
-///
-/// Two boards on a bench need milliwatts, and this is what makes keeping
-/// the PA on indefinitely a bench convenience rather than a way to cook a
-/// module. 0 dBm is 1 mW, which is still an enormous signal at that range.
+/// Most transmit power the source will key at, dBm. Two boards on a bench
+/// need milliwatts; 0 dBm is 1 mW, which is still an enormous signal at
+/// that range.
 const SOURCE_MAX_DBM: i8 = 10;
 
-/// Poll period on DIO1, milliseconds.
+/// Seconds the source stays off the air before its first frame, so a
+/// probe flashed second still sees the start.
+const QUIET_FIRST_S: u64 = 5;
+
+/// Symbols a LoRa explicit header occupies.
+const HEADER_SYMBOLS: u32 = 8;
+
+/// Symbols the modem needs inside a window to detect a preamble.
+const DETECT_SYMBOLS: u32 = 4;
+
+/// The board's configured oscillator startup, microseconds. Added between
+/// the sleep and receive phases of a duty cycle, so it lengthens the cycle.
+const TCXO_US: u32 = 10_000;
+
+/// Seconds the control listens for.
+const CONTROL_S: u64 = 20;
+
+/// Seconds each trial runs. Long enough for about thirty frames at the
+/// source's cadence.
+const TRIAL_S: u64 = 75;
+
+/// Passes between heartbeats in the loops that have no await in them.
 ///
-/// The pin latches high until the interrupt is cleared, so this sets the
-/// resolution of a timestamp and not whether a detection is seen at all.
-/// Ten milliseconds against a cycle of about a second is one percent, which
-/// is inside the chip's own RC timebase and so costs nothing real.
+/// Those loops watch pins, and a wait on the timer queue is not free on
+/// this chip: every one is a critical section shared between the two
+/// cores, and a poll of a millisecond has starved the watchdog monitor on
+/// the other core before. A loop with no await at all costs the other
+/// core nothing, and the monitor is fed by count instead of by time.
+const BEAT_EVERY: u32 = 20_000;
+
+/// One way of arming the sniff loop.
+struct Trial {
+    name: &'static str,
+    rx_us: u32,
+    sleep_us: u32,
+    symb_timeout: u8,
+    stop_on_preamble: bool,
+}
+
+/// What is tried, in order.
 ///
-/// It is not set by the resolution wanted but by what the rest of the board
-/// can afford. Every wait is a timer-queue operation under a critical
-/// section this chip shares between its two cores, so a poll of one
-/// millisecond puts a thousand of them a second against everything else
-/// running - and the task that loses is the watchdog monitor on the other
-/// core, which stops feeding and resets the board. Poll no faster than the
-/// measurement needs.
-const POLL_MS: u64 = 10;
+/// The first pair is the question: the datasheet's sniff loop as written,
+/// then with the window timer told to stop on the preamble rather than the
+/// header. The third is the old configuration for comparison, whose
+/// symbol timeout of eight predicts a wake only from a window that opened
+/// in the last eight symbols of the preamble - about three percent. The
+/// fourth deliberately breaks the upper bound: its restarted timer is
+/// shorter than the preamble, so it should catch only the frames whose
+/// preamble was mostly over when the window opened. The last is a cheaper
+/// window inside both bounds.
+const TRIALS: [Trial; 5] = [
+    Trial {
+        name: "symb 0, stop on header, rx 300 sleep 900",
+        rx_us: 300_000,
+        sleep_us: 900_000,
+        symb_timeout: 0,
+        stop_on_preamble: false,
+    },
+    Trial {
+        name: "symb 0, stop on preamble, rx 300 sleep 900",
+        rx_us: 300_000,
+        sleep_us: 900_000,
+        symb_timeout: 0,
+        stop_on_preamble: true,
+    },
+    Trial {
+        name: "symb 8, stop on header, rx 200 sleep 1000 (the old arm)",
+        rx_us: 200_000,
+        sleep_us: 1_000_000,
+        symb_timeout: 8,
+        stop_on_preamble: false,
+    },
+    Trial {
+        name: "symb 0, stop on preamble, rx 150 sleep 1000 (timer too short)",
+        rx_us: 150_000,
+        sleep_us: 1_000_000,
+        symb_timeout: 0,
+        stop_on_preamble: true,
+    },
+    Trial {
+        name: "symb 0, stop on preamble, rx 250 sleep 950",
+        rx_us: 250_000,
+        sleep_us: 950_000,
+        symb_timeout: 0,
+        stop_on_preamble: true,
+    },
+];
+
+/// The J1 header pins that mirror the radio's lines for an external
+/// monitor:
+///
+/// ```text
+///   GPIO38   BUSY  (high = asleep or starting, low = awake)
+///   GPIO39   DIO1  (high = an enabled interrupt is pending)
+///   GPIO40   mark  (pulsed high when a trial arms)
+/// ```
+///
+/// `main` parks them as pulled-down inputs and nothing else claims them.
+struct J1 {
+    busy: Output<'static>,
+    dio1: Output<'static>,
+    mark: Output<'static>,
+}
+
+impl J1 {
+    fn take() -> Self {
+        // SAFETY: `main` parks these as inputs and nothing else ever claims
+        // them; the bench builds drive them and do not return.
+        unsafe {
+            Self {
+                busy: Output::new(
+                    esp_hal::peripherals::GPIO38::steal(),
+                    Level::Low,
+                    OutputConfig::default(),
+                ),
+                dio1: Output::new(
+                    esp_hal::peripherals::GPIO39::steal(),
+                    Level::Low,
+                    OutputConfig::default(),
+                ),
+                mark: Output::new(
+                    esp_hal::peripherals::GPIO40::steal(),
+                    Level::Low,
+                    OutputConfig::default(),
+                ),
+            }
+        }
+    }
+
+    /// Prove the wires before measuring through them. Each pin is pulsed a
+    /// different number of times, so a monitor on the far end can tell not
+    /// only that a line is connected but which line it is - a swapped pair
+    /// otherwise reads as a perfectly plausible measurement. DIO1
+    /// especially: it only moves on a reception, so in a run with nothing
+    /// transmitting a dead wire and a good one look exactly alike.
+    async fn self_test(&mut self) {
+        println!("sentry: J1 self-test - BUSY x1, DIO1 x2, MARK x3 pulses of 50 ms");
+        for (pin, times) in [
+            (&mut self.busy, 1u8),
+            (&mut self.dio1, 2),
+            (&mut self.mark, 3),
+        ] {
+            for _ in 0..times {
+                pin.set_high();
+                Timer::after(Duration::from_millis(50)).await;
+                pin.set_low();
+                Timer::after(Duration::from_millis(50)).await;
+            }
+            Timer::after(Duration::from_millis(200)).await;
+        }
+    }
+
+    fn mirror(&mut self, radio: &Sx1262Driver<'_>) {
+        self.busy
+            .set_level(if radio.busy_high() { Level::High } else { Level::Low });
+        self.dio1
+            .set_level(if radio.irq_pending() { Level::High } else { Level::Low });
+    }
+}
 
 /// Run the probe. Does not return.
 ///
 /// Expects the radio already initialized from the running config - the
-/// board has to be in a mode that brings it up - and a second board keying
-/// a continuous preamble on the same settings throughout.
+/// board has to be in a mode that brings it up - and a second board
+/// running [`source`] on the same settings.
 pub async fn probe(radio: &mut Sx1262Driver<'_>) -> ! {
+    let mut j1 = J1::take();
+    j1.self_test().await;
+
     let t_sym = radio.symbol_time_us();
-    let listening = u32::from(DETECT_SYMBOLS) * t_sym;
-    println!("sentry probe: {} us/symbol, {} symbols to detect ({} us listening)",
-        t_sym, DETECT_SYMBOLS, listening);
-    println!("sentry probe: source must be keying a continuous preamble on the same settings");
+    let preamble_us = u32::from(SOURCE_PREAMBLE_SYMBOLS) * t_sym;
+    println!(
+        "sentry probe: {} us/symbol, source preamble {} symbols = {} us",
+        t_sym, SOURCE_PREAMBLE_SYMBOLS, preamble_us
+    );
 
-    // The band first, because it decides whether the rest is worth
-    // reading: a window that is usually already busy with a false
-    // detection cannot be waiting for a frame.
-    noise_survey(radio).await;
-
-    // The chip's own timebase next: it needs no source, and what it
-    // measures is what decides how wide every window below has to be.
-    let rc = rc_timebase(radio).await;
-
-    // The control first, while the chip is still in a state that answers.
-    // A duty cycle leaves it asleep, so a control run afterwards measures
-    // the ordering rather than the link - which is how the first version of
-    // this reported a dead source that was transmitting perfectly well.
-    if !hearing(radio).await {
+    // The control first, while the chip is in a state that answers. It
+    // uses the same interrupt the trials are judged on, so a failure here
+    // is the link - a source that is off or on other settings - and a
+    // failure below it with this passing is the arm.
+    let control = control(radio).await;
+    if control == 0 {
         println!("sentry probe: STOPPING - nothing to measure against");
-        loop {
-            watchdog::beat(Task::Loop, Phase::Receive);
-            Timer::after(Duration::from_millis(500)).await;
-        }
+        park("sentry probe").await
     }
 
-    // What the peer is transmitting decides what can be measured, and the
-    // two want opposite signals: the sweep asks whether a window *detects*,
-    // so it wants a carrier that is always there, and the wake test asks
-    // whether one *receives*, so it wants frames. A run cannot do both, and
-    // trying costs ten minutes proving the wrong one.
-    if PEER_IS_CARRIER {
-        let steps = sweep(radio, listening).await;
-        println!("sentry probe:");
-        match sweep_floor(&steps, t_sym, DETECT_SYMBOLS) {
-            Some(f) => {
-                println!(
-                    "sentry probe: floor {} us, so {} us of overhead over {} symbols",
-                    f.rx_us, f.overhead_us, DETECT_SYMBOLS
-                );
-                println!(
-                    "sentry probe: a window is worth its length less {} us - size every one that way",
-                    f.overhead_us
-                );
-            }
-            // Either nothing detected at all, or a longer window failed
-            // while a shorter one passed. Both are runs to repeat rather
-            // than numbers to design against, and the table says which.
-            None => println!(
-                "sentry probe: NO FLOOR - nothing detected, or the sweep is not clean from the top"
-            ),
-        }
-    } else {
-        // The control that was never run: whether a receiver which never
-        // sleeps can complete a reception of these frames at all. Every
-        // earlier control counted preamble detections, which prove only
-        // that the preamble arrives - a frame the receiver cannot finish
-        // would detect perfectly and never complete, and would look
-        // exactly like a duty cycle that fails to receive.
-        let continuous = receives_continuously(radio).await;
-        // Then the same thing again, but only after the chip has been
-        // through a duty cycle's sleep and warm start. Continuous receive
-        // completes these frames perfectly from a cold configuration; if it
-        // stops completing them once a warm start has happened, the fault
-        // is what the restore leaves behind rather than how long a window
-        // lasts - and those want entirely different fixes.
-        let after_warm = receives_after_warm_start(radio).await;
+    println!("sentry probe: {} trials of {} s", TRIALS.len(), TRIAL_S);
+    let mut wakes = [0u32; TRIALS.len()];
+    let mut offered = [0u32; TRIALS.len()];
+    for (i, t) in TRIALS.iter().enumerate() {
+        let (w, o) = trial(radio, &mut j1, t, preamble_us).await;
+        wakes[i] = w;
+        offered[i] = o;
+    }
+
+    println!("sentry probe: RESULTS, {} s a trial, control {} in {} s", TRIAL_S, control, CONTROL_S);
+    for (i, t) in TRIALS.iter().enumerate() {
+        let pct = if offered[i] > 0 {
+            wakes[i] * 100 / offered[i]
+        } else {
+            0
+        };
         println!(
-            "sentry probe: WARM continuous {} before a sleep, {} after one",
-            continuous, after_warm
+            "sentry probe:   {:>3}% ({:>2} of {:>2})  {}",
+            pct, wakes[i], offered[i], t.name
         );
-        if continuous > 0 && after_warm == 0 {
-            println!("sentry probe: the warm start breaks reception - not the window length");
-        } else if after_warm > 0 {
-            println!("sentry probe: reception survives a warm start - the window itself is the cost");
-        }
-        wake_test(radio, rc.as_ref(), continuous).await;
     }
+    park("sentry probe").await
+}
 
-    // Nothing else on this build has anything to do, and the loop is what
-    // keeps the board's watchdog fed while the console output is read off.
-    // Says so on a cadence for the reason `park` does: a finished run and a
-    // wedged one look the same to a console attached after the fact, and
-    // this run's whole output is the lines above.
-    let mut said = Instant::now();
-    loop {
+/// Listen without sleeping and count completed receptions.
+async fn control(radio: &mut Sx1262Driver<'_>) -> u32 {
+    println!("sentry probe: control - continuous receive for {} s", CONTROL_S);
+    radio.wake_from_retained_sleep().await;
+    radio.arm_continuous_rx(irq::RX_DONE | irq::CRC_ERR);
+    let until = Instant::now() + Duration::from_secs(CONTROL_S);
+    let mut got = 0u32;
+    let mut crc = 0u32;
+    while Instant::now() < until {
         watchdog::beat(Task::Loop, Phase::Receive);
-        if Instant::now() - said > Duration::from_secs(15) {
-            println!("sentry probe: done, results above");
-            said = Instant::now();
+        if radio.irq_pending() {
+            let status = radio.take_irq();
+            if status & irq::CRC_ERR != 0 {
+                crc += 1;
+            }
+            if status & irq::RX_DONE != 0 {
+                got += 1;
+                let (seq, pre) = read_wake(radio);
+                println!("sentry probe: control heard seq {} ({} symbols)", seq, pre);
+                radio.arm_continuous_rx(irq::RX_DONE | irq::CRC_ERR);
+            }
         }
-        Timer::after(Duration::from_millis(200)).await;
+        Timer::after(Duration::from_millis(10)).await;
+    }
+    let (mode, err) = radio.health();
+    println!(
+        "sentry probe: CONTROL {} frames, {} crc errors in {} s, radio {} err 0x{:04X}",
+        got, crc, CONTROL_S, mode, err
+    );
+    got
+}
+
+/// The sequence number and preamble length the frame in the buffer
+/// carries, or zeros if it is something else.
+fn read_wake(radio: &mut Sx1262Driver<'_>) -> (u16, u16) {
+    let mut buf = [0u8; 8];
+    let n = radio.read_payload(&mut buf);
+    if n >= 5 && buf[0] == WAKE_TAG {
+        (
+            u16::from_le_bytes([buf[1], buf[2]]),
+            u16::from_le_bytes([buf[3], buf[4]]),
+        )
+    } else {
+        (0, 0)
     }
 }
 
-/// Arm a sentry the way the design means it to be armed, and wait to be
-/// woken by a real frame.
-///
-/// This is the question the whole plan rests on, and the earlier version of
-/// this probe could not ask it: the sniff loop leaves only on `RX_DONE`, so
-/// a source keying a preamble that never becomes a packet can never wake
-/// it, however long it keys for.
-///
-/// A reception ends the cycle and leaves the chip in standby, so every wake
-/// is followed by a re-arm. That is not a workaround - it is what a sleeping
-/// board will have to do on the far side of every wake.
-async fn wake_test(
+/// Arm one way and count what wakes it. Returns `(wakes, frames offered)`,
+/// the second from the sequence numbers the wakes carried.
+async fn trial(
     radio: &mut Sx1262Driver<'_>,
-    rc: Option<&midair_proto::sentry::RcRate>,
-    continuous: u32,
-) {
-    const WAKE_WAIT_S: u64 = 150;
-    let g = geometry(radio);
-    let Some(preamble) = g.preamble_symbols(&cfg_of(radio)) else {
-        println!("sentry probe: no preamble fits this geometry - nothing to test");
-        return;
-    };
-    // Corrected, so the sleep the chip actually takes is the one the
-    // preamble was sized against.
-    let (rx_cmd, sleep_cmd) = match rc {
-        Some(r) => (r.correct_us(g.rx_us), r.correct_us(g.sleep_us)),
-        None => (g.rx_us, g.sleep_us),
-    };
+    j1: &mut J1,
+    t: &Trial,
+    preamble_us: u32,
+) -> (u32, u32) {
+    let t_sym = radio.symbol_time_us();
+    // What the datasheet's two bounds say about this arm against the
+    // source's preamble: the cycle a preamble has to span so that a window
+    // opens inside it with room to detect, and the restarted timer the rest
+    // of the frame has to fit in. Printed so a trial that fails a bound on
+    // paper is not mistaken for one that failed on the chip.
+    let cycle_us = t.rx_us + t.sleep_us + TCXO_US;
+    let need_min = cycle_us + DETECT_SYMBOLS * t_sym;
+    let hold_us = 2 * t.rx_us + t.sleep_us;
+    let need_max = hold_us + DETECT_SYMBOLS * t_sym - HEADER_SYMBOLS * t_sym;
+    println!("sentry probe: TRIAL {}", t.name);
     println!(
-        "sentry probe: wake test, rx {} us sleep {} us (commanded {} / {}), symb timeout {}",
-        g.rx_us, g.sleep_us, rx_cmd, sleep_cmd, SYMB_TIMEOUT
-    );
-    println!(
-        "sentry probe: source must send frames with a {}-symbol preamble ({} us, window {} to {} us)",
-        preamble,
-        preamble * radio.symbol_time_us(),
-        g.preamble_min_us,
-        g.preamble_max_us
+        "sentry probe:   cycle {} us, hold after detect {} us, preamble {} us must be in {}..{} - {}",
+        cycle_us,
+        hold_us,
+        preamble_us,
+        need_min,
+        need_max,
+        if preamble_us >= need_min && preamble_us <= need_max {
+            "inside both bounds"
+        } else if preamble_us < need_min {
+            "SHORTER than the cycle"
+        } else {
+            "LONGER than the restarted timer"
+        }
     );
 
-    // Every arm is verified and every arm's outcome is recorded, because
-    // the question is which of the two is failing: frames that are not
-    // heard, or an arm after a reception that never took. A sentry whose
-    // re-arm is eaten wakes once and then never again, which for a sleeping
-    // board is a doorbell that works one time.
-    let until = Instant::now() + Duration::from_secs(WAKE_WAIT_S);
-    let mut woken = 0u32;
+    let mut wakes = 0u32;
     let mut arms = 0u32;
-    let mut arms_verified = 0u32;
-    let mut preambles = 0u32;
-    let mut headers = 0u32;
-    let mut crc_errs = 0u32;
-    // Which preamble lengths actually woke it, against the lengths sent.
-    let mut hits = [0u32; PREAMBLE_SWEEP.len()];
-    // Set by the first `arm!` before anything reads it.
-    let mut armed_at;
-    let mut said = Instant::now();
+    // Which sequence numbers woke it, low byte, so the frames missed
+    // between two wakes can be counted.
+    let mut seen = [0u64; 4];
+    let mut seq_lo = u16::MAX;
+    let mut seq_hi = 0u16;
+    // BUSY is high only through the transitions, so its low periods
+    // alternate between the window and the sleep. Held windows - ones a
+    // preamble extended - show up as low periods longer than the window
+    // and shorter than the sleep.
+    const GLITCH_US: u32 = 1_000;
+    let mut lows = 0u32;
+    let mut shortest = u32::MAX;
+    let mut longest = 0u32;
+    let mut held = 0u32;
 
-    // A closure would need the radio mutably twice; a small helper keeps it
-    // readable and is used for the first arm and every re-arm alike, so the
-    // two cannot drift apart.
     macro_rules! arm {
         () => {{
-            // The chip is most likely in a retained sleep, where it accepts
-            // nothing until an NSS edge wakes it - so the arm that follows
-            // would otherwise be spent doing that and be lost.
             radio.wake_from_retained_sleep().await;
-            // Every stage of a reception, not just its end. A wake that
-            // does not happen is one of three different failures - a window
-            // that never caught the preamble, a preamble that never became
-            // a header, or a header whose packet failed - and they want
-            // different fixes. All three fire while the chip is awake in a
-            // window, so reading them cannot disturb the cycle.
             radio.arm_duty_cycle(
-                rx_cmd,
-                sleep_cmd,
-                SYMB_TIMEOUT,
-                irq::RX_DONE | irq::PREAMBLE_DETECTED | irq::HEADER_VALID | irq::CRC_ERR,
+                t.rx_us,
+                t.sleep_us,
+                t.symb_timeout,
+                t.stop_on_preamble,
+                irq::RX_DONE,
             );
             arms += 1;
-            armed_at = Instant::now();
-            // Inside the first receive window, so this read cannot disturb
-            // the cycle it is checking.
-            let (mode, err) = radio.health();
-            if mode == "rx" {
-                arms_verified += 1;
-            } else {
-                println!(
-                    "sentry probe: ARM {} DID NOT TAKE - radio {} err 0x{:04X}",
-                    arms, mode, err
-                );
-            }
+            j1.mark.set_high();
         }};
     }
 
     arm!();
+    let mut armed_at = Instant::now();
+    let until = Instant::now() + Duration::from_secs(TRIAL_S);
+    let mut was_busy = radio.busy_high();
+    let mut since = Instant::now();
+    let mut passes = 0u32;
+    let mut said = Instant::now();
     while Instant::now() < until {
-        watchdog::beat(Task::Loop, Phase::Receive);
+        j1.mirror(radio);
+        let busy = radio.busy_high();
+        if busy != was_busy {
+            if !was_busy {
+                let held_us = (Instant::now() - since).as_micros() as u32;
+                if held_us >= GLITCH_US {
+                    lows += 1;
+                    shortest = shortest.min(held_us);
+                    longest = longest.max(held_us);
+                    // A window is the shorter phase; the sleep is at least
+                    // the commanded sleep less the timer's error.
+                    let window_us = if t.symb_timeout == 0 {
+                        t.rx_us
+                    } else {
+                        (u32::from(t.symb_timeout) * t_sym).min(t.rx_us)
+                    };
+                    if held_us > window_us + window_us / 2 && held_us < t.sleep_us * 9 / 10 {
+                        held += 1;
+                    }
+                }
+            }
+            was_busy = busy;
+            since = Instant::now();
+        }
+        // A reception is the only thing on DIO1, and it has ended the
+        // cycle: the chip is in standby, so reading it disturbs nothing.
         if radio.irq_pending() {
+            j1.mark.set_low();
             let status = radio.take_irq();
-            if status & irq::PREAMBLE_DETECTED != 0 {
-                preambles += 1;
-            }
-            if status & irq::HEADER_VALID != 0 {
-                headers += 1;
-            }
-            if status & irq::CRC_ERR != 0 {
-                crc_errs += 1;
-            }
             if status & irq::RX_DONE != 0 {
-                woken += 1;
-                // The frame says what preamble it was sent with, so a wake
-                // reports its own cause. Read before the re-arm, which
-                // rewrites the packet parameters.
-                let mut buf = [0u8; 8];
-                let n = radio.read_payload(&mut buf);
-                let syms = if n >= 3 && buf[0] == WAKE_TAG {
-                    u16::from(buf[1]) | (u16::from(buf[2]) << 8)
-                } else {
-                    0
-                };
-                if let Some(slot) = PREAMBLE_SWEEP.iter().position(|p| *p == syms) {
-                    hits[slot] += 1;
+                wakes += 1;
+                let (seq, pre) = read_wake(radio);
+                if seq != 0 {
+                    seen[usize::from(seq & 0xFF) / 64] |= 1u64 << (seq % 64);
+                    seq_lo = seq_lo.min(seq);
+                    seq_hi = seq_hi.max(seq);
                 }
                 println!(
-                    "sentry probe: woken by a {} symbol preamble after {} ms",
-                    syms,
+                    "sentry probe:   WOKEN by seq {} ({} symbols), {} ms after arming",
+                    seq,
+                    pre,
                     (Instant::now() - armed_at).as_millis()
                 );
-                arm!();
+            } else {
+                println!("sentry probe:   DIO1 without RxDone, irq 0x{:04X}", status);
             }
+            arm!();
+            armed_at = Instant::now();
+            was_busy = radio.busy_high();
+            since = Instant::now();
         }
-        if Instant::now() - said > Duration::from_secs(20) {
-            println!(
-                "sentry probe: {} s left, {} wakes, {} arms ({} verified)",
-                (until - Instant::now()).as_secs(),
-                woken,
-                arms,
-                arms_verified
-            );
-            said = Instant::now();
-        }
-        Timer::after(Duration::from_millis(POLL_MS)).await;
-    }
-
-    radio.wake_from_retained_sleep().await;
-    println!(
-        "sentry probe: {} wakes from {} arms, {} of those arms verified rx",
-        woken, arms, arms_verified
-    );
-    // Where the frames that did not wake it got to. Each step is a
-    // different failure with a different fix, and the counts say which.
-    println!(
-        "sentry probe: {} preambles -> {} headers -> {} wakes ({} crc errors)",
-        preambles, headers, woken, crc_errs
-    );
-    // The measurement this run exists for: the feasible preamble window as
-    // the hardware reports it, rather than as the geometry predicts it.
-    println!("sentry probe: wakes by preamble length -");
-    let g = geometry(radio);
-    for (i, p) in PREAMBLE_SWEEP.iter().enumerate() {
-        let us = u32::from(*p) * radio.symbol_time_us();
-        let predicted = us >= g.preamble_min_us && us <= g.preamble_max_us;
-        println!(
-            "sentry probe: {:>4} symbols ({:>7} us) {:>3} wakes  {}",
-            p,
-            us,
-            hits[i],
-            if predicted { "<- model says this should work" } else { "" }
-        );
-    }
-    println!(
-        "sentry probe: model predicts {} to {} us",
-        g.preamble_min_us, g.preamble_max_us
-    );
-
-    if preambles == 0 {
-        println!("sentry probe: STAGE windows are not catching the preamble - geometry or margin");
-    } else if headers < preambles / 2 {
-        println!("sentry probe: STAGE preambles caught but not becoming headers - the window closes too early");
-    } else if woken < headers / 2 {
-        println!("sentry probe: STAGE headers decoded but packets not completing - length or crc");
-    } else {
-        println!("sentry probe: STAGE receptions complete once started - the misses are earlier");
-    }
-    if arms_verified < arms {
-        println!("sentry probe: VERDICT re-arms are being eaten - {} of {} did not take", arms - arms_verified, arms);
-    } else if woken == 0 {
-        println!("sentry probe: VERDICT every arm took and nothing was heard - not the re-arm");
-    }
-    // The comparison this run exists for: the same source and the same
-    // interrupt, judged once without sleeping and once with.
-    println!(
-        "sentry probe: A/B continuous {} received, duty cycled {} woken",
-        continuous, woken
-    );
-    if continuous == 0 && woken == 0 {
-        println!("sentry probe: neither completes - the frame, not the duty cycle");
-    } else if continuous > 0 && woken.saturating_mul(4) < continuous {
-        println!("sentry probe: continuous completes and duty cycled does not - the window, not the frame");
-    } else if woken > 0 && continuous > 0 {
-        println!("sentry probe: both complete at comparable rates - the duty cycle is not the cost");
-    } else {
-        println!("sentry probe: VERDICT every arm took; the misses are frames not heard, not arms lost");
-    }
-}
-
-/// The running modulation as a config, for the shared arithmetic.
-fn cfg_of(radio: &Sx1262Driver<'_>) -> midair_proto::radiocfg::RadioConfig {
-    let mut cfg = midair_proto::radiocfg::RadioConfig::default();
-    cfg.spreading_factor = sf_for(radio.symbol_time_us());
-    cfg
-}
-
-/// Count false preamble detections across the band and both gain settings.
-///
-/// A duty-cycled receiver is only listening for a fraction of each cycle,
-/// so it can afford that window to be spent on the signal it is waiting
-/// for and not much else. A false detection is not free: the chip restarts
-/// its timer and holds the receiver hunting a header that will never
-/// arrive, so a channel busy enough will consume most windows before a real
-/// frame lands.
-///
-/// Nothing may be transmitting while this runs, or it measures the source.
-/// What it produces is the one number the wake design needs from the
-/// environment - detections a second - for each carrier and gain, so a
-/// quiet corner of the band can be picked rather than assumed.
-async fn noise_survey(radio: &mut Sx1262Driver<'_>) {
-    /// Seconds of continuous receive per condition.
-    const DWELL_S: u64 = 6;
-    /// Carriers to try, Hz. The 902-928 MHz band, sampled across.
-    const CARRIERS: [u32; 7] = [
-        903_000_000,
-        907_000_000,
-        911_000_000,
-        915_000_000,
-        919_000_000,
-        923_000_000,
-        927_000_000,
-    ];
-
-    let home = radio.carrier_hz();
-    println!("sentry probe: noise survey, {} s a condition, nothing may be transmitting", DWELL_S);
-    println!("sentry probe:      MHz  boost   detections  per second");
-    let mut best = (u32::MAX, home, true);
-    for boost in [true, false] {
-        for hz in CARRIERS {
-            radio.set_rx_boost(boost);
-            radio.tune(hz);
-            radio.arm_continuous_rx(irq::PREAMBLE_DETECTED);
-            let until = Instant::now() + Duration::from_secs(DWELL_S);
-            let mut seen = 0u32;
-            while Instant::now() < until {
-                watchdog::beat(Task::Loop, Phase::Receive);
-                if radio.irq_pending() && radio.take_irq() & irq::PREAMBLE_DETECTED != 0 {
-                    seen += 1;
-                }
-                Timer::after(Duration::from_millis(POLL_MS)).await;
-            }
-            // Tenths, so the table stays integer and still separates a
-            // quiet carrier from a merely quieter one.
-            let per_s_tenths = u64::from(seen) * 10 / DWELL_S;
-            println!(
-                "sentry probe: {:>8}  {:>5}   {:>10}  {}.{}",
-                hz / 1_000_000,
-                if boost { "on" } else { "off" },
-                seen,
-                per_s_tenths / 10,
-                per_s_tenths % 10
-            );
-            if seen < best.0 {
-                best = (seen, hz, boost);
-            }
-        }
-    }
-    println!(
-        "sentry probe: quietest {} MHz with boost {} - {} in {} s",
-        best.1 / 1_000_000,
-        if best.2 { "on" } else { "off" },
-        best.0,
-        DWELL_S
-    );
-    // Put the radio back where the config wants it; the phases below are
-    // about the link, not the band.
-    radio.set_rx_boost(true);
-    radio.tune(home);
-}
-
-/// Time the chip's own sleep timer against the host's crystal.
-///
-/// The receive timeout is counted in the same 15.625 us steps off the same
-/// RC64k that times a duty cycle's sleep phase, so a timeout commanded and
-/// then measured says what that oscillator is really running at. Nothing
-/// has to be on the air for this, which is why it goes first.
-///
-/// The number matters because the preamble window has to absorb this error
-/// over a whole sleep. The window is tens of milliseconds; one percent of a
-/// one-second sleep is ten. So this is what sets the receive window, and
-/// the receive window is what the sentry's current is proportional to.
-async fn rc_timebase(radio: &mut Sx1262Driver<'_>) -> Option<midair_proto::sentry::RcRate> {
-    /// Commanded timeout per trial, ms. Long enough that the fixed costs of
-    /// arming and of the poll period are a small part of it.
-    const RC_TIMEOUT_MS: u32 = 2_000;
-    const RC_TRIALS: usize = 8;
-
-    println!("sentry probe: timing the chip's RC64k, {} trials of {} ms", RC_TRIALS, RC_TIMEOUT_MS);
-    let commanded_us = RC_TIMEOUT_MS * 1_000;
-    let mut measured: heapless::Vec<u32, RC_TRIALS> = heapless::Vec::new();
-    let mut spoiled = 0u32;
-    for _ in 0..RC_TRIALS {
-        // Everything that could end a receive window is latched, not just
-        // the timeout, so a trial that was cut short by traffic can be told
-        // from one that ran its length. Measuring only the timeout hides
-        // the contaminated trials instead of discarding them, and a wrong
-        // rate here mis-sizes every sleep that is corrected by it.
-        radio.arm_rx_timeout(
-            RC_TIMEOUT_MS,
-            irq::TIMEOUT | irq::RX_DONE | irq::PREAMBLE_DETECTED | irq::HEADER_VALID,
-        );
-        let started = Instant::now();
-        // Generous: a timer that runs very long must be measured, not cut
-        // off at the value being checked.
-        let give_up = started + Duration::from_millis(u64::from(RC_TIMEOUT_MS) * 3);
-        let mut got = None;
-        while Instant::now() < give_up {
+        passes += 1;
+        if passes % BEAT_EVERY == 0 {
             watchdog::beat(Task::Loop, Phase::Receive);
-            if radio.irq_pending() {
-                let at = Instant::now();
-                let status = radio.take_irq();
-                // A window that saw a signal was not timing the oscillator,
-                // it was receiving. Discard it rather than average it in.
-                if status & (irq::RX_DONE | irq::PREAMBLE_DETECTED | irq::HEADER_VALID) != 0 {
-                    spoiled += 1;
-                    break;
-                }
-                if status & irq::TIMEOUT != 0 {
-                    got = Some((at - started).as_micros() as u32);
-                    break;
-                }
-            }
-            Timer::after(Duration::from_millis(POLL_MS)).await;
-        }
-        match got {
-            Some(us) => {
-                let _ = measured.push(us);
-            }
-            None => println!("sentry probe: a timeout never fired - the chip is not counting"),
-        }
-    }
-
-    let Some(r) = rc_rate(commanded_us, &measured) else {
-        println!("sentry probe: RC64k NOT MEASURED - no trial completed");
-        return None;
-    };
-    println!(
-        "sentry probe: RC64k {} clean trials ({} spoiled by traffic), mean {} ppm, min {} ppm, max {} ppm",
-        r.trials, spoiled, r.mean_ppm, r.min_ppm, r.max_ppm
-    );
-    if r.trials < 3 {
-        println!("sentry probe: RC64k UNRELIABLE - too few clean trials to correct with");
-        return None;
-    }
-    // The offset and the spread are different things and only one of them
-    // costs anything. An offset is the same every cycle and divides out of
-    // the period commanded; the spread is what a window has to be wide
-    // enough to absorb.
-    let sleep = SLEEP_US;
-    let spread = r.spread_ppm();
-    println!(
-        "sentry probe: offset {} ppm (correctable: command {} us for a {} us sleep)",
-        r.mean_ppm,
-        r.correct_us(sleep),
-        sleep
-    );
-    println!(
-        "sentry probe: spread {} ppm is {} us over a {} ms sleep - this is what needs margin",
-        spread,
-        drift_us(sleep, spread),
-        sleep / 1000
-    );
-    let t_sym = radio.symbol_time_us();
-    let floor = min_rx_us_for(t_sym);
-    for (label, ppm) in [("corrected", spread), ("uncorrected", r.worst_abs_ppm())] {
-        let needed = min_rx_for_margin_us(t_sym, sleep, ppm);
-        println!(
-            "sentry probe: {} - window >= {} us ({} over the {} us floor), {} permille duty",
-            label,
-            needed,
-            needed.saturating_sub(floor),
-            floor,
-            (u64::from(needed) * 1000 / u64::from(needed + sleep + TCXO_US)) as u32
-        );
-    }
-    // Said plainly, because it is the finding: these trials ran seconds
-    // apart on a board at one temperature, and a stored board does not sit
-    // at one temperature for a month.
-    println!("sentry probe: NOTE the spread above is short-term only - temperature drift is unmeasured");
-    Some(r)
-}
-
-/// The fixed floor, for the running modulation.
-fn min_rx_us_for(t_sym_us: u32) -> u32 {
-    let mut cfg = midair_proto::radiocfg::RadioConfig::default();
-    cfg.spreading_factor = sf_for(t_sym_us);
-    min_rx_us(&cfg, SYMB_TIMEOUT, TCXO_US, WAKE_PAYLOAD.len())
-}
-
-/// The window a measured drift demands, for the running modulation.
-fn min_rx_for_margin_us(t_sym_us: u32, sleep_us: u32, ppm: u32) -> u32 {
-    let mut cfg = midair_proto::radiocfg::RadioConfig::default();
-    cfg.spreading_factor = sf_for(t_sym_us);
-    min_rx_for_margin(&cfg, SYMB_TIMEOUT, TCXO_US, sleep_us, ppm, WAKE_PAYLOAD.len())
-}
-
-/// Recover the spreading factor from the symbol time at the default 500 kHz
-/// bandwidth, so the arithmetic above is done on what the radio is running
-/// rather than on the config default.
-fn sf_for(t_sym_us: u32) -> u8 {
-    // t_sym = 2^sf / bw, and at 500 kHz that is 2^sf * 2 us.
-    let mut sf = 5u8;
-    while sf < 12 && (1u32 << sf) * 2 < t_sym_us {
-        sf += 1;
-    }
-    sf
-}
-
-/// Put the chip through a duty cycle's sleep and warm start, then listen
-/// continuously and count what it can still receive.
-///
-/// The one thing that separates a receiver which never sleeps from one that
-/// does is the restore on the far side of a sleep. Continuous receive
-/// completes these frames perfectly from a cold configuration, so if it
-/// cannot complete them after a warm start the fault is in what the restore
-/// leaves behind - and no amount of window or preamble arithmetic would
-/// ever have found it.
-async fn receives_after_warm_start(radio: &mut Sx1262Driver<'_>) -> u32 {
-    const LISTEN_S: u64 = 90;
-    let g = geometry(radio);
-
-    // A short cycle, purely to force a sleep and a restore quickly.
-    println!("sentry probe: forcing a sleep and warm start, then listening continuously");
-    radio.wake_from_retained_sleep().await;
-    radio.arm_duty_cycle(g.rx_us, 200_000, SYMB_TIMEOUT, irq::RX_DONE);
-    // Long enough for several sleep/restore cycles to have happened.
-    let spin = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < spin {
-        watchdog::beat(Task::Loop, Phase::Receive);
-        Timer::after(Duration::from_millis(POLL_MS)).await;
-    }
-    // Out of the cycle and into plain continuous receive, without
-    // re-initializing the radio: the point is to listen with whatever the
-    // warm start left in place.
-    radio.wake_from_retained_sleep().await;
-    radio.arm_continuous_rx(irq::RX_DONE | irq::CRC_ERR);
-    let (mode, err) = radio.health();
-    println!("sentry probe: after warm start radio {} err 0x{:04X}", mode, err);
-
-    let until = Instant::now() + Duration::from_secs(LISTEN_S);
-    let mut got = 0u32;
-    let mut crc = 0u32;
-    while Instant::now() < until {
-        watchdog::beat(Task::Loop, Phase::Receive);
-        if radio.irq_pending() {
-            let status = radio.take_irq();
-            if status & irq::CRC_ERR != 0 {
-                crc += 1;
-            }
-            if status & irq::RX_DONE != 0 {
-                got += 1;
-                println!("sentry probe: post-warm reception {}", got);
-                radio.arm_continuous_rx(irq::RX_DONE | irq::CRC_ERR);
-            }
-        }
-        Timer::after(Duration::from_millis(POLL_MS)).await;
-    }
-    println!(
-        "sentry probe: AFTER WARM START {} received, {} crc errors in {} s",
-        got, crc, LISTEN_S
-    );
-    got
-}
-
-/// Listen without ever sleeping, and count completed receptions.
-///
-/// Judged on `RxDone`, the same interrupt the duty cycle is judged on, so
-/// the two numbers mean the same thing. Anything else compares a preamble
-/// against a packet - which is what every earlier control here did, and why
-/// it could never have told a frame the receiver cannot finish from a duty
-/// cycle that fails to receive one.
-async fn receives_continuously(radio: &mut Sx1262Driver<'_>) -> u32 {
-    const LISTEN_S: u64 = 90;
-    println!(
-        "sentry probe: control - continuous receive for {} s, counting RxDone",
-        LISTEN_S
-    );
-    radio.wake_from_retained_sleep().await;
-    radio.arm_continuous_rx(irq::RX_DONE | irq::CRC_ERR);
-    let until = Instant::now() + Duration::from_secs(LISTEN_S);
-    let mut got = 0u32;
-    let mut crc = 0u32;
-    let mut said = Instant::now();
-    while Instant::now() < until {
-        watchdog::beat(Task::Loop, Phase::Receive);
-        if radio.irq_pending() {
-            let status = radio.take_irq();
-            if status & irq::CRC_ERR != 0 {
-                crc += 1;
-            }
-            if status & irq::RX_DONE != 0 {
-                got += 1;
-                let mut buf = [0u8; 8];
-                let n = radio.read_payload(&mut buf);
-                let syms = if n >= 3 && buf[0] == WAKE_TAG {
-                    u16::from(buf[1]) | (u16::from(buf[2]) << 8)
-                } else {
-                    0
-                };
+            if Instant::now() - said > Duration::from_secs(25) {
                 println!(
-                    "sentry probe: control received a {} symbol frame ({} so far)",
-                    syms, got
+                    "sentry probe:   {} s left, {} wakes",
+                    (until - Instant::now()).as_secs(),
+                    wakes
                 );
-                // A reception drops the chip into standby; put it back.
-                radio.arm_continuous_rx(irq::RX_DONE | irq::CRC_ERR);
+                said = Instant::now();
             }
         }
-        if Instant::now() - said > Duration::from_secs(30) {
-            println!("sentry probe: control {} received, {} crc so far", got, crc);
-            said = Instant::now();
-        }
-        Timer::after(Duration::from_millis(POLL_MS)).await;
     }
-    println!(
-        "sentry probe: CONTROL {} frames received, {} crc errors in {} s",
-        got, crc, LISTEN_S
-    );
-    if got == 0 {
-        println!("sentry probe: a receiver that never sleeps cannot finish these frames either");
-    }
-    got
-}
-
-/// Listen continuously for a few seconds and say whether anything is there.
-///
-/// The control for the whole run: it uses the same radio, the same
-/// interrupt and the same settings as every measurement below, and differs
-/// only in never sleeping. So a failure here is the link - a source that is
-/// off, on other settings, or out of range - and a failure below it with
-/// this passing is the receive window, which is the thing being measured.
-async fn hearing(radio: &mut Sx1262Driver<'_>) -> bool {
-    const LISTEN_S: u64 = 10;
-    println!("sentry probe: listening continuously for {} s as a control", LISTEN_S);
-    radio.arm_continuous_rx(irq::PREAMBLE_DETECTED);
-    let until = Instant::now() + Duration::from_secs(LISTEN_S);
-    let mut seen = 0u32;
-    while Instant::now() < until {
-        watchdog::beat(Task::Loop, Phase::Receive);
-        if radio.irq_pending() {
-            let status = radio.take_irq();
-            if status & irq::PREAMBLE_DETECTED != 0 {
-                seen += 1;
-            }
-        }
-        Timer::after(Duration::from_millis(POLL_MS)).await;
-    }
+    j1.mark.set_low();
+    // Out of the cycle, into somewhere known.
+    radio.wake_from_retained_sleep().await;
     let (mode, err) = radio.health();
+
+    let offered = if wakes > 0 {
+        u32::from(seq_hi - seq_lo) + 1
+    } else {
+        0
+    };
+    let distinct: u32 = seen.iter().map(|w| w.count_ones()).sum();
     println!(
-        "sentry probe: control saw {} preamble detections, radio {} err 0x{:04X}",
-        seen, mode, err
+        "sentry probe:   {} wakes ({} distinct) from seq {}..{} = {} frames offered, {} arms, radio {} err 0x{:04X}",
+        wakes, distinct, seq_lo, seq_hi, offered, arms, mode, err
     );
-    if seen == 0 {
-        println!("sentry probe: CONTROL FAILED - the source is not reachable on these settings");
-        println!("sentry probe: check it is still keyed, and that both boards share frequency and modulation");
-    }
-    seen > 0
-}
-
-/// Walk the window down and count what still detects.
-async fn sweep(radio: &mut Sx1262Driver<'_>, listening: u32) -> heapless::Vec<SweepStep, 16> {
-    println!("sentry probe: sweep, {} trials a step", SWEEP_TRIALS);
-    println!("sentry probe:  overhead_us     rx_us  detects");
-    let mut steps: heapless::Vec<SweepStep, 16> = heapless::Vec::new();
-    for overhead in OVERHEAD_LADDER_US {
-        let rx_us = listening + overhead;
-        let deadline =
-            Duration::from_micros(u64::from(rx_us + SLEEP_US) * u64::from(TRIAL_CYCLES));
-        let mut detects = 0;
-        for _ in 0..SWEEP_TRIALS {
-            // Re-armed per trial, so each one is an independent question:
-            // does a window of this length catch a signal that is already
-            // there?
-            //
-            // The wake first is not optional. Every trial but the first
-            // arms a chip left mid-sleep by the one before, where it holds
-            // BUSY high and accepts nothing until an NSS edge wakes it - so
-            // the arm is spent waking it and the window never opens. Without
-            // this the sweep reads 0 of 15 at every length including 432 ms,
-            // on a board whose continuous receive hears the same carrier
-            // perfectly well, and that reads as a receiver that cannot
-            // detect rather than an arm that never landed.
-            watchdog::beat(Task::Loop, Phase::Receive);
-            radio.wake_from_retained_sleep().await;
-            radio.arm_duty_cycle(rx_us, SLEEP_US, DETECT_SYMBOLS, irq::PREAMBLE_DETECTED);
-            if wait_for_detect(radio, deadline).await.is_some() {
-                detects += 1;
-            }
-        }
+    if lows > 0 {
         println!(
-            "sentry probe: {:>11}  {:>8}  {:>3}/{}",
-            overhead, rx_us, detects, SWEEP_TRIALS
+            "sentry probe:   BUSY low periods x{}, shortest {} us, longest {} us, {} held windows",
+            lows, shortest, longest, held
         );
-        let _ = steps.push(SweepStep {
-            rx_us,
-            cycles: SWEEP_TRIALS,
-            detects,
-        });
+    } else {
+        println!("sentry probe:   BUSY never moved - the cycle did not run");
     }
-    steps
+    (wakes, offered)
 }
 
-/// Wait for DIO1, clear what raised it, and return when it happened.
-/// `None` if `deadline` passed with the pin quiet.
-async fn wait_for_detect(radio: &mut Sx1262Driver<'_>, deadline: Duration) -> Option<Instant> {
-    let give_up = Instant::now() + deadline;
-    // Progress, so a run that stops says where it stopped. Without it a
-    // reset mid-sweep is indistinguishable from one mid-wait, and the sweep
-    // rows only print when a whole step is done.
-    let mut said = Instant::now();
-    loop {
-        watchdog::beat(Task::Loop, Phase::Receive);
-        if Instant::now() - said > Duration::from_secs(20) {
-            println!("sentry probe: still waiting, {} s into a wait", (Instant::now() - give_up + deadline).as_secs());
-            said = Instant::now();
-        }
-        if radio.irq_pending() {
-            let at = Instant::now();
-            let status = radio.take_irq();
-            // A window that opened, counted its symbols and found nothing is
-            // a timeout, not a detection - and on a sweep step that is too
-            // short it is the expected outcome rather than an error.
-            if status & irq::PREAMBLE_DETECTED != 0 {
-                return Some(at);
-            }
-        }
-        if Instant::now() >= give_up {
-            return None;
-        }
-        Timer::after(Duration::from_millis(POLL_MS)).await;
-    }
-}
-
-/// Key a continuous preamble, as the signal the probe measures against.
-/// Does not return.
+/// Send wake frames, each behind [`SOURCE_PREAMBLE_SYMBOLS`] of preamble
+/// and carrying its sequence number. Does not return.
 ///
-/// **This keys the PA and leaves it keyed**, for as long as the board is
-/// powered. Two things make that acceptable rather than reckless, and both
-/// are checked here rather than left to whoever is at the bench:
+/// Two things make keying a PA on a bench acceptable rather than reckless,
+/// and both are checked here rather than left to whoever is at the bench:
 ///
 /// - **The power has to be low.** At the top of the range the PA is 127 mA
-///   in a module that normally sees a third of a second at a time. At
-///   [`SOURCE_MAX_DBM`] it is a fraction of that, and two boards a bench
-///   apart need nothing more. A board configured higher is refused.
+///   in a module that normally sees a third of a second at a time. A board
+///   configured above [`SOURCE_MAX_DBM`] is refused.
 /// - **The antenna switch has to be right.** DIO2 switches it and DIO3
 ///   supplies it, so this only ever follows the ordinary initialization
 ///   that sets both, and the latched device errors are read before keying -
@@ -964,11 +499,9 @@ async fn wait_for_detect(radio: &mut Sx1262Driver<'_>, deadline: Duration) -> Op
 ///   means the switch is unpowered, and keying into an isolated port
 ///   destroys the part.
 ///
-/// Continuous rather than burst because of what is downstream: a sweep
-/// trial that lands while the source is quiet fails, and a source with an
-/// off-period would put that failure into every step of the sweep at the
-/// rate of its own duty cycle. The measurement would then be of the
-/// transmitter, not the receiver.
+/// The gap between frames is jittered so the source's period and the
+/// receiver's cycle cannot settle into a phase where every window lands on
+/// the same part of every frame.
 pub async fn source(radio: &mut Sx1262Driver<'_>) -> ! {
     let dbm = radio.power_dbm();
     if dbm > SOURCE_MAX_DBM {
@@ -976,76 +509,73 @@ pub async fn source(radio: &mut Sx1262Driver<'_>) -> ! {
             "sentry source: REFUSING to send at {} dBm - {} dBm or less",
             dbm, SOURCE_MAX_DBM
         );
-        park().await
+        park("sentry source").await
     }
     let err = radio.device_errors();
     if err != 0 {
         println!("sentry source: REFUSING to transmit, device errors 0x{:04X}", err);
-        park().await
+        park("sentry source").await
     }
 
-    println!(
-        "sentry source: quiet for {} s so the receiver can time its own oscillator first",
-        QUIET_FIRST_S
-    );
+    println!("sentry source: quiet for {} s", QUIET_FIRST_S);
     hold(QUIET_FIRST_S).await;
     println!(
-        "sentry source: sweeping {} preamble lengths, {} frames each at {} dBm",
-        PREAMBLE_SWEEP.len(),
-        FRAMES_PER_PREAMBLE,
+        "sentry source: frames with a {} symbol preamble ({} us) at {} dBm",
+        SOURCE_PREAMBLE_SYMBOLS,
+        u32::from(SOURCE_PREAMBLE_SYMBOLS) * radio.symbol_time_us(),
         dbm
     );
 
     let until = Instant::now() + Duration::from_secs(SOURCE_MAX_KEYED_S);
-    loop {
-        for preamble in PREAMBLE_SWEEP {
-            if Instant::now() >= until {
-                println!("sentry source: budget spent, standing down");
-                radio.standby();
-                park().await
-            }
-            // The frame says what it was sent with, so a receiver woken by
-            // it can report which length worked rather than leaving the two
-            // ends to be matched up by wall clock.
-            let payload = [WAKE_TAG, preamble as u8, (preamble >> 8) as u8];
-            let mut ok = 0u32;
-            for _ in 0..FRAMES_PER_PREAMBLE {
-                watchdog::beat(Task::Loop, Phase::TxSend);
-                if radio.send_wake(&payload, preamble).await.is_ok() {
-                    ok += 1;
-                }
-                hold(1).await;
-            }
+    let mut seq = 1u16;
+    let mut sent = 0u32;
+    let mut failed = 0u32;
+    while Instant::now() < until {
+        watchdog::beat(Task::Loop, Phase::TxSend);
+        let payload = [
+            WAKE_TAG,
+            seq as u8,
+            (seq >> 8) as u8,
+            SOURCE_PREAMBLE_SYMBOLS as u8,
+            (SOURCE_PREAMBLE_SYMBOLS >> 8) as u8,
+        ];
+        if radio.send_wake(&payload, SOURCE_PREAMBLE_SYMBOLS).await.is_ok() {
+            sent += 1;
+        } else {
+            failed += 1;
+        }
+        if seq % 10 == 0 {
             let (mode, err) = radio.health();
             if err != 0 {
                 println!("sentry source: STANDING DOWN, radio latched 0x{:04X}", err);
                 radio.standby();
-                park().await
+                park("sentry source").await
             }
             println!(
-                "sentry source: {} symbols, {}/{} sent, radio {}, {} s left",
-                preamble,
-                ok,
-                FRAMES_PER_PREAMBLE,
+                "sentry source: seq {} sent, {} ok {} failed, radio {}, {} s left",
+                seq,
+                sent,
+                failed,
                 mode,
                 (until - Instant::now()).as_secs()
             );
         }
+        // 600 to 1400 ms, stepping through five values.
+        let gap_ms = 600 + u64::from(seq % 5) * 200;
+        hold_ms(gap_ms).await;
+        seq = seq.wrapping_add(1).max(1);
     }
+    println!("sentry source: budget spent, standing down");
+    radio.standby();
+    park("sentry source").await
 }
 
-/// Key a continuous preamble, as the signal the window sweep measures
-/// against. Does not return.
+/// Key a continuous preamble. Does not return.
 ///
-/// The sweep asks whether a receive window *detects*, not whether it
-/// receives, so a signal that is always present and never becomes a packet
-/// is exactly right for it - every window that opens should detect, and the
-/// ones that do not are the measurement.
-///
-/// The same guards as the frame source: the power is checked because this
-/// holds the PA on, the device errors are read because DIO3 supplies the
-/// antenna switch on this module, and the keying is bounded so a board left
-/// plugged in does not transmit until somebody remembers it.
+/// For a receiver whose windows are being timed rather than counted: a
+/// signal that is always present and never becomes a packet is what says
+/// whether a window that detects something is held open by it. The same
+/// guards as the frame source, for the same reasons.
 #[cfg(feature = "iso-sentry-carrier")]
 pub async fn carrier(radio: &mut Sx1262Driver<'_>) -> ! {
     let dbm = radio.power_dbm();
@@ -1054,7 +584,7 @@ pub async fn carrier(radio: &mut Sx1262Driver<'_>) -> ! {
             "sentry carrier: REFUSING to key at {} dBm - {} dBm or less",
             dbm, SOURCE_MAX_DBM
         );
-        park().await
+        park("sentry carrier").await
     }
     println!(
         "sentry carrier: quiet for {} s, then keyed at {} dBm for {} s",
@@ -1065,7 +595,7 @@ pub async fn carrier(radio: &mut Sx1262Driver<'_>) -> ! {
     if err != 0 {
         println!("sentry carrier: REFUSING to key, device errors 0x{:04X}", err);
         radio.standby();
-        park().await
+        park("sentry carrier").await
     }
     let until = Instant::now() + Duration::from_secs(SOURCE_MAX_KEYED_S);
     let mut said = Instant::now();
@@ -1076,7 +606,7 @@ pub async fn carrier(radio: &mut Sx1262Driver<'_>) -> ! {
             if err != 0 {
                 println!("sentry carrier: STANDING DOWN, radio latched 0x{:04X}", err);
                 radio.standby();
-                park().await
+                park("sentry carrier").await
             }
             println!(
                 "sentry carrier: keyed at {} dBm, radio {}, {} s left",
@@ -1090,160 +620,80 @@ pub async fn carrier(radio: &mut Sx1262Driver<'_>) -> ! {
     }
     println!("sentry carrier: standing down");
     radio.standby();
-    park().await
+    park("sentry carrier").await
 }
 
 /// Wait `secs`, keeping the heartbeat up across it.
 async fn hold(secs: u64) {
-    let until = Instant::now() + Duration::from_secs(secs);
+    hold_ms(secs * 1000).await
+}
+
+async fn hold_ms(ms: u64) {
+    let until = Instant::now() + Duration::from_millis(ms);
     while Instant::now() < until {
         watchdog::beat(Task::Loop, Phase::Receive);
-        Timer::after(Duration::from_millis(200)).await;
+        Timer::after(Duration::from_millis(50)).await;
     }
 }
 
-/// Sit still, keeping the heartbeat up. For a source that declined to key.
+/// Sit still, keeping the heartbeat up, saying so on a cadence.
 ///
-/// It says so on a cadence rather than going quiet. A board that refused is
-/// otherwise indistinguishable from a wedged one at the far end of a
-/// console that was attached after the refusal was printed - and the
-/// refusal is the more likely of the two, so it is the one that has to keep
-/// being visible.
-async fn park() -> ! {
+/// A finished run and a wedged one look the same to a console attached
+/// after the fact, and the results are the lines above - so the fact that
+/// there are results to scroll up to has to keep being said.
+async fn park(who: &str) -> ! {
     let mut said = Instant::now();
     loop {
         watchdog::beat(Task::Loop, Phase::Receive);
-        if Instant::now() - said > Duration::from_secs(10) {
-            println!("sentry source: parked, not transmitting");
+        if Instant::now() - said > Duration::from_secs(15) {
+            println!("{}: done, results above", who);
             said = Instant::now();
         }
         Timer::after(Duration::from_millis(200)).await;
     }
 }
 
-/// Watch a duty cycle from outside the SPI bus. Does not return.
+/// Time the sniff loop's phases off BUSY, with nothing transmitting, and
+/// mirror the lines to J1. Does not return.
 ///
-/// Every instrument in this module until now asked the chip a question, and
-/// in a sniff loop the chip either will not answer or is ended by the
-/// asking. BUSY is different: it is an input to the host, so reading it is
-/// a pin read - no transaction, no NSS edge, nothing the radio can notice.
-/// It is held high through a retained sleep and the startup behind it, and
-/// released once the chip is awake, so watching it draws the shape of the
-/// cycle from outside.
-///
-/// That answers the question the sweep could not reach: whether a receive
-/// window is really as long as it was commanded. If a window commanded at
-/// 200 ms is observed as twenty, nothing about preambles or margins was
-/// ever going to matter.
-///
-/// It also mirrors BUSY and DIO1 onto the J1 header, so the same timing can
-/// be taken by something that does not share this firmware's clock or its
-/// bugs:
-///
-/// ```text
-///   GPIO38   BUSY  (high = asleep or starting, low = awake)
-///   GPIO39   DIO1  (high = an enabled interrupt is pending)
-///   GPIO40   mark  (pulsed high for one pass when the sentry is armed)
-/// ```
-///
-/// Those three are J1 header pins that nothing else claims; `main` parks
-/// them as pulled-down inputs, and they are taken here the way the sleep
-/// path takes the pads it has to hold.
+/// Sweeps the symbol timeout with the receive period opened wide, so the
+/// symbol count alone decides how long an empty window stays open. What
+/// it measured: the window is `SymbNum` symbol times exactly, and with the
+/// count at zero it is the receive period.
 #[cfg(feature = "iso-sentry-mirror")]
 pub async fn mirror(radio: &mut Sx1262Driver<'_>) -> ! {
-    use esp_hal::gpio::{Level, Output, OutputConfig};
-
-    /// Passes between heartbeats. The loop has no await in it, so the
-    /// watchdog is fed by count rather than by time - and the monitor that
-    /// would reset the board for a stall runs on the other core.
-    const BEAT_EVERY: u32 = 20_000;
-
-    // SAFETY: `main` parks these as inputs and nothing else ever claims
-    // them; this build exists to drive them and does not return.
-    let (mut out_busy, mut out_dio1, mut out_mark) = unsafe {
-        (
-            Output::new(esp_hal::peripherals::GPIO38::steal(), Level::Low, OutputConfig::default()),
-            Output::new(esp_hal::peripherals::GPIO39::steal(), Level::Low, OutputConfig::default()),
-            Output::new(esp_hal::peripherals::GPIO40::steal(), Level::Low, OutputConfig::default()),
-        )
-    };
-
-    // Symbol counts to try. The window is the lever now, and it has only
-    // been measured at one value - this is what says how it scales, and
-    // whether `rxPeriod` really is the ceiling the model claims.
-    //
-    // `rxPeriod` is opened wide for the sweep so it cannot be what binds;
-    // at SF12/BW500 even 128 symbols is about a second, so a one-second
-    // ceiling leaves the symbol count alone to decide.
-    const SYMB_SWEEP: [u8; 7] = [0, 4, 8, 16, 32, 64, 128];
+    const SYMB_SWEEP: [u8; 6] = [0, 4, 8, 16, 32, 64];
     const SWEEP_RX_US: u32 = 1_000_000;
+    const SLEEP_US: u32 = 1_000_000;
     const PER_STEP_S: u64 = 12;
+    const GLITCH_US: u32 = 1_000;
 
-    // Prove the wires before measuring through them. Each mirror pin is
-    // pulsed a different number of times, so a monitor on the far end can
-    // tell not only that a line is connected but which line it is - a
-    // swapped pair otherwise reads as a perfectly plausible measurement.
-    //
-    // DIO1 especially: it only moves when a reception happens, so in a run
-    // with nothing transmitting a disconnected wire and a correct one look
-    // exactly alike. That is not a distinction to discover afterwards.
-    println!("sentry mirror: wiring self-test - BUSY x1, DIO1 x2, MARK x3 pulses of 50 ms");
-    for (pin, times) in [
-        (&mut out_busy as &mut Output, 1u8),
-        (&mut out_dio1 as &mut Output, 2),
-        (&mut out_mark as &mut Output, 3),
-    ] {
-        for _ in 0..times {
-            pin.set_high();
-            Timer::after(Duration::from_millis(50)).await;
-            pin.set_low();
-            Timer::after(Duration::from_millis(50)).await;
-        }
-        Timer::after(Duration::from_millis(200)).await;
-    }
-    println!("sentry mirror: self-test done");
-
-    let g = geometry(radio);
+    let mut j1 = J1::take();
+    j1.self_test().await;
     println!(
         "sentry mirror: sweeping the symbol timeout, rx ceiling {} us, sleep {} us",
-        SWEEP_RX_US, g.sleep_us
+        SWEEP_RX_US, SLEEP_US
     );
     println!("sentry mirror:  symbols   predicted_us   measured_us");
-    println!("sentry mirror: J1 GPIO38 = BUSY, GPIO39 = DIO1, GPIO40 = armed marker");
 
     for symbs in SYMB_SWEEP {
         radio.wake_from_retained_sleep().await;
-        radio.arm_duty_cycle(SWEEP_RX_US, g.sleep_us, symbs, irq::RX_DONE);
-        out_mark.set_high();
+        radio.arm_duty_cycle(SWEEP_RX_US, SLEEP_US, symbs, false, irq::RX_DONE);
+        j1.mark.set_high();
 
-        // BUSY marks only the transitions, so its low periods alternate
-        // between the receive window and the sleep. The short one of each
-        // pair is the window; taking the minimum picks it out without
-        // needing to know which phase the run started in.
         let mut was_busy = radio.busy_high();
         let mut since = Instant::now();
-        // BUSY glitches at its own transitions - low periods of a few
-        // microseconds show up either side of a real edge, and a raw
-        // minimum picks those instead of the window. Anything under this
-        // is not a phase of the cycle.
-        const GLITCH_US: u32 = 1_000;
         let mut shortest = u32::MAX;
         let mut longest = 0u32;
-        let mut glitches = 0u32;
         let until = Instant::now() + Duration::from_secs(PER_STEP_S);
         let mut passes = 0u32;
         while Instant::now() < until {
+            j1.mirror(radio);
             let busy = radio.busy_high();
-            out_busy.set_level(if busy { Level::High } else { Level::Low });
-            out_dio1.set_level(if radio.irq_pending() { Level::High } else { Level::Low });
             if busy != was_busy {
-                if was_busy {
-                    // A low period just began; nothing to record yet.
-                } else {
+                if !was_busy {
                     let held = (Instant::now() - since).as_micros() as u32;
-                    if held < GLITCH_US {
-                        glitches += 1;
-                    } else {
+                    if held >= GLITCH_US {
                         shortest = shortest.min(held);
                         longest = longest.max(held);
                     }
@@ -1256,7 +706,7 @@ pub async fn mirror(radio: &mut Sx1262Driver<'_>) -> ! {
                 watchdog::beat(Task::Loop, Phase::Receive);
             }
         }
-        out_mark.set_low();
+        j1.mark.set_low();
 
         let predicted = if symbs == 0 {
             SWEEP_RX_US
@@ -1267,25 +717,11 @@ pub async fn mirror(radio: &mut Sx1262Driver<'_>) -> ! {
             println!("sentry mirror: {:>8}   {:>12}   no transitions", symbs, predicted);
         } else {
             println!(
-                "sentry mirror: {:>8}   {:>12}   {:>11}   (long phase {} us, {} glitches)",
-                symbs, predicted, shortest, longest, glitches
+                "sentry mirror: {:>8}   {:>12}   {:>11}   (long phase {} us)",
+                symbs, predicted, shortest, longest
             );
         }
     }
-    println!("sentry mirror: sweep done - measured should track predicted if the symbol count is the window");
-
-    let mut said = Instant::now();
-    loop {
-        watchdog::beat(Task::Loop, Phase::Receive);
-        if Instant::now() - said > Duration::from_secs(15) {
-            println!("sentry mirror: done, results above; J1 pins still mirroring");
-            said = Instant::now();
-        }
-        // Keep mirroring after the report so an external monitor can still
-        // be attached and read the same cycle.
-        for _ in 0..BEAT_EVERY {
-            out_busy.set_level(if radio.busy_high() { Level::High } else { Level::Low });
-            out_dio1.set_level(if radio.irq_pending() { Level::High } else { Level::Low });
-        }
-    }
+    radio.wake_from_retained_sleep().await;
+    park("sentry mirror").await
 }

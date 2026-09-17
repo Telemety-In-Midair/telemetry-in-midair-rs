@@ -28,6 +28,7 @@ mod op {
     pub const SET_RX: u8 = 0x82;
     pub const SET_RX_DUTY_CYCLE: u8 = 0x94;
     pub const SET_LORA_SYMB_NUM_TIMEOUT: u8 = 0xA0;
+    pub const STOP_TIMER_ON_PREAMBLE: u8 = 0x9F;
     pub const SET_TX_INFINITE_PREAMBLE: u8 = 0xD1;
     pub const SET_RX_TX_FALLBACK_MODE: u8 = 0x93;
     pub const SET_REGULATOR_MODE: u8 = 0x96;
@@ -525,16 +526,46 @@ impl<'d> Sx1262<'d> {
         );
     }
 
-    /// How many LoRa symbols the modem must count before it accepts that a
-    /// signal is really there. 0 disables the check.
+    /// How many LoRa symbols the modem is given, from the first chirp it
+    /// detects, to find the *end* of a preamble. 0 disables the check.
     ///
-    /// What makes a duty-cycled receive window cheap: without it a window
-    /// that caught noise stays in receive for the whole of its timeout, and
-    /// with it the modem gives up after a few symbols and goes back to
-    /// sleep. Larger is more confident and costs that much more window on
-    /// every cycle for the life of the board.
+    /// Not a detection threshold, though it reads like one. RM0461 spells
+    /// out what the SX126x datasheet leaves ambiguous: the modem counts
+    /// chirps after the first one it sees and times out unless the end of
+    /// the preamble arrives within `symbols` of it. So it bounds how much
+    /// preamble may *precede* the header once the receiver is listening -
+    /// which suits a receiver that opens its window just before a short
+    /// preamble starts, and defeats one that opens in the middle of a long
+    /// one. A duty-cycled receiver waiting for a wake preamble seconds long
+    /// must leave this at zero: with it set to eight, only a window that
+    /// opened in the last eight symbols of the preamble ever completed a
+    /// reception, and that was the two percent wake rate this design spent
+    /// a week on.
+    ///
+    /// It also sets the length of an empty window: with nothing on the air
+    /// the count starts at once and the receiver leaves after exactly
+    /// `symbols` symbol times, whatever `rxPeriod` says.
     pub fn set_lora_symb_num_timeout(&mut self, symbols: u8) {
         self.cmd(op::SET_LORA_SYMB_NUM_TIMEOUT, &[symbols]);
+    }
+
+    /// Whether a receive timeout stops on preamble detection rather than on
+    /// header detection, which is the power-up default.
+    ///
+    /// What lets a short window catch a long preamble. A duty cycle restarts
+    /// its window timer at `2 * rxPeriod + sleepPeriod` when the timer's
+    /// stop event fires, and by default that event is the header - which on
+    /// a wake frame arrives a second or more after the preamble began, long
+    /// after a window sized in tens of milliseconds has closed. Stopping on
+    /// the preamble instead holds the receiver from the moment it hears
+    /// anything, and the header then has the whole restarted period to
+    /// arrive in.
+    ///
+    /// The cost is the one the datasheet warns about: a false detection
+    /// holds the receiver for that same period, so a sentry pays a whole
+    /// restarted timer for every burst of noise that looks like a chirp.
+    pub fn set_stop_timer_on_preamble(&mut self, on: bool) {
+        self.cmd(op::STOP_TIMER_ON_PREAMBLE, &[u8::from(on)]);
     }
 
     /// Transmit preamble symbols continuously until a `SetStandby`.

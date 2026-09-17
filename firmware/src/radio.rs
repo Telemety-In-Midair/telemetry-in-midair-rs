@@ -734,7 +734,20 @@ impl<'d> Sx1262Driver<'d> {
     /// `rx_active` stays false. This is not continuous receive, and a poll
     /// that decided the receiver needed re-arming would take the chip
     /// straight back out of the cycle.
-    pub fn arm_duty_cycle(&mut self, rx_us: u32, sleep_us: u32, detect_symbols: u8, mask: u16) {
+    ///
+    /// `symb_timeout` and `stop_on_preamble` are the two settings that
+    /// decide whether a window can catch a preamble longer than itself; see
+    /// the driver's notes on each. A sentry waiting for a wake frame wants
+    /// zero and true. Both persist in the chip across every mode change, so
+    /// every other arm in this driver resets them.
+    pub fn arm_duty_cycle(
+        &mut self,
+        rx_us: u32,
+        sleep_us: u32,
+        symb_timeout: u8,
+        stop_on_preamble: bool,
+        mask: u16,
+    ) {
         // Both halves are counted by the chip's RC64k, so both are what the
         // caller asked for only if the caller corrected for its offset.
         // Nothing here does that on the caller's behalf - the correction
@@ -746,13 +759,29 @@ impl<'d> Sx1262Driver<'d> {
         // first sleep phase and every window after it listens deafer.
         self.radio.set_retention_list(&[reg::RX_GAIN]);
         self.radio.set_lora_packet_params(RX_MAX_PAYLOAD);
-        self.radio.set_lora_symb_num_timeout(detect_symbols);
+        self.radio.set_lora_symb_num_timeout(symb_timeout);
+        self.radio.set_stop_timer_on_preamble(stop_on_preamble);
         self.radio.set_dio_irq_params(mask);
         self.radio.clear_irq_status(irq::ALL);
         self.radio.set_rx_duty_cycle(
             sentry::duty_steps_from_us(rx_us),
             sentry::duty_steps_from_us(sleep_us),
         );
+    }
+
+    /// The receive settings a plain receiver wants, undone from whatever a
+    /// duty cycle left behind.
+    ///
+    /// The symbol timeout and the timer stop event both persist in the chip
+    /// until something rewrites them, and neither is touched by `init`'s
+    /// reset only because the reset returns them to these values. An arm
+    /// that followed a duty cycle without this inherited a symbol timeout
+    /// that ends a window a few symbols in, and a continuous receive that
+    /// had just heard twenty-four frames then heard none - which read, for
+    /// a day, as a chip that lost its configuration in the sleep.
+    fn plain_rx_settings(&mut self) {
+        self.radio.set_lora_symb_num_timeout(0);
+        self.radio.set_stop_timer_on_preamble(false);
     }
 
     /// Arm plain continuous receive with `mask` routed to DIO1.
@@ -765,6 +794,7 @@ impl<'d> Sx1262Driver<'d> {
     pub fn arm_continuous_rx(&mut self, mask: u16) {
         self.rx_active = false;
         self.radio.set_standby(StandbyClk::Rc);
+        self.plain_rx_settings();
         self.radio.set_lora_packet_params(RX_MAX_PAYLOAD);
         self.radio.set_dio_irq_params(mask);
         self.radio.clear_irq_status(irq::ALL);
@@ -828,6 +858,7 @@ impl<'d> Sx1262Driver<'d> {
     pub fn arm_rx_timeout(&mut self, timeout_ms: u32, mask: u16) {
         self.rx_active = false;
         self.radio.set_standby(StandbyClk::Rc);
+        self.plain_rx_settings();
         self.radio.set_lora_packet_params(RX_MAX_PAYLOAD);
         self.radio.set_dio_irq_params(mask);
         self.radio.clear_irq_status(irq::ALL);
