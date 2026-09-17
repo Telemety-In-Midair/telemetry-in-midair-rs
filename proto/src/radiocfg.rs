@@ -531,6 +531,12 @@ pub struct RadioConfig {
     /// The sentry's sleep between windows, ms. What buys current: the
     /// receiver is off for this long out of every cycle.
     pub wake_sleep_ms: u16,
+    /// The carrier the sentry listens on and a wake frame is sent on, Hz;
+    /// 0 for [`frequency_hz`](Self::frequency_hz). A sentry locks on any
+    /// LoRa symbol in its window and a foreign preamble costs it a whole
+    /// cycle, so a carrier the fleet's beacons are not on is what keeps a
+    /// stored board reachable beside a busy one.
+    pub wake_frequency_hz: u32,
     /// GPS receiver configuration.
     pub gps: GpsConfig,
     /// Duty cycle, i.e. how much of the time the board is reachable.
@@ -629,6 +635,7 @@ impl Default for RadioConfig {
             wake_enabled: true,
             wake_rx_ms: 300,
             wake_sleep_ms: 3_000,
+            wake_frequency_hz: 0,
             gps: GpsConfig::default(),
             // All-absent: a file that says nothing about the duty cycle
             // leaves whatever the board is running untouched.
@@ -839,7 +846,7 @@ pub const MAX_HOPS_LIMIT: u8 = 8;
 // with no stored file at all.
 
 /// Wire length of the [`RadioConfig`] read-back blob.
-pub const RADIO_CONFIG_LEN: usize = 38;
+pub const RADIO_CONFIG_LEN: usize = 42;
 
 /// Length of the blob before the hop plan was appended. A board on that
 /// firmware sends this much, and its byte 27 - now `hop_channels` - was a
@@ -876,6 +883,15 @@ const RCFG_QZSS: u8 = 1 << 4;
 const RCFG_SBAS: u8 = 1 << 5;
 
 impl RadioConfig {
+    /// The carrier a sentry listens on and a wake frame goes out on.
+    pub fn wake_carrier_hz(&self) -> u32 {
+        if self.wake_frequency_hz == 0 {
+            self.frequency_hz
+        } else {
+            self.wake_frequency_hz
+        }
+    }
+
     /// Encode the config as the fixed [`RADIO_CONFIG_LEN`]-byte read-back
     /// blob (little-endian).
     pub fn encode(&self) -> [u8; RADIO_CONFIG_LEN] {
@@ -940,6 +956,7 @@ impl RadioConfig {
         b[32..34].copy_from_slice(&self.ping_interval_s.to_le_bytes());
         b[34..36].copy_from_slice(&self.wake_rx_ms.to_le_bytes());
         b[36..38].copy_from_slice(&self.wake_sleep_ms.to_le_bytes());
+        b[38..42].copy_from_slice(&self.wake_frequency_hz.to_le_bytes());
         b
     }
 
@@ -990,6 +1007,11 @@ impl RadioConfig {
             wake_enabled: has_wake && flags & RCFG_WAKE != 0,
             wake_rx_ms: if has_wake { u16at(34) } else { defaults.wake_rx_ms },
             wake_sleep_ms: if has_wake { u16at(36) } else { defaults.wake_sleep_ms },
+            wake_frequency_hz: if has_wake {
+                u32::from_le_bytes([b[38], b[39], b[40], b[41]])
+            } else {
+                0
+            },
             gps: GpsConfig {
                 gps_enabled: g & RCFG_GPS != 0,
                 glonass_enabled: g & RCFG_GLONASS != 0,
@@ -1283,6 +1305,14 @@ pub const KEYS: &[Key] = &[
         commented: false,
         doc: "The sentry's sleep between windows, 200-30000 ms. Longer is cheaper and makes every wake frame longer by the same amount, so a waker spends more air time per attempt.",
         show: |c, w| write!(w, "{}", c.wake_sleep_ms),
+    },
+    Key {
+        section: "wake",
+        name: "wake_frequency_hz",
+        kind: Kind::Int { min: 0, max: RF_MAX_HZ as i64 },
+        commented: false,
+        doc: "The carrier the sentry listens on and wake frames go out on, Hz; 0 means frequency_hz. A sentry locks on any LoRa symbol that lands in its window, and a preamble that is not a wake frame's - a beacon, another network, noise - holds it for a restarted timer and then costs it a whole sleep, during which a wake frame is lost. So put the sentry where the beacons are not: a fleet that beacons every second on frequency_hz will blind a sentry on the same carrier most of the time. Every board that calls or is called must share this value. 927 MHz measured about ten times quieter than the rest of the 902-928 band on one bench.",
+        show: |c, w| write!(w, "{}", c.wake_frequency_hz),
     },
     Key {
         section: "network",
@@ -1668,6 +1698,7 @@ pub fn parse(text: &str) -> Result<RadioConfig, ConfigError> {
             "wake_enabled" => cfg.wake_enabled = bool_of(value, lineno)?,
             "wake_rx_ms" => cfg.wake_rx_ms = int_of(name, value, lineno)? as u16,
             "wake_sleep_ms" => cfg.wake_sleep_ms = int_of(name, value, lineno)? as u16,
+            "wake_frequency_hz" => cfg.wake_frequency_hz = int_of(name, value, lineno)? as u32,
             // The card is gone; a file that still carries its key is not
             // wrong, only out of date, and the value is what it always
             // would have been.
@@ -2324,6 +2355,7 @@ mod tests {
             wake_enabled: false,
             wake_rx_ms: 450,
             wake_sleep_ms: 7_500,
+            wake_frequency_hz: 927_000_000,
             gps: GpsConfig {
                 gps_enabled: true,
                 glonass_enabled: true,

@@ -1,19 +1,25 @@
 //! Deep sleep: park what a sleeping board cannot use, then go down.
 //!
-//! There is no rail to cut on this board - the GPS and SD sit directly on
-//! +3V3 - so the radio is the one load the firmware can actually drop, and
-//! dropping it is worth doing: continuous RX is 5.5 mA against the module's
-//! 9.3 uA asleep. The hardware loop owns the radio, so this asks and waits
-//! rather than reaching for it.
+//! There is no rail to cut on this board - the GPS and the radio sit
+//! directly on +3V3 - so the radio is the one load the firmware can
+//! actually drop, and dropping it is worth doing: continuous RX is 5.5 mA
+//! against the module's 9.3 uA asleep. The hardware loop owns the radio, so
+//! this asks and waits rather than reaching for it.
 //!
-//! The GPS goes with it. `PrepareSleep` puts the receiver into backup and
-//! holds the UART TX pad across the sleep, which together are what make a
-//! sleeping board actually cheap: an M10 left acquiring is around 30 mA
-//! against a chip that is otherwise in microamps, and a sleeping S3 cannot
-//! use a fix anyway.
+//! Or the radio is not dropped but left listening. A park that arms a
+//! sentry leaves the SX1262 cycling its own receiver on its own timers,
+//! and this registers the radio's DIO1 as a wake source beside the timer:
+//! a completed wake frame then brings the chip back in the middle of an
+//! interval that would otherwise have been the whole wait.
+//!
+//! The GPS goes down either way. `PrepareSleep` puts the receiver into
+//! backup and holds the UART TX pad across the sleep, which together are
+//! what make a sleeping board actually cheap: an M10 left acquiring is
+//! around 30 mA against a chip that is otherwise in microamps, and a
+//! sleeping S3 cannot use a fix anyway.
 
 use embassy_time::{with_timeout, Duration};
-use esp_hal::rtc_cntl::sleep::TimerWakeupSource;
+use esp_hal::rtc_cntl::sleep::{Ext0WakeupSource, TimerWakeupSource, WakeupLevel};
 use esp_hal::rtc_cntl::Rtc;
 use esp_println::println;
 use midair_proto::evlog::Kind;
@@ -31,7 +37,7 @@ use crate::{event, evlog, settings, state, watchdog};
 /// when the park does.
 const PARK_SLACK_MS: u64 = 1_500;
 
-/// Park the radio, the GPS and the card, then deep sleep for `interval_s`.
+/// Park the radio, the GPS and the panel, then deep sleep for `interval_s`.
 /// Does not return.
 pub async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
     state::SLEEP_READY.reset();
@@ -88,7 +94,17 @@ pub async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
     // that would have written it is about to lose its RAM with the rest.
     watchdog::beat(Task::Serve, Phase::Sleep);
     evlog::flush().await;
+    go_down(rtc, interval_s)
+}
 
+/// The last step of every deep sleep: hold the pads a sleeping board needs
+/// held, register the wake sources, and go. Does not return.
+///
+/// Separate from the park above because one caller has no park to wait
+/// for: a boot that a wake frame for some other node caused re-arms the
+/// radio and comes straight here, from a boot that never started the
+/// hardware task.
+pub fn go_down(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
     // Hold what the sleeping board still needs held.
     //
     // The S3 releases every pad that is not explicitly held when the digital
@@ -97,16 +113,20 @@ pub async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
     // on an otherwise quiet board will produce one, so the radio that
     // `PrepareSleep` just put into cold sleep wakes itself back to STDBY_RC
     // and sits there for the whole interval - which is the same 5.7 mA the
-    // parking was for. GPIO21 is inside the S3's RTC GPIO range (0-21), so
-    // the pad hold reaches it.
+    // parking was for. And a radio left as a sentry is ended by the same
+    // edge: it wakes into standby and the cycle does not resume, so the
+    // hold is what keeps the sentry listening at all. GPIO21 is inside the
+    // S3's RTC GPIO range (0-21), so the pad hold reaches it.
     //
-    // The pin belongs to the SX1262 driver in the hardware task, so the
-    // singleton is stolen for the hold. Nothing races: the driver is parked
-    // and this function does not return.
+    // NRESET (GPIO7) is held for the sentry too. It is driven high by the
+    // driver and released with everything else at sleep entry, and a reset
+    // line drifting low would reset the radio into its power-up state -
+    // deaf, with the antenna switch unpowered - with nothing anywhere to
+    // say it happened.
     //
-    // SD CS (GPIO44) has the same problem and is not fixable the same way -
-    // the S3's RTC pins stop at 21, so a digital pad needs the
-    // `RTC_CNTL_DIG_PAD_HOLD` register that esp-hal 1.0 does not expose.
+    // The pins belong to the SX1262 driver in the hardware task, so the
+    // singletons are stolen for the holds. Nothing races: the driver is
+    // parked and this function does not return.
     //
     // GPIO2 is UART1 TX into the M10's RX, and UART RX activity is one of
     // the receiver's two backup wake sources. A floating edge there undoes
@@ -116,6 +136,7 @@ pub async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
     // held at the level the UART idles at.
     unsafe {
         esp_hal::gpio::RtcPin::rtcio_pad_hold(&esp_hal::peripherals::GPIO21::steal(), true);
+        esp_hal::gpio::RtcPin::rtcio_pad_hold(&esp_hal::peripherals::GPIO7::steal(), true);
         esp_hal::gpio::RtcPin::rtcio_pad_hold(&esp_hal::peripherals::GPIO2::steal(), true);
     }
 
@@ -125,11 +146,39 @@ pub async fn enter_deep_sleep(rtc: &mut Rtc<'_>, interval_s: u32) -> ! {
     // side is how long the wake itself took, less the interval asked for.
     // Nothing else on the board can measure that: every other clock stops.
     settings::note_sleep_at(rtc.time_since_boot().as_millis() as u32);
-    println!(
-        "deep sleep for {} s (mode {}, radio and gps parked)",
-        interval_s,
-        settings::get().mode.as_str()
-    );
     let timer = TimerWakeupSource::new(core::time::Duration::from_secs(interval_s as u64));
-    rtc.sleep_deep(&[&timer])
+    match settings::sentry() {
+        Some(s) => {
+            println!(
+                "deep sleep for {} s (mode {}, gps parked, radio listening {} ms every {} ms - DIO1 wakes)",
+                interval_s,
+                settings::get().mode.as_str(),
+                s.rx_ms,
+                s.sleep_ms
+            );
+            // DIO1 is GPIO9, inside the RTC range, and the radio holds it
+            // high from `RxDone` until the interrupt is cleared - so a
+            // frame that lands between the arm and this line is not lost:
+            // the level is already there when the sleep begins, and the
+            // chip comes straight back. The pin is the driver's, stolen
+            // here for the same reason the held pads are.
+            //
+            // What this costs: `Ext0` keeps the RTC peripheral domain
+            // powered through the sleep, tens of microamps against a
+            // sentry average in the hundreds.
+            let ext0 = Ext0WakeupSource::new(
+                unsafe { esp_hal::peripherals::GPIO9::steal() },
+                WakeupLevel::High,
+            );
+            rtc.sleep_deep(&[&timer, &ext0])
+        }
+        None => {
+            println!(
+                "deep sleep for {} s (mode {}, radio and gps parked)",
+                interval_s,
+                settings::get().mode.as_str()
+            );
+            rtc.sleep_deep(&[&timer])
+        }
+    }
 }

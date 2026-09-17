@@ -52,10 +52,20 @@ use midair_proto::sentry;
 use midair_proto::supervise::{Phase, Task};
 
 use crate::sx1262::{dev_err, irq, mode, reg, FallbackMode, StandbyClk, Sx1262, RX_CONTINUOUS};
+use midair_proto::lora::{Frame, Wake};
 
 #[derive(Debug)]
 pub enum Sx1262Error {
     Timeout,
+}
+
+/// The wake frame a boot found in the radio's buffer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeekedWake {
+    /// Who sent it.
+    pub caller: u8,
+    pub wake: Wake,
+    pub rssi: i16,
 }
 
 /// Payload length written into the packet params before receiving.
@@ -65,6 +75,19 @@ pub enum Sx1262Error {
 /// accept. Every transmit has to narrow it to the size of the frame being
 /// sent, so receiving means putting it back.
 const RX_MAX_PAYLOAD: u8 = 255;
+
+/// What DIO1 carries while the node is on the network: the packet ends,
+/// and the preamble and header as well, because they are how the poll
+/// knows a frame is arriving - which is what holds a hop and a transmit
+/// off a channel somebody is mid-sentence on. Anything that narrows the
+/// mask for its own purposes puts this back.
+const NETWORK_IRQS: u16 = irq::RX_DONE
+    | irq::TX_DONE
+    | irq::CRC_ERR
+    | irq::TIMEOUT
+    | irq::PREAMBLE_DETECTED
+    | irq::HEADER_VALID
+    | irq::HEADER_ERR;
 
 /// Time added to the header time before a preamble with no header behind
 /// it is given up on, ms: one poll period each for seeing the preamble and
@@ -401,23 +424,15 @@ impl<'d> Sx1262Driver<'d> {
         //
         // Nodes on different sync words cannot hear each other at all, so
         // this is a flag day: a fleet has to be reflashed together.
-        let (msb, lsb) = reg::SYNC_WORD_PRIVATE;
-        self.radio.write_reg(reg::LORA_SYNC_WORD_MSB, msb);
-        self.radio.write_reg(reg::LORA_SYNC_WORD_LSB, lsb);
+        self.radio.set_sync_word(reg::SYNC_WORD_PRIVATE);
+        // Both at their reset values after the pulse above, and written
+        // anyway: they are the two settings a sentry changes, they persist
+        // across every mode change, and the day they were assumed cost a
+        // week.
+        self.plain_rx_settings();
 
         self.radio.set_buffer_base_address(0x00, 0x00);
-        // Preamble and header as well as the packet ends: they are how the
-        // poll knows a frame is arriving, which is what holds a hop and a
-        // transmit off a channel somebody is mid-sentence on.
-        self.radio.set_dio_irq_params(
-            irq::RX_DONE
-                | irq::TX_DONE
-                | irq::CRC_ERR
-                | irq::TIMEOUT
-                | irq::PREAMBLE_DETECTED
-                | irq::HEADER_VALID
-                | irq::HEADER_ERR,
-        );
+        self.radio.set_dio_irq_params(NETWORK_IRQS);
         // Where the chip lands after a packet: a listening node keeps the
         // oscillator running (see `xosc`), so its next receive or transmit
         // starts without the TCXO's startup in front of it.
@@ -799,6 +814,159 @@ impl<'d> Sx1262Driver<'d> {
         self.radio.set_dio_irq_params(mask);
         self.radio.clear_irq_status(irq::ALL);
         self.radio.set_rx(RX_CONTINUOUS);
+    }
+
+    /// Arm the radio as a sentry: its own receive/sleep cycle on the
+    /// config's carrier, on the wake sync word, with DIO1 carrying `RxDone`
+    /// and nothing else, so that the chip that owns it can go to deep
+    /// sleep and be woken by the pin.
+    ///
+    /// After this nothing may touch the radio over SPI until DIO1 rises:
+    /// a transaction during the sleep phase wakes the chip into standby
+    /// and the cycle does not resume. The caller is expected to be on its
+    /// way to deep sleep.
+    ///
+    /// What is set and why, in order:
+    ///
+    /// - the wake carrier, which is the network's unless the config names
+    ///   a quieter one: a sentry locks on any LoRa symbol in its window and
+    ///   a foreign preamble costs it a whole cycle, so beacons on the same
+    ///   carrier blind it;
+    /// - the wake sync word, which is what keeps every ordinary beacon in
+    ///   earshot from waking the board;
+    /// - the retention list, because that word and the receiver gain are
+    ///   register writes and the warm start between windows restores
+    ///   commands, not registers - without this the second window listens
+    ///   on the network's word at the power-up gain;
+    /// - the symbol timeout at zero and the timer stopping on the header,
+    ///   the two settings that decide whether a long preamble can be
+    ///   caught at all;
+    /// - `RxDone` alone on DIO1. A timeout there would wake the chip every
+    ///   cycle, and a preamble would wake it on noise.
+    pub fn arm_sentry(&mut self, s: &sentry::Sentry) {
+        self.rx_active = false;
+        self.gate.clear();
+        self.radio.set_standby(StandbyClk::Rc);
+        self.hop.carrier_hz = self.cfg.wake_carrier_hz();
+        self.hop.rx_slot = None;
+        self.radio.set_rf_frequency(self.cfg.wake_carrier_hz());
+        self.radio.set_sync_word(reg::SYNC_WORD_WAKE);
+        self.radio.set_retention_list(&[
+            reg::RX_GAIN,
+            reg::LORA_SYNC_WORD_MSB,
+            reg::LORA_SYNC_WORD_LSB,
+        ]);
+        self.radio.set_lora_packet_params(RX_MAX_PAYLOAD);
+        self.radio.set_lora_symb_num_timeout(0);
+        self.radio.set_stop_timer_on_preamble(false);
+        self.radio.set_dio_irq_params(irq::RX_DONE);
+        self.radio.clear_irq_status(irq::ALL);
+        self.radio.set_rx_duty_cycle(s.rx_steps(), s.sleep_steps());
+    }
+
+    /// Start the cycle again on a chip that a reception just stopped, with
+    /// everything [`arm_sentry`](Self::arm_sentry) set still in place.
+    ///
+    /// For the boot that a wake frame for some other node caused: the chip
+    /// is in standby with its configuration intact, nothing has pulsed its
+    /// reset, and the periods come from the record the park left in RTC
+    /// RAM rather than from a config that would have to be read from
+    /// flash first.
+    pub fn rearm_sentry(&mut self, rx_ms: u32, sleep_ms: u32) {
+        self.rx_active = false;
+        self.radio.set_standby(StandbyClk::Rc);
+        self.radio.set_dio_irq_params(irq::RX_DONE);
+        self.radio.clear_irq_status(irq::ALL);
+        self.radio.set_rx_duty_cycle(
+            sentry::duty_steps_from_us(rx_ms.saturating_mul(1_000)),
+            sentry::duty_steps_from_us(sleep_ms.saturating_mul(1_000)),
+        );
+    }
+
+    /// Read the frame that woke the chip, without disturbing anything
+    /// else about the radio.
+    ///
+    /// No reset and no init: after `RxDone` the chip sits in standby with
+    /// its configuration and its receive buffer intact, and `init` pulses
+    /// the reset line, which is what would erase the one thing this boot
+    /// needs to look at first. `None` if DIO1 rose for something other
+    /// than a completed, CRC-clean wake frame - which then reads as a
+    /// wake nobody sent, and the caller treats it as it would a timer.
+    pub fn peek_wake(&mut self) -> Option<PeekedWake> {
+        let status = self.radio.irq_status();
+        if status & irq::RX_DONE == 0 {
+            return None;
+        }
+        let crc_ok = status & irq::CRC_ERR == 0;
+        let (len, offset) = self.radio.rx_buffer_status();
+        let mut buf = [0u8; FRAME_MAX];
+        let n = usize::from(len).min(buf.len());
+        if n > 0 {
+            self.radio.read_buffer(offset, &mut buf[..n]);
+        }
+        let (rssi, _) = self.radio.lora_packet_status();
+        self.radio.clear_irq_status(irq::ALL);
+        if !crc_ok {
+            return None;
+        }
+        let frame = Frame::decode(&buf[..n])?;
+        let wake = Wake::decode(frame.payload)?;
+        Some(PeekedWake {
+            caller: frame.src,
+            wake,
+            rssi,
+        })
+    }
+
+    /// Take a sentry back and sleep the radio cold, so a boot that is not
+    /// going to use it finds it where the posture believes it is.
+    ///
+    /// The chip may be in the sleep phase of its cycle, where it answers
+    /// nothing until an NSS edge wakes it; the wake is what makes the
+    /// sleep command land.
+    pub async fn disarm_sentry(&mut self) {
+        self.wake_from_retained_sleep().await;
+        self.radio.set_sleep();
+    }
+
+    /// Send `frame` on the wake sync word behind a preamble of
+    /// `preamble_syms` symbols, on the config's carrier, and put the
+    /// receiver back on the network afterwards.
+    ///
+    /// The word is switched for the one transmission and restored, so a
+    /// listening node that calls another loses nothing but the air time.
+    pub async fn send_wake_frame(
+        &mut self,
+        frame: &[u8],
+        preamble_syms: u16,
+    ) -> Result<(), Sx1262Error> {
+        let clk = self.standby_clk();
+        self.radio.set_standby(clk);
+        self.radio.set_rf_frequency(self.cfg.wake_carrier_hz());
+        self.radio.set_sync_word(reg::SYNC_WORD_WAKE);
+        let result = self.send_wake(frame, preamble_syms).await;
+        self.radio.set_standby(clk);
+        self.radio.set_sync_word(reg::SYNC_WORD_PRIVATE);
+        // Back to the network's carrier; the poll's hop tick sees a slot
+        // it has not tuned for and puts the receiver where the plan says.
+        self.radio.set_rf_frequency(self.cfg.frequency_hz);
+        self.hop.carrier_hz = self.cfg.frequency_hz;
+        self.hop.rx_slot = None;
+        // The transmit narrowed DIO1 to its own two bits.
+        self.radio.set_dio_irq_params(NETWORK_IRQS);
+        self.radio.clear_irq_status(irq::ALL);
+        self.last_tx = Some((
+            Instant::now().as_millis().saturating_sub(u64::from(
+                self.cfg
+                    .time_on_air_preamble_us(frame.len(), u32::from(preamble_syms))
+                    .div_ceil(1000),
+            )),
+            Instant::now().as_millis(),
+        ));
+        if self.listen {
+            self.enter_rx();
+        }
+        result
     }
 
     /// Transmit `data` behind a preamble of `preamble_syms`, and wait for it

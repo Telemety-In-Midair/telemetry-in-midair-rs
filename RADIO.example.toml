@@ -198,6 +198,17 @@ wake_rx_ms = 300
 # air time per attempt.
 wake_sleep_ms = 3000
 
+# The carrier the sentry listens on and wake frames go out on, Hz; 0 means
+# frequency_hz. A sentry locks on any LoRa symbol that lands in its window,
+# and a preamble that is not a wake frame's - a beacon, another network,
+# noise - holds it for a restarted timer and then costs it a whole sleep,
+# during which a wake frame is lost. So put the sentry where the beacons are
+# not: a fleet that beacons every second on frequency_hz will blind a sentry
+# on the same carrier most of the time. Every board that calls or is called
+# must share this value. 927 MHz measured about ten times quieter than the
+# rest of the 902-928 band on one bench.
+wake_frequency_hz = 0
+
 # -- Debug -----------------------------------------------------------------
 [debug]
 

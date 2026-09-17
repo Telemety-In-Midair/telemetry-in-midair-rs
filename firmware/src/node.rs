@@ -34,7 +34,7 @@
 
 use midair_proto::dedup::{RepeatQueue, SeenTable};
 use midair_proto::hop::{Offer, SyncWord};
-use midair_proto::lora::{Frame, FLAG_SYNC, FRAME_MAX, HEADER_LEN};
+use midair_proto::lora::{self, Frame, FLAG_SYNC, FRAME_MAX, HEADER_LEN};
 use midair_proto::radiocfg::{RadioConfig, Role};
 
 use crate::radio::{Sx1262Driver, Sx1262Error};
@@ -213,6 +213,38 @@ impl<'d> Node<'d> {
         self.next_id = self.next_id.wrapping_add(1);
         self.radio
             .send(&mut buf[..n], frame.sync_offset(), interval_ms)
+            .await
+            .map_err(TxError::Radio)
+    }
+
+    /// Call a sleeping node: one wake frame, from this node, behind a
+    /// preamble of `preamble_syms` symbols, on the wake sync word.
+    ///
+    /// Not a broadcast in the network's sense - no hop clock, no turn, no
+    /// repeat - because the receiver it is for has no clock and is not
+    /// listening for the network at all. The frame still carries this
+    /// node's address and a fresh id, so the woken node knows who called.
+    pub async fn send_wake(
+        &mut self,
+        wake: &lora::Wake,
+        preamble_syms: u16,
+    ) -> Result<(), TxError> {
+        if !self.role.transmits() {
+            return Err(TxError::Muted);
+        }
+        let payload = wake.encode();
+        let frame = Frame {
+            src: self.address,
+            id: self.next_id,
+            hops_left: 0,
+            sync: None,
+            payload: &payload,
+        };
+        let mut buf = [0u8; FRAME_MAX];
+        let n = frame.encode(&mut buf).ok_or(TxError::Payload)?;
+        self.next_id = self.next_id.wrapping_add(1);
+        self.radio
+            .send_wake_frame(&buf[..n], preamble_syms)
             .await
             .map_err(TxError::Radio)
     }

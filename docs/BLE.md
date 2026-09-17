@@ -123,11 +123,12 @@ section of the file are laid out from:
 | `0x12` | u8 0/1 | GPS backup mode (UBX-RXM-PMREQ / UART wake) |
 | `0x13` | u32 s | deep-sleep wake-check interval, 5 s..5 min, 0 = off (the default) |
 | `0x14` | u32 s | advertising window per wake check, 1 s..60 s (default 15 s). Stored's alone |
-| `0x15` | u32 s | deep sleep **now** for this long, 5 s..5 min; 0 = use `0x13`. A command, not a setting |
+| `0x15` | u32 s | deep sleep **now** for this long, 5 s..1 h; 0 = use `0x13`. A command, not a setting |
 | `0x16` | u32 s | BLE controller down between windows while tracking, 5 s..5 min, 0 = off |
 | `0x17` | u8 | mode: 0 stored, 1 idle, 2 tracking, 3 listening. The one an app actually means |
 | `0x18` | u32 s | how long idle lasts before the board stores itself, 10 s..1 h, 0 = never (the default) |
 | `0x19` | ASCII | board name label, up to 15 bytes; empty clears it |
+| `0x1B` | 2 bytes | call a stored node over LoRa: its address (0 = every sleeping node in earshot) and flags (bit 0 = come up tracking). A command, not a setting: the board sends a burst of wake frames and reports the answer on its console. Refused on a node whose radio is down or whose role never transmits |
 | `0x1A` | u32 s | BLE up between off periods while tracking, 1 s..60 s (default 15 s). Tracking's alone |
 
 The board clamps and the ack carries the value it stored, so an app reports

@@ -1,12 +1,174 @@
 # Wake on LoRa
 
-A plan for making the radio, not the RTC timer, the thing that brings a
-stored board back - so a board in a pack is reachable on demand instead of
-on a cadence, and costs microamps between wakes instead of a boot every
-minute.
+The radio, not the RTC timer, is what brings a stored board back - so a
+board in a pack is reachable on demand instead of on a cadence, and costs
+a fraction of a milliamp between wakes instead of a boot every minute.
 
-Nothing below is built. This is the design, the arithmetic, the parts that
-have to be measured before the rest is worth writing, and the order.
+**Built and working on the bench, 2026-09-17.** The section immediately
+below says what it is and how it went; the design that follows it is the
+document as it was written and measured against, kept with its withdrawn
+findings because the reason a measurement was wrong is usually the useful
+part. Two of those withdrawals are the story of this feature, and the last
+one is in the section after this.
+
+## What is built
+
+A stored board's park leaves the SX1262 in `SetRxDutyCycle` on the
+config's carrier, on a sync word ordinary traffic never uses, with DIO1
+carrying `RxDone` alone; the S3 registers DIO1 as an EXT0 wake source
+beside its timer and goes down. A board that wants it back sends a burst
+of `MSG_WAKE` frames behind a preamble sized to the sleeper's cycle and
+listens for its answer between them. The sleeper wakes on the first frame,
+reads it out of the radio's buffer before anything else in the boot, and
+if it was called comes up idle (or tracking, if asked), answers with a
+ping, and can be connected to; if some other node was called it re-arms
+the radio and is back asleep before its USB port has enumerated.
+
+Measured, two boards on a bench at 0 dBm and 927 MHz, `wake_rx_ms = 300`,
+`wake_sleep_ms = 3000`:
+
+```
+node 5:  wake: called node 3 (403 symbol preamble, 3483 ms on air), listening
+         node 3 ping: rssi -42, up 0s, gps silent
+         wake: node 3 answered                       860 ms after the frame ended
+node 3:  woke from deep sleep #4 (slept 60 s, parks missed 0, lora wakes 1, rejected 0)
+         mode idle - reachable, gps in backup
+         wake: rtc 5598308 ms, slept from 5583936 ms, elapsed 14372 ms over 60000 ms asked
+         wake: answered node 5
+```
+
+Woken 14 s into a 60 s interval by the first frame of the burst, idle and
+advertising 860 ms after the frame ended. With the sentry on its own
+carrier, every later call was answered on its first frame; two bursts at a
+node that does not exist produced `rejected 6` on the sleeper's next answer
+line and never brought its USB port up; and a call that began during the
+sleeper's wake check was caught by the burst's third frame, six seconds
+after the window closed. The five bench arms behind the numbers are in the
+section after this.
+
+What it consists of:
+
+- `proto/src/sentry.rs`: the corrected model - window, cycle, hold, the
+  two preamble bounds, the waker's burst - host-tested against the bench.
+- `proto/src/lora.rs`: `MSG_WAKE` (0x53): target, flags, nonce.
+- `proto/src/radiocfg.rs`: `[wake]` - `wake_enabled` (default on),
+  `wake_rx_ms`, `wake_sleep_ms`, `wake_frequency_hz`; eight bytes on the
+  read-back blob.
+- `proto/src/posture.rs`: `Radio::Sentry`, `Effect::RadioSentry`; a park
+  arms one when the config asks, reading the config and initializing the
+  radio first on a wake check that has done neither.
+- `proto/src/session.rs`, `ble.rs`: `CFG_WAKE` (0x1B) - a call over BLE
+  or the console; the wake-check ceiling raised to an hour, since with the
+  radio listening the cadence is a backstop.
+- `firmware/src/radio.rs`: `arm_sentry`, `rearm_sentry`, `peek_wake`,
+  `disarm_sentry`, `send_wake_frame`. `firmware/src/sleep.rs`: the EXT0
+  source and a held NRESET. `firmware/src/bin/main.rs`: the peek and the
+  fast reject, ahead of everything. `firmware/src/hardware.rs`: the arm,
+  the burst, the answer.
+- `tools/board_wake.py`: `pixi run board-wake --target 3 [--tracking]`.
+
+Four things the bench added that the design did not have:
+
+- **The sentry needs a carrier of its own.** With the symbol timeout at
+  zero the modem locks on any LoRa symbol that lands in a window, and a
+  preamble that is not a wake frame's holds the receiver for the restarted
+  timer and then costs it a whole sleep - about seven seconds blind at the
+  defaults. The caller's own beacon, sent 0.8 s before its wake frame, did
+  exactly that, and the call was answered on its second try. Now a caller
+  holds its beacon for the length of a call, and `wake_frequency_hz` puts
+  the sentry on a carrier the fleet's beacons are not on; a fleet
+  beaconing every second on the sentry's carrier would blind it most of
+  the time.
+
+- **DIO1's pad is muxed to the RTC domain by the EXT0 wake source, and
+  that register survives the reset.** esp-hal's digital input setup does
+  not clear it, so without an explicit un-mux at boot the receive poll
+  would never see an interrupt again after the first LoRa wake. The boot
+  path clears it before it builds the input.
+- **The sync word is a register, not a command**, so the warm start
+  between windows would have put the network's word back after the first
+  window. It is in the retention list beside the receiver gain. Ordinary
+  beacons at 5 s intervals did not wake a sentry across several cadences.
+- **A call must not be gated by the mode.** A listening node never
+  beacons, and the burst first inherited that gate and waited silently
+  forever; a call is an operator's explicit request, and a base station is
+  the natural thing to make one from. It is gated on the radio being up and
+  the role transmitting, and on a transfer, a pending sleep and a frame
+  arriving, as a beacon is.
+
+What it costs: at the defaults the receiver is on 9% of the time, about
+0.5 mA averaged on top of the deep-sleep floor, and a wake attempt is about
+3.5 s of air per try. The window sets the tolerance for the radio's RC64k
+drifting over a sleep - half of `2 * rx - 10 ms - 24 symbols`, about 6% at
+the defaults - and the sleep sets the current; the two keys are the two
+knobs. Unmeasured: that drift over temperature, which is what decides
+whether a sentry armed on a warm afternoon is still catchable on a cold
+night, and the sentry's actual current on a meter.
+
+## The symbol timeout was the whole problem, 2026-09-17
+
+The finding that preceded this one - that the configuration does not
+survive the sleep - was wrong, and it was wrong in the way every earlier
+withdrawn finding here was: the instrument was measuring something other
+than what it appeared to. `SetLoRaSymbNumTimeout` is a persistent setting.
+The control listen ran with it at zero; the "after a warm start" listen ran
+with the eight that the duty-cycle arm before it had left in the chip.
+That, not a lost configuration, is why twenty-four frames became none.
+The `XOSC_START_ERR` that seemed to prove the loss is what every warm start
+with a TCXO leaves latched; it reads `0x0020` after every successful trial
+below too.
+
+RM0461 says what the datasheet leaves ambiguous. With SymbNum set, the
+modem counts chirps from the first one it sees and times out unless **the
+end of the preamble** arrives within that many symbols. A window opened in
+the middle of a 140-symbol preamble can never satisfy that with eight, so
+only a window that happened to open in the last few symbols of a preamble
+ever completed a reception. Eight symbols out of a 1070 ms cycle is about
+three percent, and it does not depend on the preamble length - which was
+the two percent, and its indifference to everything that was swept.
+
+Measured, with a numbered frame behind a 165-symbol preamble every 2-3 s
+and DIO1 carrying `RxDone` alone, no SPI traffic while a cycle ran:
+
+| arm | wakes |
+|-|-|
+| SymbNum 0, stop on header, rx 300 ms, sleep 900 ms | **29 of 29** |
+| SymbNum 0, stop on preamble, rx 300 ms, sleep 900 ms | **30 of 30** |
+| SymbNum 0, stop on preamble, rx 250 ms, sleep 950 ms | **29 of 29** |
+| SymbNum 0, stop on preamble, rx 150 ms, sleep 1000 ms | 18 of 29 |
+| SymbNum 8, stop on header, rx 200 ms, sleep 1000 ms (every earlier run) | 2 of ~30 |
+
+The first row is the datasheet's sniff loop exactly as written. The 150 ms
+row deliberately breaks the upper bound - its restarted timer of 1300 ms is
+shorter than the preamble plus header - and fails the way the bound
+predicts, so the bound is real and the margin above it matters. The
+`StopTimerOnPreamble` setting makes no difference inside a duty cycle,
+which restarts its timer on preamble detection either way.
+
+So the model, corrected once more and for the last time:
+
+- the window is `rxPeriod` with the symbol timeout at zero;
+- a preamble is caught if it spans `sleep + tcxo + 2 * detect`, and its
+  header lands inside `2 * rx + sleep`;
+- the sleep cancels out of the margin, so the window buys drift tolerance
+  and the sleep buys current.
+
+Everything measured before this - the 2% rate, the preamble lengths that
+worked once, the 39 preambles producing 2 headers, the window truncating to
+the symbol count, the sweeps to no effect - was measured against a receiver
+whose symbol timeout forbade what it was being asked to do. They were ruled
+out, but they were also never the question.
+
+Two process lessons, both now in the code rather than in a note: every
+plain receive arm resets the symbol timeout and the timer-stop setting, so
+an instrument cannot inherit an arm's settings again; and the probe never
+reads the chip over SPI while a cycle runs, because a transaction in the
+sleep phase ends the cycle and a preamble detection routed to DIO1 could
+provoke one.
+
+---
+
+The design, as written before any of it was built:
 
 ## What it replaces
 
@@ -831,6 +993,13 @@ the two costs move together: the transmitter pays air time for whatever the
 receiver saves in current.
 
 ## The configuration does not survive the sleep
+
+**Withdrawn, 2026-09-17.** What follows was the reading at the time. The
+zero after the warm start was the probe's own symbol timeout of eight,
+left in the chip by the duty-cycle arm and inherited by a continuous
+listen that the control had run at zero; the `XOSC_START_ERR` is what
+every warm start with a TCXO latches. The configuration survives. See the
+section at the top.
 
 The test that separates the two halves of a duty cycle - the sleeping and
 the shortened window - by putting them on different hooks. Listen

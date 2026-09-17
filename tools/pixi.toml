@@ -48,6 +48,13 @@ board-set = "python board_set.py"
 # port disappears while it sleeps; that is the command working.
 board-sleep = "python board_sleep.py"
 
+# Call a stored board over LoRa, through the board on this port:
+#   pixi run board-wake --target 3
+#   pixi run board-wake --target 3 --tracking
+# The calling board sends a burst of wake frames and reports the answer on
+# its console. The target wakes, pings, and can then be connected to.
+board-wake = "python board_wake.py"
+
 # Read what the board wrote down about itself - every boot with its reset
 # reason, every panic with its message and location, every stall with the
 # task and the phase it stopped in, and the faults worth a line:

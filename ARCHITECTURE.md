@@ -465,6 +465,17 @@ stateDiagram-v2
         on purpose, since init() rewrites
         all of it anyway.
     end note
+
+    StandbyRc --> Sentry : arm_sentry() at a park, if the config asks
+    Sentry --> Sentry : its own RX/sleep cycle, the S3 asleep
+    Sentry --> StandbyRc : RxDone - DIO1 wakes the S3, peek_wake() reads the frame
+    Sentry --> Sleep : disarm_sentry() on a timer wake
+    note right of Sentry
+        Wake sync word, RxDone alone on DIO1,
+        symbol timeout 0. No SPI may touch it:
+        a transaction in its sleep phase ends
+        the cycle. NSS and NRESET pad-held.
+    end note
 ```
 
 A transmit-only node never arms the receiver - idling in standby instead of
@@ -1192,6 +1203,8 @@ stateDiagram-v2
     Down --> Parking : a nap commanded over the console
     Parking --> Asleep : the hardware loop signals the park done
     Asleep --> Advertising : timer wake, boot_mode decides the flavor
+    Asleep --> Advertising : a wake frame for this node - idle, answers the caller
+    Asleep --> Asleep : a wake frame for another node - re-armed, asleep again
 
     note right of Parking
         Invariant: nothing arriving after
@@ -1199,8 +1212,10 @@ stateDiagram-v2
         or the radio again.
     end note
     note right of Asleep
-        Invariant: radio asleep, GPS parked,
-        parked, and the park finished.
+        Invariant: radio asleep or listening
+        as a sentry exactly when the config
+        asked, GPS parked, parked, and the
+        park finished.
     end note
     note left of Connected
         Every write, over BLE or the console,

@@ -209,12 +209,20 @@ async fn main(spawner: Spawner) -> ! {
 
     println!("wio-s3-gps v{} up", env!("CARGO_PKG_VERSION"));
 
-    // Was this a deep-sleep wake check, or a real boot? Read before
-    // anything can clear it.
+    // Was this a deep-sleep wake, or a real boot - and if a wake, whose?
+    // Read before anything can clear it. The timer is the wake check; the
+    // radio's DIO1, registered as EXT0 by a park that left the radio
+    // listening, is a wake frame - or something that looked like one,
+    // which the peek below decides.
+    let cause = esp_hal::system::wakeup_cause();
     let woke_from_sleep = matches!(
-        esp_hal::system::wakeup_cause(),
-        esp_hal::system::SleepSource::Timer
+        cause,
+        esp_hal::system::SleepSource::Timer | esp_hal::system::SleepSource::Ext0
     );
+    let lora_woke = matches!(cause, esp_hal::system::SleepSource::Ext0);
+    // The RTC, early: a boot that rejects a wake frame goes back to sleep
+    // from here, before anything below has run.
+    let mut rtc = Rtc::new(peripherals.LPWR);
 
     // Flash: the settings mirror and the OTA slots.
     flash::install(flash::Flash::new(peripherals.FLASH)).await;
@@ -263,6 +271,164 @@ async fn main(spawner: Spawner) -> ! {
             }
         ),
     }
+    // The radio, before anything else the boot does. On a boot the radio
+    // woke, the frame that woke it is sitting in the radio's buffer and
+    // the question of whether the rest of this boot is worth paying for
+    // is answered by reading it - so it is read here, ahead of the event
+    // log, the config and every task.
+    #[cfg(not(feature = "iso-no-app"))]
+    let (lora, lora_wake) = {
+        // Wio-S3 internal SX1262 wiring, from the module datasheet. Confirmed
+        // against hardware - do not guess at these. An earlier build had three
+        // of them wrong in a way that put an ESP push-pull output on a line the
+        // SX1262 also drives, and it destroyed a board.
+        //
+        //   NSS  GPIO21    SCK  GPIO4    MOSI GPIO6    MISO GPIO5
+        //   NRESET GPIO7   BUSY GPIO8    DIO1 GPIO9
+        //   DIO2 goes to the SKY13453 RF switch inside the module, so it never
+        //   reaches an ESP pin - it is the radio's own antenna control.
+        let lora_spi = Spi::new(
+            peripherals.SPI2,
+            SpiConfig::default()
+                .with_frequency(Rate::from_hz(LORA_SPI_HZ))
+                .with_mode(SpiMode::_0),
+        )
+        .expect("lora spi")
+        .with_sck(peripherals.GPIO4)
+        .with_mosi(peripherals.GPIO6)
+        .with_miso(miso_with_pullup(peripherals.GPIO5));
+
+        // BUSY and DIO1 both idle low, so a pull-down is the level they hold
+        // anyway - and it is what makes an absent radio diagnosable. With no
+        // pull, an unpowered or mis-wired SX1262 leaves BUSY floating, which
+        // reads high as often as not and spends the driver's 50 ms busy timeout
+        // on every single transaction. Pulled down it reads "not busy", the
+        // transfer goes ahead, and the status byte comes back 0x00 - which is
+        // exactly what `print_diagnostics` is written to recognize.
+        let radio_irq_cfg = InputConfig::default().with_pull(Pull::Down);
+
+        // DIO1 back to the digital side. A sleep that registered it as the
+        // EXT0 wake source routed the pad to the RTC mux, and that register
+        // lives in the RTC domain: it survives the sleep and the reset that
+        // ends it, and building a digital input does not touch it. Left
+        // alone, every read of DIO1 from here on would see the RTC's idea
+        // of the pad rather than the pin, the receive poll would never see
+        // an interrupt, and the radio would be deaf from the first LoRa
+        // wake onward. Unconditional: on every other boot it is already
+        // clear, and clearing it again is a write of the value it holds.
+        unsafe {
+            esp_hal::gpio::RtcPin::rtc_set_config(
+                &esp_hal::peripherals::GPIO9::steal(),
+                false,
+                false,
+                esp_hal::gpio::RtcFunction::Rtc,
+            );
+        }
+
+        let mut lora = Sx1262Driver::new(Sx1262::new(
+            lora_spi,
+            // NSS and NRESET are ours to drive; BUSY and DIO1 are the radio's,
+            // so they are inputs and nothing here may ever drive them.
+            Output::new(peripherals.GPIO21, Level::High, OutputConfig::default()),
+            Input::new(peripherals.GPIO8, radio_irq_cfg),
+            Input::new(peripherals.GPIO9, radio_irq_cfg),
+            Output::new(peripherals.GPIO7, Level::High, OutputConfig::default()),
+        ));
+
+        // Release the NSS and NRESET pad holds that the sleep path set, now
+        // that both pins have been reconfigured as the outputs that drive
+        // them.
+        //
+        // The holds outlive the sleep *and* the reset, which is the point -
+        // they are what keep NSS and NRESET high while the digital domain is
+        // down, so a floating edge cannot wake the SX1262 out of the sleep it
+        // was put into, or reset the sentry it was left as. The order
+        // matters: reconfigure first, then release, or the pad glitches
+        // through whatever state it had between the two. Unconditional
+        // because a cold boot's hold bits are already clear, so releasing
+        // them is a write of the value they hold.
+        unsafe {
+            esp_hal::gpio::RtcPin::rtcio_pad_hold(&esp_hal::peripherals::GPIO21::steal(), false);
+            esp_hal::gpio::RtcPin::rtcio_pad_hold(&esp_hal::peripherals::GPIO7::steal(), false);
+        }
+
+        // What the last park left the radio doing, from RTC RAM: nothing,
+        // or a sentry with these periods for this address.
+        let armed = settings::sentry();
+        let mut lora_wake = None;
+        match (lora_woke, armed) {
+            (true, Some(armed)) => match lora.peek_wake() {
+                // Called, and it is us: the rest of the boot is a boot
+                // the caller asked for. Which mode it comes up in is
+                // decided below with the rest.
+                Some(p) if p.wake.is_for(armed.address) => {
+                    settings::clear_sentry();
+                    let n = settings::note_lora_wake();
+                    println!(
+                        "woke over LoRa: node {} called node {} (rssi {}, nonce {}, wake #{})",
+                        p.caller,
+                        p.wake.target,
+                        p.rssi,
+                        p.wake.nonce,
+                        n
+                    );
+                    lora_wake = Some((p.caller, p.wake.tracking, p.rssi));
+                }
+                // Called, but somebody else was. The radio is in standby
+                // with everything it was armed with still in place, so it
+                // goes straight back into its cycle, and the chip goes
+                // straight back to sleep for what is left of the interval
+                // - from a boot that has read nothing and started nothing.
+                // This is the fast reject, and it is what makes a wake
+                // frame for another board cost a fraction of a second
+                // rather than a wake check.
+                Some(p) => {
+                    let rejected = settings::note_lora_reject();
+                    println!(
+                        "lora wake for node {} from node {} - not us, re-arming ({} rejected since cold boot)",
+                        p.wake.target, p.caller, rejected
+                    );
+                    lora.rearm_sentry(armed.rx_ms, armed.sleep_ms);
+                    let remaining = remaining_sleep_s(&rtc);
+                    wio_s3_gps::sleep::go_down(&mut rtc, remaining)
+                }
+                // DIO1 rose for something that was not a clean wake frame.
+                // Nothing to act on, and no reason to trust the cycle: the
+                // radio is taken back, and this boot is a wake check.
+                None => {
+                    let rejected = settings::note_lora_reject();
+                    println!(
+                        "lora wake with no wake frame behind it - treating as a wake check ({} rejected since cold boot)",
+                        rejected
+                    );
+                    settings::clear_sentry();
+                    lora.disarm_sentry().await;
+                }
+            },
+            // The timer, on a board whose radio was left listening: the
+            // wake check does not use the radio, so it is put where the
+            // posture believes it is, cold, and stops cycling for nothing.
+            // Said here because the line the park printed as it armed the
+            // sentry rarely reaches a host - the port goes down within
+            // milliseconds of it.
+            (false, Some(armed)) => {
+                println!(
+                    "sentry was listening {} ms every {} ms for node {} - taken back for the wake check",
+                    armed.rx_ms, armed.sleep_ms, armed.address
+                );
+                settings::clear_sentry();
+                lora.disarm_sentry().await;
+            }
+            (true, None) => {
+                println!("EXT0 wake with no sentry armed - treating as a wake check");
+            }
+            (false, None) => {}
+        }
+        (lora, lora_wake)
+    };
+    #[cfg(feature = "iso-no-app")]
+    let lora_wake: Option<(u8, bool, i16)> = None;
+
     // Why this boot happened and what the last one left - a panic, a
     // stall - go into the event log now, before anything that could fail
     // again is started, and the tail of the log goes to the console.
@@ -276,7 +442,20 @@ async fn main(spawner: Spawner) -> ! {
     // cold boot turns "stored" into, so a board that has just been flashed,
     // or has just come back from a flat cell, is reachable for an idle
     // timeout before it stores itself. See `session::boot_mode`.
-    let boot = session::boot_mode(settings::get().mode, woke_from_sleep);
+    // A boot a wake frame asked for comes up reachable rather than as a
+    // wake check - idle, or tracking if the caller asked - and the caller
+    // is answered by the hardware task once the radio is up.
+    let boot = match lora_wake {
+        Some((caller, tracking, _)) => {
+            state::set_lora_wake(caller, tracking);
+            if tracking {
+                Mode::Tracking
+            } else {
+                Mode::Idle
+            }
+        }
+        None => session::boot_mode(settings::get().mode, woke_from_sleep),
+    };
     // The live mode, published so the serve loop, the settings
     // characteristic and the USB console all read the same answer. RTC RAM
     // only; idle never reaches flash.
@@ -305,14 +484,27 @@ async fn main(spawner: Spawner) -> ! {
         // question is whether sleep is working at all. The parks missed
         // beside it are the sleeps that cost more than they should have.
         let (n, asked_s) = settings::note_wake();
+        let (lora_wakes, lora_rejects) = settings::lora_wakes();
         status_println!(
-            "woke from deep sleep #{} (slept {} s, parks missed {})",
+            "woke from deep sleep #{} (slept {} s, parks missed {}, lora wakes {}, rejected {})",
             n,
             asked_s,
-            settings::parks_missed()
+            settings::parks_missed(),
+            lora_wakes,
+            lora_rejects
         );
     } else {
         status_println!("cold boot (not a deep-sleep wake)");
+    }
+    // Said again here, after the console is likely to have a host on it:
+    // the line the peek printed went out before the USB port was up.
+    if let Some((caller, tracking, rssi)) = lora_wake {
+        status_println!(
+            "woken over LoRa by node {} (rssi {}){}",
+            caller,
+            rssi,
+            if tracking { ", asked to track" } else { "" }
+        );
     }
     status_println!(
         "mode {} - {}",
@@ -334,58 +526,6 @@ async fn main(spawner: Spawner) -> ! {
     // defaults.
     #[cfg(not(feature = "iso-no-app"))]
     {
-    // Wio-S3 internal SX1262 wiring, from the module datasheet. Confirmed
-    // against hardware - do not guess at these. An earlier build had three
-    // of them wrong in a way that put an ESP push-pull output on a line the
-    // SX1262 also drives, and it destroyed a board.
-    //
-    //   NSS  GPIO21    SCK  GPIO4    MOSI GPIO6    MISO GPIO5
-    //   NRESET GPIO7   BUSY GPIO8    DIO1 GPIO9
-    //   DIO2 goes to the SKY13453 RF switch inside the module, so it never
-    //   reaches an ESP pin - it is the radio's own antenna control.
-    let lora_spi = Spi::new(
-        peripherals.SPI2,
-        SpiConfig::default()
-            .with_frequency(Rate::from_hz(LORA_SPI_HZ))
-            .with_mode(SpiMode::_0),
-    )
-    .expect("lora spi")
-    .with_sck(peripherals.GPIO4)
-    .with_mosi(peripherals.GPIO6)
-    .with_miso(miso_with_pullup(peripherals.GPIO5));
-
-    // BUSY and DIO1 both idle low, so a pull-down is the level they hold
-    // anyway - and it is what makes an absent radio diagnosable. With no
-    // pull, an unpowered or mis-wired SX1262 leaves BUSY floating, which
-    // reads high as often as not and spends the driver's 50 ms busy timeout
-    // on every single transaction. Pulled down it reads "not busy", the
-    // transfer goes ahead, and the status byte comes back 0x00 - which is
-    // exactly what `print_diagnostics` is written to recognize.
-    let radio_irq_cfg = InputConfig::default().with_pull(Pull::Down);
-
-    let lora = Sx1262Driver::new(Sx1262::new(
-        lora_spi,
-        // NSS and NRESET are ours to drive; BUSY and DIO1 are the radio's,
-        // so they are inputs and nothing here may ever drive them.
-        Output::new(peripherals.GPIO21, Level::High, OutputConfig::default()),
-        Input::new(peripherals.GPIO8, radio_irq_cfg),
-        Input::new(peripherals.GPIO9, radio_irq_cfg),
-        Output::new(peripherals.GPIO7, Level::High, OutputConfig::default()),
-    ));
-
-    // Release the NSS pad hold that `enter_deep_sleep` set, now that the
-    // pin has been reconfigured as the output that drives it.
-    //
-    // The hold outlives the sleep *and* the reset, which is the point - it
-    // is what keeps NSS high while the digital domain is down, so a floating
-    // edge cannot wake the SX1262 out of the sleep it was put into. The
-    // order matters: reconfigure first, then release, or the pad glitches
-    // through whatever state it had between the two. Unconditional because a cold boot's hold bit is
-    // already clear, so releasing it is a write of the value it holds.
-    unsafe {
-        esp_hal::gpio::RtcPin::rtcio_pad_hold(&esp_hal::peripherals::GPIO21::steal(), false);
-    }
-
     // GPS on UART1: GPIO1 is RX (module TX), GPIO2 is TX. 9600 8N1 is the
     // u-blox M10 factory default.
     //
@@ -552,7 +692,6 @@ async fn main(spawner: Spawner) -> ! {
     #[cfg(not(feature = "iso-no-ble"))]
     {
         println!("BLE-ADDR {}", wio_s3_gps::ble::fmt_address(&addr_bytes));
-        let mut rtc = Rtc::new(peripherals.LPWR);
         // The first point after a wake where the RTC counter can be read.
         // Both readings go out, not just the difference: whether the counter
         // survives a deep sleep at all is the thing to confirm before
@@ -578,9 +717,26 @@ async fn main(spawner: Spawner) -> ! {
     // Nothing left to do but hold the rail up and answer the console.
     #[cfg(feature = "iso-no-ble")]
     {
+        let _ = &mut rtc;
         status_println!("iso-no-ble: BLE stack not started");
         loop {
             Timer::after(Duration::from_secs(1)).await;
         }
     }
+}
+
+/// What is left of the interval the last sleep asked for, seconds, from
+/// the RTC's own count - the one clock that ran through the sleep. For a
+/// boot that goes straight back down; never under the shortest sleep the
+/// settings allow, so a wake frame that lands at the very end of an
+/// interval cannot produce a sleep of nothing.
+fn remaining_sleep_s(rtc: &Rtc<'_>) -> u32 {
+    let asked_s = settings::last_sleep_s();
+    let elapsed_ms = match settings::sleep_stamp_ms() {
+        Some(stamp) => (rtc.time_since_boot().as_millis() as u32).wrapping_sub(stamp),
+        None => 0,
+    };
+    asked_s
+        .saturating_sub(elapsed_ms / 1_000)
+        .max(midair_proto::ble::ESP_SLEEP_MIN_S)
 }

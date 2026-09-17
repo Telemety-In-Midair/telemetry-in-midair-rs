@@ -112,6 +112,16 @@ pub mod reg {
     pub const LORA_SYNC_WORD_LSB: u16 = 0x0741;
     /// Private network (0x1424), not the public LoRaWAN word.
     pub const SYNC_WORD_PRIVATE: (u8, u8) = (0x14, 0x24);
+    /// The word a sentry listens on and a wake frame is sent with.
+    ///
+    /// Not the network's, on purpose: the modem checks the sync word after
+    /// the preamble and before the header, in hardware, so a sleeping
+    /// board's radio never completes an ordinary beacon and never wakes
+    /// the chip for one. This is the whole of the false-wake filter, and
+    /// it costs nothing. The two low nibbles are the fixed 4 every SX126x
+    /// word carries; the high nibbles spell 0x5A, which is 40 and 80 in
+    /// chirp offsets against the private word's 8 and 16.
+    pub const SYNC_WORD_WAKE: (u8, u8) = (0x54, 0xA4);
 }
 
 /// Latched operational errors, as returned by `GetDeviceErrors`.
@@ -457,6 +467,17 @@ impl<'d> Sx1262<'d> {
 
     pub fn set_buffer_base_address(&mut self, tx: u8, rx: u8) {
         self.cmd(op::SET_BUFFER_BASE_ADDRESS, &[tx, rx]);
+    }
+
+    /// Write the LoRa sync word, high byte then low.
+    ///
+    /// A register write, so it is not in the configuration a warm start
+    /// restores: a duty cycle that changes it has to list both registers
+    /// in [`Self::set_retention_list`] or every window after the first
+    /// listens on the power-up word.
+    pub fn set_sync_word(&mut self, word: (u8, u8)) {
+        self.write_reg(reg::LORA_SYNC_WORD_MSB, word.0);
+        self.write_reg(reg::LORA_SYNC_WORD_LSB, word.1);
     }
 
     /// Name the registers the chip restores when it wakes from a sleep that

@@ -3,6 +3,22 @@
 Items retired from `TODO.md`. Kept so the shape of the port is legible
 without reading the whole log.
 
+## Wake on LoRa
+
+A stored board's park leaves the SX1262 duty-cycling its receiver on a
+wake sync word with `RxDone` alone on DIO1, and the S3 sleeps with DIO1
+as an EXT0 wake source beside its timer. `MSG_WAKE` behind a preamble sized
+to the sleeper's cycle wakes it on the first frame; the boot reads the
+frame out of the radio before anything else, comes up idle or tracking and
+answers with a ping, or re-arms and goes straight back down if some other
+node was called. `[wake]` in the radio config - the two periods and a
+carrier of the sentry's own, since any LoRa symbol in a window blinds a
+sentry for a cycle - `CFG_WAKE` over BLE and the console, `pixi run
+board-wake --target N`, the wake-check ceiling raised to an hour. The week of two-percent wake rates before it was a symbol timeout
+of eight: `SetLoRaSymbNumTimeout` demands the end of the preamble within
+that many symbols of the first chirp, which a window opened mid-preamble
+cannot satisfy, and at zero the chip's sniff loop wakes on every frame.
+
 ## Port to the Wio-S3
 
 Port parity with the two-MCU pair. The bulk transfer handler and the USB

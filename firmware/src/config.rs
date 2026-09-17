@@ -74,6 +74,11 @@ pub async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
         // the controller before this write arrived. The characteristic is
         // republished by the caller, which still holds the connection.
         Action::Name => status_println!("name: {}", settings::name()),
+        // Handed to the hardware loop, which owns the radio, runs the
+        // burst from its own pass and says so on the console - from there
+        // rather than here, because a line printed ahead of the ack is one
+        // the tool reading for that ack discards.
+        Action::WakeNode { target, tracking } => state::request_wake(target, tracking),
         Action::None => qprintln!("config: rejected write (status {})", outcome.ack[1]),
     }
     (outcome.ack, outcome.ack_len)

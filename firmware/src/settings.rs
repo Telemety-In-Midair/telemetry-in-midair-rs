@@ -90,6 +90,37 @@ static SLEEP_AT_MS: AtomicU32 = AtomicU32::new(0);
 #[esp_hal::ram(unstable(rtc_fast, persistent))]
 static PARKS_MISSED: AtomicU32 = AtomicU32::new(0);
 
+/// The sentry the last park armed, if it armed one: the two periods in ms
+/// and the node's own address, packed as `sleep << 16 | rx` and the
+/// address with a set bit 8 as the "armed" mark.
+///
+/// What the sleep path reads to decide whether DIO1 is a wake source, and
+/// what a boot that DIO1 woke reads to judge the frame - the target is
+/// compared against this address, because the radio config that holds it
+/// lives in flash and the point of the check is to avoid reading anything.
+/// The periods are what a re-arm after a rejected frame uses, for the same
+/// reason.
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static SENTRY_PERIODS: AtomicU32 = AtomicU32::new(0);
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static SENTRY_ADDRESS: AtomicU32 = AtomicU32::new(0);
+/// Boots this board owes to a wake frame, and frames that woke the chip
+/// for some other board, since the last cold boot.
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static LORA_WAKES: AtomicU32 = AtomicU32::new(0);
+#[esp_hal::ram(unstable(rtc_fast, persistent))]
+static LORA_REJECTS: AtomicU32 = AtomicU32::new(0);
+
+const SENTRY_ARMED: u32 = 1 << 8;
+
+/// What the last park left listening.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SentryArmed {
+    pub rx_ms: u32,
+    pub sleep_ms: u32,
+    pub address: u8,
+}
+
 /// The current settings. An unconfigured board reads back
 /// [`Stored::new`], which is awake, powered and never sleeping.
 pub fn get() -> Stored {
@@ -125,6 +156,10 @@ pub fn set(s: Stored) {
         WAKE_COUNT.store(0, Ordering::Relaxed);
         LAST_SLEEP_S.store(0, Ordering::Relaxed);
         PARKS_MISSED.store(0, Ordering::Relaxed);
+        SENTRY_PERIODS.store(0, Ordering::Relaxed);
+        SENTRY_ADDRESS.store(0, Ordering::Relaxed);
+        LORA_WAKES.store(0, Ordering::Relaxed);
+        LORA_REJECTS.store(0, Ordering::Relaxed);
     }
     for spec in &KNOBS {
         DURATIONS[spec.knob as usize].store(spec.get(&s), Ordering::Relaxed);
@@ -193,6 +228,15 @@ pub fn note_wake() -> (u32, u32) {
     (n, LAST_SLEEP_S.load(Ordering::Relaxed))
 }
 
+/// The seconds the last deep sleep was asked for, without counting a wake.
+pub fn last_sleep_s() -> u32 {
+    if MAGIC_WORD.load(Ordering::Relaxed) == MAGIC {
+        LAST_SLEEP_S.load(Ordering::Relaxed)
+    } else {
+        0
+    }
+}
+
 /// Wakes counted since the last cold boot.
 pub fn wake_count() -> u32 {
     if MAGIC_WORD.load(Ordering::Relaxed) == MAGIC {
@@ -225,6 +269,63 @@ pub fn sleep_stamp_ms() -> Option<u32> {
         Some(SLEEP_AT_MS.load(Ordering::Relaxed))
     } else {
         None
+    }
+}
+
+/// Note that the park about to be slept over left the radio armed as a
+/// sentry, so the sleep registers DIO1 as a wake source and a boot that
+/// DIO1 woke knows what it is looking at.
+pub fn note_sentry(rx_ms: u32, sleep_ms: u32, address: u8) {
+    set(get());
+    SENTRY_PERIODS.store((sleep_ms.min(0xFFFF) << 16) | rx_ms.min(0xFFFF), Ordering::Relaxed);
+    SENTRY_ADDRESS.store(SENTRY_ARMED | u32::from(address), Ordering::Relaxed);
+}
+
+/// The radio is not listening: a park that slept it cold, or a boot that
+/// took it back.
+pub fn clear_sentry() {
+    SENTRY_ADDRESS.store(0, Ordering::Relaxed);
+}
+
+/// The sentry the last park armed, or `None` if it slept the radio cold -
+/// or if there is no copy to trust.
+pub fn sentry() -> Option<SentryArmed> {
+    if MAGIC_WORD.load(Ordering::Relaxed) != MAGIC {
+        return None;
+    }
+    let a = SENTRY_ADDRESS.load(Ordering::Relaxed);
+    if a & SENTRY_ARMED == 0 {
+        return None;
+    }
+    let p = SENTRY_PERIODS.load(Ordering::Relaxed);
+    Some(SentryArmed {
+        rx_ms: p & 0xFFFF,
+        sleep_ms: p >> 16,
+        address: a as u8,
+    })
+}
+
+/// Count a boot a wake frame caused. Returns the count since cold boot.
+pub fn note_lora_wake() -> u32 {
+    let n = LORA_WAKES.load(Ordering::Relaxed).saturating_add(1);
+    LORA_WAKES.store(n, Ordering::Relaxed);
+    n
+}
+
+/// Count a DIO1 wake that was not for this node: a frame for another, or
+/// nothing decodable behind the interrupt at all.
+pub fn note_lora_reject() -> u32 {
+    let n = LORA_REJECTS.load(Ordering::Relaxed).saturating_add(1);
+    LORA_REJECTS.store(n, Ordering::Relaxed);
+    n
+}
+
+/// `(wakes, rejects)` over LoRa since the last cold boot.
+pub fn lora_wakes() -> (u32, u32) {
+    if MAGIC_WORD.load(Ordering::Relaxed) == MAGIC {
+        (LORA_WAKES.load(Ordering::Relaxed), LORA_REJECTS.load(Ordering::Relaxed))
+    } else {
+        (0, 0)
     }
 }
 

@@ -45,6 +45,7 @@ From `tools/`, over USB; the app does the same over BLE.
 | `pixi run board-set mode tracking` | Write one setting. The ack says what the board stored. |
 | `pixi run board-info` | Protocol version, BLE address, name. |
 | `pixi run board-sleep --seconds 60` | Deep sleep now. |
+| `pixi run board-wake --target 3` | Call a stored board over LoRa through this one; it wakes and answers. |
 | `pixi run board-wipe` | Forget the settings, the name and the config backup, then restart. `--flash` erases the whole part and reflashes. |
 | `pixi run board-ota` | Build and push a firmware image into the other slot. |
 | `pixi run board-log` | What the board wrote down about itself: every boot and why, every panic, every stall and its phase. `--last 10`, `--clear`. |
@@ -58,7 +59,7 @@ the file, the parser and the app's editor cannot disagree.
 
 | Mode | What is up |
 |-|-|
-| **stored** | a wake check on a cadence; otherwise asleep |
+| **stored** | asleep, the radio listening for a wake frame; a wake check on a cadence as a backstop |
 | **idle** | BLE only; where a cold boot lands |
 | **tracking** | GPS, a beacon every second, receiver, card, BLE on a duty cycle |
 | **listening** | tracking without the transmitter, BLE up throughout |

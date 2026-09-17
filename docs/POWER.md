@@ -441,13 +441,14 @@ direction; everything below item 1 is provisional until it is done.
    `Rtc::sleep_light` is legal. The cost is resyncing embassy's timebase
    and restructuring the hardware loop around it - a week, and the only
    path below ~40 mA without a respin.
-8. **`SetRxDutyCycle`** on the SX1262 for a leaf that mostly listens: ~5 mA
-   down to ~1-2, at the cost of picking a sleep/RX ratio against the beacon
-   interval. The larger version of the same command is wake-on-LoRa, where
-   the radio duty-cycles while the chip is in deep sleep and DIO1 wakes it -
-   which removes the wake-check burst this document's stored figures are
-   dominated by. Designed in `WAKE-ON-LORA.md`; item 5 above is one of its
-   inputs.
+8. **Wake-on-LoRa is built** (`WAKE-ON-LORA.md`): the radio duty-cycles
+   while the chip is in deep sleep and DIO1 wakes it, so the wake-check
+   cadence this document's stored figures are dominated by becomes a
+   backstop and can be an hour. At the defaults the receiver is on 9% of
+   the time, about 0.5 mA on top of the deep-sleep floor - unmeasured on a
+   meter, and item 5 is still the floor it sits on. The same command for a
+   leaf that mostly listens while awake (~5 mA down to ~1-2, against the
+   beacon interval) is not done.
 9. **The board:** `V_BCKP` to +3V3, a load switch under the GPS and the
    SX1262 (the old board's 46 mA floor exists because it had one), a buck
    in place of U2. No firmware substitutes for any of them.

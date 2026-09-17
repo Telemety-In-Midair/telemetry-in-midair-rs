@@ -22,6 +22,7 @@ use midair_proto::session::Stored;
 use midair_proto::radiocfg::{self, RadioConfig};
 use midair_proto::evlog::Kind;
 use midair_proto::roster::Report;
+use midair_proto::sentry::{self, Step as WakeStep, Waker};
 use midair_proto::supervise::{Phase, Task};
 use midair_proto::{link, lora};
 
@@ -186,6 +187,11 @@ pub struct Hardware {
     /// Nodes already reported for sharing this node's turn, one bit each,
     /// so the console says it once per node rather than once per frame.
     turn_warned: [u8; 32],
+    /// A call to a sleeping node in progress: the burst of wake frames
+    /// and the listens between them.
+    waker: Option<Waker>,
+    /// Tells one burst from the next in the frames it sends.
+    wake_nonce: u8,
 }
 
 impl Hardware {
@@ -239,6 +245,8 @@ impl Hardware {
             idle_at_ms: now_ms,
             prev_pass_ms: now_ms,
             turn_warned: [0; 32],
+            waker: None,
+            wake_nonce: 0,
         }
     }
 
@@ -273,6 +281,54 @@ impl Hardware {
         // check leaves it parked and has nothing to report.
         if self.posture.radio_up() {
             status_println!("boot: radio up {} ms into this boot", Instant::now().as_millis());
+        }
+        // A boot a wake frame caused answers the caller, so the waker's
+        // burst ends at the first frame rather than at its last try. One
+        // ping on the network's word, from a radio brought up for it if
+        // the mode this boot came up in keeps the radio down, and put back
+        // where the posture wants it afterwards.
+        if let Some((caller, _)) = state::take_lora_wake() {
+            let raised = !self.posture.radio_up();
+            if raised {
+                self.effect(Effect::RadioInit, now_ms).await;
+            }
+            state::set_radio_busy(true);
+            watchdog::beat(Task::Loop, Phase::TxSend);
+            let answered = self
+                .node
+                .broadcast(
+                    &lora::Ping {
+                        uptime_s: (now_ms / 1_000).min(u16::MAX as u64) as u16,
+                        gps_present: self.gps.present(),
+                        had_fix: false,
+                    }
+                    .encode(),
+                    0,
+                )
+                .await;
+            state::set_radio_busy(false);
+            // The counters go out here as well as on the boot line: this
+            // is the first line of a LoRa wake a host attached to the USB
+            // port is likely to see, and a frame rejected for another node
+            // costs a boot too short for the port to come up at all - so
+            // the rejects are only ever readable from a wake like this one.
+            let (wakes, rejects) = settings::lora_wakes();
+            match answered {
+                Ok(()) => {
+                    self.tx_count = self.tx_count.saturating_add(1);
+                    status_println!(
+                        "wake: answered node {} (lora wakes {}, rejected {} since cold boot)",
+                        caller, wakes, rejects
+                    );
+                }
+                Err(e) => status_println!("wake: could not answer node {} ({:?})", caller, e),
+            }
+            if raised {
+                match self.posture.radio {
+                    Radio::Standby => self.node.radio_mut().standby(),
+                    _ => self.node.radio_mut().sleep(),
+                }
+            }
         }
 
         // The isolation build asks unconditionally, because the point is
@@ -361,6 +417,7 @@ impl Hardware {
                 self.cold = false;
                 self.node.reconfigure(&self.cfg);
                 self.planner = Planner::new(self.first_beacon_ms(now_ms));
+                self.posture.set_sentry(self.cfg.wake_enabled);
             }
             Effect::GpsUp => {
                 watchdog::beat(Task::Loop, Phase::GpsCtl);
@@ -395,7 +452,42 @@ impl Hardware {
             }
             // Cold sleep rather than standby: nothing is going to use the
             // radio, and `init` runs again whenever something does.
-            Effect::RadioSleep => self.node.radio_mut().sleep(),
+            Effect::RadioSleep => {
+                settings::clear_sentry();
+                self.node.radio_mut().sleep()
+            }
+            // Leave the radio listening through the sleep. The config is
+            // checked here and not only in the posture, because a wake
+            // check's park decides on the sentry before the config load in
+            // the same pass can say otherwise; a config that says no, or
+            // asks for periods no preamble fits, gets a cold sleep and a
+            // line saying why. After the arm nothing here touches the
+            // radio again: the next effect is the panel, then the signal,
+            // then the chip goes down.
+            Effect::RadioSentry => {
+                let payload = lora::HEADER_LEN + lora::WAKE_MSG_LEN;
+                match sentry::plan(&self.cfg, payload) {
+                    Ok(s) => {
+                        self.node.radio_mut().arm_sentry(&s);
+                        settings::note_sentry(s.rx_us / 1_000, s.sleep_us / 1_000, self.cfg.address);
+                        status_println!(
+                            "radio: sentry armed, {} ms every {} ms on {} Hz ({} permille, wake preamble {} symbols)",
+                            s.rx_us / 1_000,
+                            s.sleep_us / 1_000,
+                            self.cfg.wake_carrier_hz(),
+                            s.duty_permille(),
+                            s.preamble_symbols().unwrap_or(0)
+                        );
+                    }
+                    Err(r) => {
+                        settings::clear_sentry();
+                        self.node.radio_mut().sleep();
+                        if r != sentry::Refusal::Disabled {
+                            status_println!("radio: sentry refused ({}), sleeping cold", r.as_str());
+                        }
+                    }
+                }
+            }
             // The panel sits on the always-on +3V3, so without this it
             // holds its last frame - and its current - for the whole
             // sleep.
@@ -411,6 +503,7 @@ impl Hardware {
                 if self.apply_radio_config(now_ms).await {
                     self.cfg_loaded = true;
                     self.watch.rearm(now_ms + 2_000);
+                    self.posture.set_sentry(self.cfg.wake_enabled);
                 }
             }
             // Did the last park hold? Free to ask here and nowhere else:
@@ -481,9 +574,14 @@ impl Hardware {
             watchdog::beat(Task::Loop, Phase::Gps);
             self.gps(now_ms, late_pass).await;
         }
+        if let Some((target, tracking)) = state::take_wake_request() {
+            self.start_wake(target, tracking);
+        }
         if self.posture.radio_up() {
             watchdog::beat(Task::Loop, Phase::Beacon);
             self.beacon(now_ms).await;
+            watchdog::beat(Task::Loop, Phase::TxSend);
+            self.wake(now_ms).await;
             watchdog::beat(Task::Loop, Phase::Receive);
             self.receive(now_ms);
             self.repeat(now_ms).await;
@@ -519,6 +617,7 @@ impl Hardware {
                         Radio::Up => "receiving, nothing transmitted",
                         Radio::Standby => "standby",
                         Radio::Asleep => "asleep",
+                        Radio::Sentry => "listening as a sentry",
                     }
                 ),
                 Request::RadioStandby(false) if fx.contains(Effect::RadioInit) => {
@@ -551,6 +650,13 @@ impl Hardware {
     /// A ping is the smaller of the two on air, so this cannot push a node
     /// past the budget its beacon already fits in.
     async fn beacon(&mut self, now_ms: u64) {
+        // Not while calling a node. The sentry being called locks on any
+        // LoRa symbol that lands in its window, and this node's own beacon
+        // just before its wake frame held that sentry through the frame -
+        // measured as a call answered on its second try, not its first.
+        if self.waker.is_some() {
+            return;
+        }
         let has_fix = self.gps.has_fix();
         let interval_ms = if self.cfg.beacon_interval_s == 0 {
             0
@@ -648,6 +754,11 @@ impl Hardware {
             self.rx_count = self.rx_count.saturating_add(1);
             self.rx_led.pulse(now_ms);
             heard_from = Some(rx.src);
+            // Anything from the node being called is its answer: the
+            // woken board pings, but a beacon would do as well.
+            if let Some(w) = self.waker.as_mut() {
+                w.heard(rx.src);
+            }
             if let Some(p) = lora::decode_position(rx.payload) {
                 vprintln!("position from node {} rssi {}", rx.src, rx.rssi);
                 let mut v = [0u8; ble::REMOTE_LEN];
@@ -701,6 +812,103 @@ impl Hardware {
                 );
             }
         }
+    }
+
+    /// Take a call to a sleeping node, if this node can make one.
+    fn start_wake(&mut self, target: u8, tracking: bool) {
+        if !self.posture.radio_up() {
+            status_println!("wake: cannot call node {} - the radio is not up", target);
+            return;
+        }
+        if !self.cfg.role.transmits() {
+            status_println!("wake: cannot call node {} - this node never transmits", target);
+            return;
+        }
+        if self.waker.is_some() {
+            status_println!("wake: a call is already in progress, node {} replaces it", target);
+        }
+        self.wake_nonce = self.wake_nonce.wrapping_add(1);
+        self.waker = Some(Waker::new(target, tracking, self.wake_nonce));
+        status_println!(
+            "wake: calling node {}{}",
+            target,
+            if tracking { " into tracking" } else { "" }
+        );
+    }
+
+    /// One step of a call in progress: a wake frame when the burst is due
+    /// one and the air is free, otherwise a listen.
+    ///
+    /// A wake frame is seconds on the air, so it is gated the way a beacon
+    /// is - by a transfer, a pending sleep and a frame arriving - and
+    /// skipped for this pass rather than refused when the gate is shut: the
+    /// burst tries again on the next pass. Not by the mode, though: a
+    /// listening node never beacons, but a call is an operator's explicit
+    /// request, and a base station is the natural thing to make one from.
+    async fn wake(&mut self, now_ms: u64) {
+        let Some(mut w) = self.waker else {
+            return;
+        };
+        match w.step(now_ms) {
+            WakeStep::Wait => {}
+            WakeStep::Done { heard } => {
+                if heard {
+                    status_println!("wake: node {} answered", w.target);
+                } else {
+                    status_println!(
+                        "wake: no answer from node {} after {} tries",
+                        w.target,
+                        sentry::WAKE_TRIES
+                    );
+                }
+                self.waker = None;
+                return;
+            }
+            WakeStep::Send => {
+                let allowed = self.posture.radio_up()
+                    && self.cfg.role.transmits()
+                    && !state::transfer_active()
+                    && !state::park_pending();
+                if !allowed || self.node.radio().rx_in_progress(now_ms) {
+                    return;
+                }
+                let payload = lora::HEADER_LEN + lora::WAKE_MSG_LEN;
+                let s = match sentry::plan(&self.cfg, payload) {
+                    Ok(s) => s,
+                    Err(r) => {
+                        status_println!("wake: cannot call node {} - {}", w.target, r.as_str());
+                        self.waker = None;
+                        return;
+                    }
+                };
+                // `plan` refused anything the preamble does not fit.
+                let syms = s.preamble_symbols().unwrap_or(0) as u16;
+                let frame = lora::Wake {
+                    target: w.target,
+                    tracking: w.tracking,
+                    nonce: w.nonce,
+                };
+                state::set_radio_busy(true);
+                watchdog::beat(Task::Loop, Phase::TxSend);
+                self.tx_led.pulse(now_ms);
+                let sent = self.node.send_wake(&frame, syms).await;
+                state::set_radio_busy(false);
+                w.sent(Instant::now().as_millis());
+                match sent {
+                    Ok(()) => {
+                        self.tx_count = self.tx_count.saturating_add(1);
+                        status_println!(
+                            "wake: called node {} ({} symbol preamble, {} ms on air), listening",
+                            w.target,
+                            syms,
+                            s.wake_airtime_us(&self.cfg, payload).unwrap_or(0) / 1_000
+                        );
+                    }
+                    Err(e) => status_println!("wake: TX to node {} failed ({:?})", w.target, e),
+                }
+            }
+        }
+        self.waker = Some(w);
     }
 
     /// Repeat forwarding. Only a node configured as a repeater ever has
@@ -798,7 +1006,18 @@ impl Hardware {
         self.idle_mark = idle_now;
         self.idle_at_ms = now_ms;
         self.next_status_ms = now_ms + STATUS_MS;
-        let (mode, err) = self.node.radio_mut().health();
+        // Only asked of a radio that is configured. A radio in cold sleep
+        // is woken into standby by the asking - the NSS edge is its wake -
+        // and stays there at half a milliamp until the next init, which on
+        // an idle board is never; and a radio left as a sentry is ended by
+        // any transaction that lands in its sleep phase. Both are told
+        // from the posture rather than read.
+        let (mode, err) = match self.posture.radio {
+            Radio::Asleep => ("asleep", 0),
+            Radio::Sentry => ("sentry", 0),
+            _ if self.posture.parked => ("parked", 0),
+            _ => self.node.radio_mut().health(),
+        };
         let (hop_stratum, hop_ch) = self.node.radio().hop_status(now_ms);
         // The heap beside the idle rate: the BLE duty cycle builds and
         // tears the whole stack down every window, and a free figure that

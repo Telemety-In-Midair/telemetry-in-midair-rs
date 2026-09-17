@@ -197,15 +197,30 @@ Hop statistics in telemetry: frames heard per channel, clock corrections
 applied and their size. Without them a receiver that is a little out of
 step looks like a range problem.
 
-Wake-on-radio: `SetRxDutyCycle` (0x94) on the SX1262, DIO1 (GPIO9, inside the
-S3's RTC range) as an EXT0 deep-sleep wake source. The radio keeps listening
-while the chip is gone and only wakes it when a frame addressed to the board
-arrives, which replaces the wake-check cadence with a doorbell: reachable on
-demand rather than on an interval, and microamps rather than a boot a minute
-between wakes. Designed in `docs/WAKE-ON-LORA.md` - the wake frame, the
-second sync word that keeps ordinary traffic from waking the board, the
-preamble arithmetic against the sentry sleep period, the fast-reject path,
-and the order. Phase 0 of that plan is two measurements, not code.
+Wake-on-LoRa is built and works on the bench (`docs/WAKE-ON-LORA.md`).
+What it still owes:
+
+- **The sentry's current on a meter.** Predicted ~0.5 mA averaged at the
+  defaults on top of the deep-sleep floor; `board-set sleep 3600`,
+  `board-set mode stored`, a DMM in the battery lead, and the same trap as
+  the stored floor - USB out, battery in, the first sleep is not the
+  steady state.
+- **The RC64k over temperature.** The preamble is sized for the middle of
+  a window whose half-width is about 6% of the sleep at the defaults, and
+  the radio's 64 kHz RC is only recalibrated when the S3 initializes the
+  radio, i.e. at every wake check. Whether a sentry armed warm is still
+  catchable cold is one board in a fridge with `board-wake` run from the
+  desk. If it is not, either the backstop cadence recalibrates often enough
+  or `wake_rx_ms` grows.
+- **A button in the app** for `CFG_WAKE` (0x1B): the app connects to an
+  awake node and asks it to call another. Nothing on the firmware side.
+- **A wake frame that arrives during a wake check** is lost: the radio is
+  cold while the board advertises. The burst's three tries over ~22 s
+  outlast a 15 s window, so it lands on the next sleep; a fourth try, or a
+  receiver kept up during the check, would close the gap.
+- **`SetRxDutyCycle` while awake**, for a leaf that mostly listens: ~5 mA
+  down to ~1-2 against the beacon interval. The same command, a different
+  posture, and the same symbol-timeout rule applies.
 
 CAD auto-transitions: `SetCadParams` (0x88) with ExitMode. Detect a preamble
 and drop straight into RX to catch the payload, or find the channel clear
@@ -269,10 +284,11 @@ Add power switch?
 
 Add current monitor? (INA219/226?)
 
-Add an LP-GPIO wake button so a deep sleep can be interrupted. Deep sleep
-is timer-only, so the 5 min clamp on 0x13 is the only thing keeping the
-board reachable - and with the modes in, that clamp is also the worst case
-for reaching a *stored* board, which is now the state it spends its life in.
+Add an LP-GPIO wake button so a deep sleep can be interrupted from the
+board itself. Over the air it can be now - the radio's DIO1 is an EXT0
+wake source when the sentry is armed, and the cadence on 0x13 (now up to
+an hour) is the backstop for a board whose config turns the sentry off or
+hops - but a board with nobody to call it still waits for its timer.
 
 Move SD CS off GPIO44. It is outside the S3's RTC range (0-21), so unlike
 NSS and UART TX it cannot be pad-held through a deep sleep and floats for
@@ -305,3 +321,5 @@ Confirm in app for stored mode.
 - Quick double flash on rx.
 - Log gps data to flash. Can load from usb or over BLE.
 - Link in status should reflect current BLE status.
+- 
+
