@@ -998,8 +998,6 @@ async fn park() -> ! {
 pub async fn mirror(radio: &mut Sx1262Driver<'_>) -> ! {
     use esp_hal::gpio::{Level, Output, OutputConfig};
 
-    /// How long to watch before reporting, seconds.
-    const WATCH_S: u64 = 30;
     /// Passes between heartbeats. The loop has no await in it, so the
     /// watchdog is fed by count rather than by time - and the monitor that
     /// would reset the board for a stall runs on the other core.
@@ -1015,76 +1013,87 @@ pub async fn mirror(radio: &mut Sx1262Driver<'_>) -> ! {
         )
     };
 
+    // Symbol counts to try. The window is the lever now, and it has only
+    // been measured at one value - this is what says how it scales, and
+    // whether `rxPeriod` really is the ceiling the model claims.
+    //
+    // `rxPeriod` is opened wide for the sweep so it cannot be what binds;
+    // at SF12/BW500 even 128 symbols is about a second, so a one-second
+    // ceiling leaves the symbol count alone to decide.
+    const SYMB_SWEEP: [u8; 7] = [0, 4, 8, 16, 32, 64, 128];
+    const SWEEP_RX_US: u32 = 1_000_000;
+    const PER_STEP_S: u64 = 12;
+
     let g = geometry(radio);
     println!(
-        "sentry mirror: rx {} us sleep {} us commanded, symb timeout {}",
-        g.rx_us, g.sleep_us, SYMB_TIMEOUT
+        "sentry mirror: sweeping the symbol timeout, rx ceiling {} us, sleep {} us",
+        SWEEP_RX_US, g.sleep_us
     );
+    println!("sentry mirror:  symbols   predicted_us   measured_us");
     println!("sentry mirror: J1 GPIO38 = BUSY, GPIO39 = DIO1, GPIO40 = armed marker");
 
-    radio.wake_from_retained_sleep().await;
-    radio.arm_duty_cycle(g.rx_us, g.sleep_us, SYMB_TIMEOUT, irq::RX_DONE);
-    out_mark.set_high();
-    // Inside the first receive window, before the chip has slept once: the
-    // one moment a status read is safe. Without it, a BUSY trace that looks
-    // nothing like the commanded cycle could equally be a cycle that never
-    // started, and those want opposite conclusions.
-    {
-        let (mode, err) = radio.health();
-        println!("sentry mirror: armed, radio {} err 0x{:04X} (want rx)", mode, err);
-    }
+    for symbs in SYMB_SWEEP {
+        radio.wake_from_retained_sleep().await;
+        radio.arm_duty_cycle(SWEEP_RX_US, g.sleep_us, symbs, irq::RX_DONE);
+        out_mark.set_high();
 
-    // Timed here as well as mirrored, so a first answer needs no other
-    // hardware - and so the two can be compared afterwards.
-    let mut was_busy = radio.busy_high();
-    let mut since = Instant::now();
-    let mut lows: (u32, u32, u32, u64) = (0, u32::MAX, 0, 0); // n, min, max, sum
-    let mut highs: (u32, u32, u32, u64) = (0, u32::MAX, 0, 0);
-    let until = Instant::now() + Duration::from_secs(WATCH_S);
-    let mut passes = 0u32;
-    out_mark.set_low();
-
-    while Instant::now() < until {
-        let busy = radio.busy_high();
-        out_busy.set_level(if busy { Level::High } else { Level::Low });
-        out_dio1.set_level(if radio.irq_pending() { Level::High } else { Level::Low });
-        if busy != was_busy {
-            let held = (Instant::now() - since).as_micros() as u32;
-            let bucket = if was_busy { &mut highs } else { &mut lows };
-            bucket.0 += 1;
-            bucket.1 = bucket.1.min(held);
-            bucket.2 = bucket.2.max(held);
-            bucket.3 += u64::from(held);
-            was_busy = busy;
-            since = Instant::now();
+        // BUSY marks only the transitions, so its low periods alternate
+        // between the receive window and the sleep. The short one of each
+        // pair is the window; taking the minimum picks it out without
+        // needing to know which phase the run started in.
+        let mut was_busy = radio.busy_high();
+        let mut since = Instant::now();
+        // BUSY glitches at its own transitions - low periods of a few
+        // microseconds show up either side of a real edge, and a raw
+        // minimum picks those instead of the window. Anything under this
+        // is not a phase of the cycle.
+        const GLITCH_US: u32 = 1_000;
+        let mut shortest = u32::MAX;
+        let mut longest = 0u32;
+        let mut glitches = 0u32;
+        let until = Instant::now() + Duration::from_secs(PER_STEP_S);
+        let mut passes = 0u32;
+        while Instant::now() < until {
+            let busy = radio.busy_high();
+            out_busy.set_level(if busy { Level::High } else { Level::Low });
+            out_dio1.set_level(if radio.irq_pending() { Level::High } else { Level::Low });
+            if busy != was_busy {
+                if was_busy {
+                    // A low period just began; nothing to record yet.
+                } else {
+                    let held = (Instant::now() - since).as_micros() as u32;
+                    if held < GLITCH_US {
+                        glitches += 1;
+                    } else {
+                        shortest = shortest.min(held);
+                        longest = longest.max(held);
+                    }
+                }
+                was_busy = busy;
+                since = Instant::now();
+            }
+            passes += 1;
+            if passes % BEAT_EVERY == 0 {
+                watchdog::beat(Task::Loop, Phase::Receive);
+            }
         }
-        passes += 1;
-        if passes % BEAT_EVERY == 0 {
-            watchdog::beat(Task::Loop, Phase::Receive);
-        }
-    }
+        out_mark.set_low();
 
-    let say = |name: &str, b: (u32, u32, u32, u64)| {
-        if b.0 == 0 {
-            println!("sentry mirror: {} never changed - the cycle is not running", name);
+        let predicted = if symbs == 0 {
+            SWEEP_RX_US
+        } else {
+            (u32::from(symbs) * radio.symbol_time_us()).min(SWEEP_RX_US)
+        };
+        if shortest == u32::MAX {
+            println!("sentry mirror: {:>8}   {:>12}   no transitions", symbs, predicted);
         } else {
             println!(
-                "sentry mirror: {} x{}, min {} us, max {} us, mean {} us",
-                name,
-                b.0,
-                b.1,
-                b.2,
-                (b.3 / u64::from(b.0)) as u32
+                "sentry mirror: {:>8}   {:>12}   {:>11}   (long phase {} us, {} glitches)",
+                symbs, predicted, shortest, longest, glitches
             );
         }
-    };
-    println!("sentry mirror: after {} s -", WATCH_S);
-    say("awake (BUSY low)", lows);
-    say("asleep (BUSY high)", highs);
-    println!(
-        "sentry mirror: commanded rx {} us, sleep {} us - compare against awake and asleep above",
-        g.rx_us, g.sleep_us
-    );
+    }
+    println!("sentry mirror: sweep done - measured should track predicted if the symbol count is the window");
 
     let mut said = Instant::now();
     loop {

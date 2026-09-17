@@ -780,6 +780,56 @@ The model now takes the window as `min(symbols x symbol time, rxPeriod)`,
 and a preamble has to span the whole cycle rather than merely reach into the
 window.
 
+## The window scales exactly, and that exonerates the timing
+
+Sweeping the symbol timeout with `rxPeriod` opened to a second so it cannot
+be what binds, and measuring the receive phase off `BUSY`:
+
+| symbols | predicted | measured |
+|-|-|-|
+| 4 | 32 768 us | **32 760** |
+| 8 | 65 536 | **65 528** |
+| 16 | 131 072 | **131 064** |
+| 32 | 262 144 | **262 135** |
+| 64 | 524 288 | 24 306 |
+| 128 | 1 000 000 | 16 115 |
+
+Four values tracking to within eight microseconds. The window is
+`SymbNum x symbol time`, exactly, and the sleep held at 994 ms through every
+one of the seven runs.
+
+The last two rows are the part's encoding rather than a finding: above
+about 63 the SX126x holds the symbol count as a mantissa and exponent in
+register 0x0706, which a plain `SetLoRaSymbNumTimeout` does not reach. The
+usable range is 4 to 32 and the design has no reason to leave it.
+
+**What that settles.** The timing is now measured end to end - window exact,
+sleep exact, cycle about 1070 ms at eight symbols - and a preamble has to
+cover a whole window for the modem to count its symbols, which needs about
+1070 ms. The preambles in the sweeps were 1097 to 1180 ms. That predicts a
+catch rate near 96%.
+
+Measured: 2%.
+
+So the geometry is not what is failing, and that is no longer an argument -
+it is measured. Whatever goes wrong is in the receiver's state or
+sensitivity inside a duty-cycled window, not in when the window opens or how
+long it stays open.
+
+**What it costs, for when the rest is solved.** The window is the duty
+cycle, so the symbol count is the power knob:
+
+| symbols | window | duty | sentry at 6 mA |
+|-|-|-|-|
+| 4 | 33 ms | 3.2% | ~0.19 mA |
+| 8 | 66 ms | 6.1% | ~0.37 mA |
+| 16 | 131 ms | 11.5% | ~0.69 mA |
+| 32 | 262 ms | 20.7% | ~1.24 mA |
+
+And a longer window needs a proportionally longer preamble to cover it, so
+the two costs move together: the transmitter pays air time for whatever the
+receiver saves in current.
+
 ## Risks, in the order they would sink it
 
 1. **`SetRxDutyCycle` with a TCXO.** The chip restarts DIO3 and waits
