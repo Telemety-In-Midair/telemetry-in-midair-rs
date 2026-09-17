@@ -854,6 +854,14 @@ impl<'d> Sx1262Driver<'d> {
         let _ = self.radio.status();
     }
 
+    /// Whether the chip is holding BUSY high: asleep, or starting up.
+    ///
+    /// Free to read and safe during a duty cycle, unlike anything that
+    /// goes over SPI.
+    pub fn busy_high(&self) -> bool {
+        self.radio.busy_high()
+    }
+
     /// Whether the radio is asserting DIO1.
     pub fn irq_pending(&self) -> bool {
         self.radio.irq_pending()

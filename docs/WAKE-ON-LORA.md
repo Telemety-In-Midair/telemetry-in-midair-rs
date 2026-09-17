@@ -731,6 +731,55 @@ So the option is withdrawn rather than recommended. The measurement that was
 supposed to make it defensible made it untenable instead, which is what it
 was for.
 
+## The receive window is not `rxPeriod`
+
+An RP2040 watching the host's mirrored `BUSY` line, and the host timing the
+same line itself. The two share nothing but three wires and a ground, and
+they agree to about five microseconds on the figure that matters.
+
+`BUSY` turns out not to stay high through a duty cycle's sleep - it goes
+high only briefly at the transitions, for the context save and for the
+restore and oscillator startup behind it, which is why its maxima sit at
+10.7 ms against a configured `tcxo_startup_ms` of 10. So the low periods
+cover both phases, and the sequence separates them where the aggregate
+cannot:
+
+```
+66, 994, 66, 994, 66, 994, 66, 993, 66, 993, ...   (ms, 85 pairs)
+```
+
+| phase | commanded | measured |
+|-|-|-|
+| receive window | 200 ms | **66 ms** |
+| sleep | 1000 ms | 994 ms |
+
+The sleep is what was asked for. The window is a third of it - and 66 ms is
+not arbitrary: **eight symbols at SF12/BW500 is 65.5 ms**, which is
+`SetLoRaSymbNumTimeout(8)` exactly.
+
+**`rxPeriod` is a ceiling, not the listening time.** What ends a window is
+the symbol timeout expiring without the modem locking. Sizing a sentry from
+`rxPeriod` sizes it from a number the chip does not use.
+
+That explains, after the fact, the things that made no sense at the time:
+
+- **Widening the window from 100 ms to 200 ms changed nothing**, because
+  both truncate to the same symbol count. The parameter being adjusted had
+  no effect on the quantity it was believed to set.
+- **Four symbols against eight looked identical** - the window was being
+  changed and the model was not, so the two moved together and cancelled.
+- **`SymbNum = 0` woke on nothing.** No truncation, but also none of the
+  "stay in Rx for the whole packet" behaviour that a non-zero value brings.
+- **The geometry was wrong throughout.** Every preamble was sized against a
+  200 ms window that was really 66 ms, so the deaf period was about 1004 ms
+  and preambles of 1.08 to 1.18 s overlapped it by only tens of
+  milliseconds. Marginal by construction, which is what a near-random wake
+  rate looks like.
+
+The model now takes the window as `min(symbols x symbol time, rxPeriod)`,
+and a preamble has to span the whole cycle rather than merely reach into the
+window.
+
 ## Risks, in the order they would sink it
 
 1. **`SetRxDutyCycle` with a TCXO.** The chip restarts DIO3 and waits

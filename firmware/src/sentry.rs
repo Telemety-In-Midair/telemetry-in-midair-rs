@@ -965,3 +965,139 @@ async fn park() -> ! {
         Timer::after(Duration::from_millis(200)).await;
     }
 }
+
+/// Watch a duty cycle from outside the SPI bus. Does not return.
+///
+/// Every instrument in this module until now asked the chip a question, and
+/// in a sniff loop the chip either will not answer or is ended by the
+/// asking. BUSY is different: it is an input to the host, so reading it is
+/// a pin read - no transaction, no NSS edge, nothing the radio can notice.
+/// It is held high through a retained sleep and the startup behind it, and
+/// released once the chip is awake, so watching it draws the shape of the
+/// cycle from outside.
+///
+/// That answers the question the sweep could not reach: whether a receive
+/// window is really as long as it was commanded. If a window commanded at
+/// 200 ms is observed as twenty, nothing about preambles or margins was
+/// ever going to matter.
+///
+/// It also mirrors BUSY and DIO1 onto the J1 header, so the same timing can
+/// be taken by something that does not share this firmware's clock or its
+/// bugs:
+///
+/// ```text
+///   GPIO38   BUSY  (high = asleep or starting, low = awake)
+///   GPIO39   DIO1  (high = an enabled interrupt is pending)
+///   GPIO40   mark  (pulsed high for one pass when the sentry is armed)
+/// ```
+///
+/// Those three are J1 header pins that nothing else claims; `main` parks
+/// them as pulled-down inputs, and they are taken here the way the sleep
+/// path takes the pads it has to hold.
+#[cfg(feature = "iso-sentry-mirror")]
+pub async fn mirror(radio: &mut Sx1262Driver<'_>) -> ! {
+    use esp_hal::gpio::{Level, Output, OutputConfig};
+
+    /// How long to watch before reporting, seconds.
+    const WATCH_S: u64 = 30;
+    /// Passes between heartbeats. The loop has no await in it, so the
+    /// watchdog is fed by count rather than by time - and the monitor that
+    /// would reset the board for a stall runs on the other core.
+    const BEAT_EVERY: u32 = 20_000;
+
+    // SAFETY: `main` parks these as inputs and nothing else ever claims
+    // them; this build exists to drive them and does not return.
+    let (mut out_busy, mut out_dio1, mut out_mark) = unsafe {
+        (
+            Output::new(esp_hal::peripherals::GPIO38::steal(), Level::Low, OutputConfig::default()),
+            Output::new(esp_hal::peripherals::GPIO39::steal(), Level::Low, OutputConfig::default()),
+            Output::new(esp_hal::peripherals::GPIO40::steal(), Level::Low, OutputConfig::default()),
+        )
+    };
+
+    let g = geometry(radio);
+    println!(
+        "sentry mirror: rx {} us sleep {} us commanded, symb timeout {}",
+        g.rx_us, g.sleep_us, SYMB_TIMEOUT
+    );
+    println!("sentry mirror: J1 GPIO38 = BUSY, GPIO39 = DIO1, GPIO40 = armed marker");
+
+    radio.wake_from_retained_sleep().await;
+    radio.arm_duty_cycle(g.rx_us, g.sleep_us, SYMB_TIMEOUT, irq::RX_DONE);
+    out_mark.set_high();
+    // Inside the first receive window, before the chip has slept once: the
+    // one moment a status read is safe. Without it, a BUSY trace that looks
+    // nothing like the commanded cycle could equally be a cycle that never
+    // started, and those want opposite conclusions.
+    {
+        let (mode, err) = radio.health();
+        println!("sentry mirror: armed, radio {} err 0x{:04X} (want rx)", mode, err);
+    }
+
+    // Timed here as well as mirrored, so a first answer needs no other
+    // hardware - and so the two can be compared afterwards.
+    let mut was_busy = radio.busy_high();
+    let mut since = Instant::now();
+    let mut lows: (u32, u32, u32, u64) = (0, u32::MAX, 0, 0); // n, min, max, sum
+    let mut highs: (u32, u32, u32, u64) = (0, u32::MAX, 0, 0);
+    let until = Instant::now() + Duration::from_secs(WATCH_S);
+    let mut passes = 0u32;
+    out_mark.set_low();
+
+    while Instant::now() < until {
+        let busy = radio.busy_high();
+        out_busy.set_level(if busy { Level::High } else { Level::Low });
+        out_dio1.set_level(if radio.irq_pending() { Level::High } else { Level::Low });
+        if busy != was_busy {
+            let held = (Instant::now() - since).as_micros() as u32;
+            let bucket = if was_busy { &mut highs } else { &mut lows };
+            bucket.0 += 1;
+            bucket.1 = bucket.1.min(held);
+            bucket.2 = bucket.2.max(held);
+            bucket.3 += u64::from(held);
+            was_busy = busy;
+            since = Instant::now();
+        }
+        passes += 1;
+        if passes % BEAT_EVERY == 0 {
+            watchdog::beat(Task::Loop, Phase::Receive);
+        }
+    }
+
+    let say = |name: &str, b: (u32, u32, u32, u64)| {
+        if b.0 == 0 {
+            println!("sentry mirror: {} never changed - the cycle is not running", name);
+        } else {
+            println!(
+                "sentry mirror: {} x{}, min {} us, max {} us, mean {} us",
+                name,
+                b.0,
+                b.1,
+                b.2,
+                (b.3 / u64::from(b.0)) as u32
+            );
+        }
+    };
+    println!("sentry mirror: after {} s -", WATCH_S);
+    say("awake (BUSY low)", lows);
+    say("asleep (BUSY high)", highs);
+    println!(
+        "sentry mirror: commanded rx {} us, sleep {} us - compare against awake and asleep above",
+        g.rx_us, g.sleep_us
+    );
+
+    let mut said = Instant::now();
+    loop {
+        watchdog::beat(Task::Loop, Phase::Receive);
+        if Instant::now() - said > Duration::from_secs(15) {
+            println!("sentry mirror: done, results above; J1 pins still mirroring");
+            said = Instant::now();
+        }
+        // Keep mirroring after the report so an external monitor can still
+        // be attached and read the same cycle.
+        for _ in 0..BEAT_EVERY {
+            out_busy.set_level(if radio.busy_high() { Level::High } else { Level::Low });
+            out_dio1.set_level(if radio.irq_pending() { Level::High } else { Level::Low });
+        }
+    }
+}

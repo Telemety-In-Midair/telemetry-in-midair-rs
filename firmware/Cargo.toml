@@ -64,6 +64,13 @@ iso-sentry-source = []
 # not whether it receives, so a signal that never becomes a packet is the
 # right one. Never build it with iso-sentry-source.
 iso-sentry-carrier = []
+# Watch the duty cycle from outside the SPI bus. Arms a sentry and then does
+# nothing but observe BUSY, which is an input to the host and so costs no
+# transaction and produces no NSS edge - the one thing about this part that
+# can be watched without disturbing it. Times the cycle itself, and mirrors
+# BUSY and DIO1 onto the J1 header so an external monitor can confirm the
+# timing independently of this firmware's own clock.
+iso-sentry-mirror = []
 
 # Bench faults, for proving the watchdog and the event log on a board.
 # Twenty seconds after the hardware loop is up, `bench-panic` panics on its

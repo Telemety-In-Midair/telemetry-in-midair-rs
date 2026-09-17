@@ -243,6 +243,19 @@ impl<'d> Sx1262<'d> {
         self.wait_on_busy();
     }
 
+    /// Whether the chip is holding BUSY high.
+    ///
+    /// The one thing about this part that can be watched without touching
+    /// it. BUSY is an input to the host, so reading it costs no SPI
+    /// transaction and produces no NSS edge - which matters during a duty
+    /// cycle, where an NSS edge would end the very thing being observed.
+    /// It is high through a retained sleep and through the startup behind
+    /// it, and low once the chip is awake, so it draws the shape of a
+    /// sniff loop from outside.
+    pub fn busy_high(&self) -> bool {
+        self.busy.is_high()
+    }
+
     /// Whether the radio is asserting DIO1, i.e. one of the enabled IRQs
     /// is pending.
     ///

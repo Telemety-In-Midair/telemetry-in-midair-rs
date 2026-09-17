@@ -446,6 +446,23 @@ pub struct Sentry {
 impl Sentry {
     /// Size a sentry for `cfg` from a sleep period, the per-window overhead
     /// a sweep measured, and the oscillator startup the config asks for.
+    /// The time a receive window really listens for, microseconds.
+    ///
+    /// **Not `rxPeriod`.** Measured on hardware with two independent
+    /// clocks: a window commanded at 200 ms with an eight-symbol timeout
+    /// listens for 66 ms, which is eight symbols at SF12/BW500 to within a
+    /// millisecond. `rxPeriod` is only a ceiling - what ends the window is
+    /// `SetLoRaSymbNumTimeout` expiring without the modem locking.
+    ///
+    /// Sizing a sentry from `rxPeriod` is therefore sizing it from a number
+    /// the chip does not use. It is why widening a window from 100 ms to
+    /// 200 ms changed nothing on the bench: both truncate to the same
+    /// symbol count.
+    pub fn listen_us(cfg: &RadioConfig, detect_symbols: u8, rx_us: u32) -> u32 {
+        let by_symbols = u32::from(detect_symbols).saturating_mul(cfg.symbol_time_us());
+        by_symbols.min(rx_us)
+    }
+
     pub fn new(
         cfg: &RadioConfig,
         sleep_us: u32,
@@ -467,11 +484,13 @@ impl Sentry {
         // both vendors' documents say so.
         let tail_us = header_us;
         let _ = payload_us;
-        // Deaf for the sleep phase plus the oscillator restart behind it;
-        // a window then needs its detect symbols inside what is left.
+        // Deaf for the sleep phase plus the oscillator restart behind it,
+        // and the window that follows listens for its symbol count rather
+        // than for `rx_us` - so a preamble has to span the whole cycle, not
+        // merely reach into the window.
         let preamble_min_us = sleep_us
             .saturating_add(tcxo_us)
-            .saturating_add(detect_us);
+            .saturating_add(Self::listen_us(cfg, detect_symbols, rx_us));
         // The chip's own post-detection timer, less the header it still has
         // to fit behind the preamble.
         let preamble_max_us = rx_us
@@ -835,6 +854,22 @@ mod tests {
         let s = Sentry::new(&c, 1_000_000, sloppy - 4 * c.symbol_time_us(), DETECT_SYMBOLS, TCXO_US, WAKE_LEN);
         assert!(s.feasible());
         assert!(s.preamble_window_us() >= 2 * drift_us(1_000_000, 10_000));
+    }
+
+    #[test]
+    fn the_window_listens_for_its_symbols_not_its_period() {
+        // Measured, with two independent clocks: a window commanded at
+        // 200 ms with an eight-symbol timeout listens for 66 ms, which is
+        // eight symbols at this modulation. Widening the period does not
+        // widen the window, which is why doing so changed nothing on the
+        // bench.
+        let c = cfg();
+        let eight_symbols = 8 * c.symbol_time_us();
+        assert_eq!(Sentry::listen_us(&c, 8, 200_000), eight_symbols);
+        assert_eq!(Sentry::listen_us(&c, 8, 100_000), eight_symbols);
+        assert!((65_000..67_000).contains(&eight_symbols), "about 66 ms");
+        // Only a period shorter than the symbols can cut it further.
+        assert_eq!(Sentry::listen_us(&c, 8, 20_000), 20_000);
     }
 
     #[test]

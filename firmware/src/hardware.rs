@@ -255,7 +255,8 @@ impl Hardware {
         any(
             feature = "iso-sentry-probe",
             feature = "iso-sentry-source",
-            feature = "iso-sentry-carrier"
+            feature = "iso-sentry-carrier",
+            feature = "iso-sentry-mirror"
         ),
         allow(unreachable_code)
     )]
@@ -304,6 +305,8 @@ impl Hardware {
         crate::sentry::source(self.node.radio_mut()).await;
         #[cfg(feature = "iso-sentry-carrier")]
         crate::sentry::carrier(self.node.radio_mut()).await;
+        #[cfg(feature = "iso-sentry-mirror")]
+        crate::sentry::mirror(self.node.radio_mut()).await;
 
         match boot {
             Mode::Tracking => status_println!(
