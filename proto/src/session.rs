@@ -664,9 +664,9 @@ pub enum Action {
     /// running was handed to the controller before the write arrived.
     Name,
     /// Call `target` over LoRa: a burst of wake frames on its sentry
-    /// preamble, ending at its answer. `tracking` asks it to come up
-    /// tracking rather than idle. Nothing stored.
-    WakeNode { target: u8, tracking: bool },
+    /// preamble, ending at its answer. `idle` asks it to come up idle
+    /// rather than tracking. Nothing stored.
+    WakeNode { target: u8, idle: bool },
     /// Nothing to do - the write was rejected, and the ack says why.
     None,
 }
@@ -818,9 +818,9 @@ pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
                     return Outcome::reject(id, ble::ACK_BAD_STATE);
                 }
                 let flags = value.get(1).copied().unwrap_or(0);
-                let tracking = flags & lora::WAKE_FLAG_TRACKING != 0;
+                let idle = flags & lora::WAKE_FLAG_IDLE != 0;
                 return Outcome::new(
-                    Action::WakeNode { target, tracking },
+                    Action::WakeNode { target, idle },
                     false,
                     id,
                     packet::ACK_OK,
@@ -1259,7 +1259,7 @@ pub struct Dispatch {
     /// The position notify interval, which is session state rather than a
     /// stored setting.
     pub notify_interval_ms: Option<u32>,
-    /// A node to call over LoRa: `(target, tracking)`.
+    /// A node to call over LoRa: `(target, idle)`.
     pub wake: Option<(u8, bool)>,
 }
 
@@ -1279,7 +1279,7 @@ pub fn dispatch(action: Action, stored: &Stored) -> Dispatch {
             d.request = Some(Request::Mode(mode));
             d.command = Some(ServeCommand::ModeChanged);
         }
-        Action::WakeNode { target, tracking } => d.wake = Some((target, tracking)),
+        Action::WakeNode { target, idle } => d.wake = Some((target, idle)),
         // Settings the loops read for themselves when they next decide.
         Action::Knob(..) | Action::Name | Action::None => {}
     }
@@ -2397,10 +2397,10 @@ mod tests {
     #[test]
     fn a_call_is_echoed_when_the_radio_is_up_and_refused_when_it_is_not() {
         let mut s = Stored { mode: Mode::Listening, ..Stored::new() };
-        let o = apply(&mut s, &[ble::CFG_WAKE, 2, 3, lora::WAKE_FLAG_TRACKING]);
-        assert_eq!(o.action, Action::WakeNode { target: 3, tracking: true });
+        let o = apply(&mut s, &[ble::CFG_WAKE, 2, 3, lora::WAKE_FLAG_IDLE]);
+        assert_eq!(o.action, Action::WakeNode { target: 3, idle: true });
         assert_eq!(o.ack[1], packet::ACK_OK);
-        assert_eq!(&o.ack[..o.ack_len], &[ble::CFG_WAKE, packet::ACK_OK, 3, lora::WAKE_FLAG_TRACKING]);
+        assert_eq!(&o.ack[..o.ack_len], &[ble::CFG_WAKE, packet::ACK_OK, 3, lora::WAKE_FLAG_IDLE]);
         assert!(!o.save, "nothing stored");
         assert_eq!(dispatch(o.action, &s).wake, Some((3, true)));
 

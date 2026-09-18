@@ -372,7 +372,7 @@ async fn main(spawner: Spawner) -> ! {
                         p.wake.nonce,
                         n
                     );
-                    lora_wake = Some((p.caller, p.wake.tracking, p.rssi));
+                    lora_wake = Some((p.caller, p.wake.idle, p.rssi));
                 }
                 // Called, but somebody else was. The radio is in standby
                 // with everything it was armed with still in place, so it
@@ -442,16 +442,17 @@ async fn main(spawner: Spawner) -> ! {
     // cold boot turns "stored" into, so a board that has just been flashed,
     // or has just come back from a flat cell, is reachable for an idle
     // timeout before it stores itself. See `session::boot_mode`.
-    // A boot a wake frame asked for comes up reachable rather than as a
-    // wake check - idle, or tracking if the caller asked - and the caller
-    // is answered by the hardware task once the radio is up.
+    // A boot a wake frame asked for comes up tracking rather than as a
+    // wake check - that is what a board is called for - or idle if the
+    // caller asked only to talk to it. The caller is answered by the
+    // hardware task once the radio is up.
     let boot = match lora_wake {
-        Some((caller, tracking, _)) => {
-            state::set_lora_wake(caller, tracking);
-            if tracking {
-                Mode::Tracking
-            } else {
+        Some((caller, idle, _)) => {
+            state::set_lora_wake(caller, idle);
+            if idle {
                 Mode::Idle
+            } else {
+                Mode::Tracking
             }
         }
         None => session::boot_mode(settings::get().mode, woke_from_sleep),
@@ -460,6 +461,13 @@ async fn main(spawner: Spawner) -> ! {
     // characteristic and the USB console all read the same answer. RTC RAM
     // only; idle never reaches flash.
     settings::set_mode(boot);
+    // Tracking on a call persists the way a CFG_MODE tracking write does:
+    // the board was called so that it reports, and a brownout an hour
+    // later is exactly when it must come back doing so. The stored record
+    // said stored until now, and a cold boot from that would land idle.
+    if lora_wake.is_some() && boot == Mode::Tracking {
+        settings::save().await;
+    }
     // An isolation build exists to measure a board with everything running,
     // so it raises the tracker whatever the record says. Without this a
     // freshly flashed measurement board would come up idle - GPS parked,
@@ -498,12 +506,12 @@ async fn main(spawner: Spawner) -> ! {
     }
     // Said again here, after the console is likely to have a host on it:
     // the line the peek printed went out before the USB port was up.
-    if let Some((caller, tracking, rssi)) = lora_wake {
+    if let Some((caller, idle, rssi)) = lora_wake {
         status_println!(
             "woken over LoRa by node {} (rssi {}){}",
             caller,
             rssi,
-            if tracking { ", asked to track" } else { "" }
+            if idle { ", asked to stay idle" } else { ", tracking" }
         );
     }
     status_println!(

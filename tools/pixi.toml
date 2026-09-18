@@ -50,9 +50,10 @@ board-sleep = "python board_sleep.py"
 
 # Call a stored board over LoRa, through the board on this port:
 #   pixi run board-wake --target 3
-#   pixi run board-wake --target 3 --tracking
+#   pixi run board-wake --target 3 --idle
 # The calling board sends a burst of wake frames and reports the answer on
-# its console. The target wakes, pings, and can then be connected to.
+# its console. The target wakes tracking (or idle with --idle), pings, and
+# can then be connected to.
 board-wake = "python board_wake.py"
 
 # Read what the board wrote down about itself - every boot with its reset

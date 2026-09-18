@@ -408,16 +408,20 @@ pub const WAKE_MSG_LEN: usize = 4;
 /// A wake meant for every sleeping node in earshot.
 pub const WAKE_BROADCAST: u8 = 0;
 
-/// Set in [`Wake::flags`] when the woken node should come up tracking
-/// rather than merely reachable.
-pub const WAKE_FLAG_TRACKING: u8 = 1 << 0;
+/// Set in [`Wake::flags`] when the woken node should come up idle -
+/// reachable over BLE, nothing else raised - rather than tracking.
+///
+/// Tracking is the default because it is what a wake is for: a board
+/// stored in a pack is called so that it starts reporting, and a caller
+/// that only wants to talk to it can say so.
+pub const WAKE_FLAG_IDLE: u8 = 1 << 0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Wake {
     /// The address to wake, or [`WAKE_BROADCAST`].
     pub target: u8,
-    /// Come up tracking - GPS and beacon - instead of idle.
-    pub tracking: bool,
+    /// Come up idle - reachable and nothing else - instead of tracking.
+    pub idle: bool,
     /// Tells one burst from the next, so a node that hears the same burst
     /// twice knows it is one request. Wraps.
     pub nonce: u8,
@@ -425,8 +429,8 @@ pub struct Wake {
 
 impl Wake {
     pub fn flags(&self) -> u8 {
-        if self.tracking {
-            WAKE_FLAG_TRACKING
+        if self.idle {
+            WAKE_FLAG_IDLE
         } else {
             0
         }
@@ -444,7 +448,7 @@ impl Wake {
         }
         Some(Self {
             target: data[1],
-            tracking: data[2] & WAKE_FLAG_TRACKING != 0,
+            idle: data[2] & WAKE_FLAG_IDLE != 0,
             nonce: data[3],
         })
     }
@@ -681,9 +685,10 @@ mod wake_tests {
 
     #[test]
     fn wake_round_trips_and_ignores_unknown_flags() {
-        let w = Wake { target: 7, tracking: true, nonce: 200 };
+        let w = Wake { target: 7, idle: true, nonce: 200 };
         let b = w.encode();
-        assert_eq!(b, [MSG_WAKE, 7, WAKE_FLAG_TRACKING, 200]);
+        assert_eq!(b, [MSG_WAKE, 7, WAKE_FLAG_IDLE, 200]);
+        assert!(!Wake { target: 7, idle: false, nonce: 0 }.encode()[2] & WAKE_FLAG_IDLE != 0);
         assert_eq!(Wake::decode(&b), Some(w));
         let mut noisy = b;
         noisy[2] |= 0x80;

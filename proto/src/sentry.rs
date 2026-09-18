@@ -324,7 +324,7 @@ pub enum Step {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Waker {
     pub target: u8,
-    pub tracking: bool,
+    pub idle: bool,
     pub nonce: u8,
     tries_left: u8,
     gap_ms: u32,
@@ -336,10 +336,10 @@ pub struct Waker {
 }
 
 impl Waker {
-    pub fn new(target: u8, tracking: bool, nonce: u8) -> Self {
+    pub fn new(target: u8, idle: bool, nonce: u8) -> Self {
         Self {
             target,
-            tracking,
+            idle,
             nonce,
             tries_left: WAKE_TRIES,
             gap_ms: WAKE_GAP_MS,

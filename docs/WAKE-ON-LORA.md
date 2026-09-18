@@ -20,8 +20,8 @@ beside its timer and goes down. A board that wants it back sends a burst
 of `MSG_WAKE` frames behind a preamble sized to the sleeper's cycle and
 listens for its answer between them. The sleeper wakes on the first frame,
 reads it out of the radio's buffer before anything else in the boot, and
-if it was called comes up idle (or tracking, if asked), answers with a
-ping, and can be connected to; if some other node was called it re-arms
+if it was called comes up tracking (or idle, if the caller asked only to
+talk to it), answers with a ping, and can be connected to; if some other node was called it re-arms
 the radio and is back asleep before its USB port has enumerated.
 
 Measured, two boards on a bench at 0 dBm and 927 MHz, `wake_rx_ms = 300`,
@@ -32,7 +32,7 @@ node 5:  wake: called node 3 (403 symbol preamble, 3483 ms on air), listening
          node 3 ping: rssi -42, up 0s, gps silent
          wake: node 3 answered                       860 ms after the frame ended
 node 3:  woke from deep sleep #4 (slept 60 s, parks missed 0, lora wakes 1, rejected 0)
-         mode idle - reachable, gps in backup
+         mode idle - reachable, gps in backup   (tracking is the default since)
          wake: rtc 5598308 ms, slept from 5583936 ms, elapsed 14372 ms over 60000 ms asked
          wake: answered node 5
 ```

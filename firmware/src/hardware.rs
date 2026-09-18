@@ -574,8 +574,8 @@ impl Hardware {
             watchdog::beat(Task::Loop, Phase::Gps);
             self.gps(now_ms, late_pass).await;
         }
-        if let Some((target, tracking)) = state::take_wake_request() {
-            self.start_wake(target, tracking);
+        if let Some((target, idle)) = state::take_wake_request() {
+            self.start_wake(target, idle);
         }
         if self.posture.radio_up() {
             watchdog::beat(Task::Loop, Phase::Beacon);
@@ -815,7 +815,7 @@ impl Hardware {
     }
 
     /// Take a call to a sleeping node, if this node can make one.
-    fn start_wake(&mut self, target: u8, tracking: bool) {
+    fn start_wake(&mut self, target: u8, idle: bool) {
         if !self.posture.radio_up() {
             status_println!("wake: cannot call node {} - the radio is not up", target);
             return;
@@ -828,11 +828,11 @@ impl Hardware {
             status_println!("wake: a call is already in progress, node {} replaces it", target);
         }
         self.wake_nonce = self.wake_nonce.wrapping_add(1);
-        self.waker = Some(Waker::new(target, tracking, self.wake_nonce));
+        self.waker = Some(Waker::new(target, idle, self.wake_nonce));
         status_println!(
             "wake: calling node {}{}",
             target,
-            if tracking { " into tracking" } else { "" }
+            if idle { " to come up idle" } else { "" }
         );
     }
 
@@ -885,7 +885,7 @@ impl Hardware {
                 let syms = s.preamble_symbols().unwrap_or(0) as u16;
                 let frame = lora::Wake {
                     target: w.target,
-                    tracking: w.tracking,
+                    idle: w.idle,
                     nonce: w.nonce,
                 };
                 state::set_radio_busy(true);

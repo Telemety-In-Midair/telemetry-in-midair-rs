@@ -386,25 +386,25 @@ pub fn take_request() -> Option<Request> {
     critical_section::with(|cs| REQUESTS.borrow(cs).borrow_mut().take())
 }
 
-/// A node to call over LoRa, `(target, tracking)`, waiting for the hardware
+/// A node to call over LoRa, `(target, idle)`, waiting for the hardware
 /// loop. One slot: a second call before the loop ran replaces the first.
 static WAKE_REQUEST: Mutex<Cell<Option<(u8, bool)>>> = Mutex::new(Cell::new(None));
 
-pub fn request_wake(target: u8, tracking: bool) {
-    critical_section::with(|cs| WAKE_REQUEST.borrow(cs).set(Some((target, tracking))));
+pub fn request_wake(target: u8, idle: bool) {
+    critical_section::with(|cs| WAKE_REQUEST.borrow(cs).set(Some((target, idle))));
 }
 
 pub fn take_wake_request() -> Option<(u8, bool)> {
     critical_section::with(|cs| WAKE_REQUEST.borrow(cs).take())
 }
 
-/// Who woke this boot over LoRa, `(caller, tracking asked)`, or `None` for
+/// Who woke this boot over LoRa, `(caller, idle asked)`, or `None` for
 /// every other kind of boot. Set once by the boot path before the hardware
 /// task starts; the task answers the caller and clears it.
 static LORA_WAKE: Mutex<Cell<Option<(u8, bool)>>> = Mutex::new(Cell::new(None));
 
-pub fn set_lora_wake(caller: u8, tracking: bool) {
-    critical_section::with(|cs| LORA_WAKE.borrow(cs).set(Some((caller, tracking))));
+pub fn set_lora_wake(caller: u8, idle: bool) {
+    critical_section::with(|cs| LORA_WAKE.borrow(cs).set(Some((caller, idle))));
 }
 
 pub fn take_lora_wake() -> Option<(u8, bool)> {

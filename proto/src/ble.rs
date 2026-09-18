@@ -713,7 +713,7 @@ pub const CFG_NAME: u8 = 0x19;
 
 /// Write: call another node over LoRa. Two bytes: the target's address
 /// (0 for every sleeping node in earshot) and flags, of which bit 0 asks
-/// the woken node to come up tracking rather than idle.
+/// the woken node to come up idle rather than tracking.
 ///
 /// A command rather than a setting: nothing is stored. The hardware loop
 /// sends a burst of wake frames on the target's sentry preamble and

@@ -128,7 +128,7 @@ section of the file are laid out from:
 | `0x17` | u8 | mode: 0 stored, 1 idle, 2 tracking, 3 listening. The one an app actually means |
 | `0x18` | u32 s | how long idle lasts before the board stores itself, 10 s..1 h, 0 = never (the default) |
 | `0x19` | ASCII | board name label, up to 15 bytes; empty clears it |
-| `0x1B` | 2 bytes | call a stored node over LoRa: its address (0 = every sleeping node in earshot) and flags (bit 0 = come up tracking). A command, not a setting: the board sends a burst of wake frames and reports the answer on its console. Refused on a node whose radio is down or whose role never transmits |
+| `0x1B` | 2 bytes | call a stored node over LoRa: its address (0 = every sleeping node in earshot) and flags (bit 0 = come up idle instead of tracking). A command, not a setting: the board sends a burst of wake frames, reports `wake: node N answered` or `wake: no answer from node N after 3 tries` on its log characteristic, and the answer itself arrives as node N's ping on the remote characteristic. The woken node comes up tracking, persisted as a mode write would be. Refused with a bad-state ack on a node in idle or stored mode |
 | `0x1A` | u32 s | BLE up between off periods while tracking, 1 s..60 s (default 15 s). Tracking's alone |
 
 The board clamps and the ack carries the value it stored, so an app reports

@@ -78,7 +78,7 @@ pub async fn apply_config(data: &[u8]) -> ([u8; packet::ACK_MAX_LEN], usize) {
         // burst from its own pass and says so on the console - from there
         // rather than here, because a line printed ahead of the ack is one
         // the tool reading for that ack discards.
-        Action::WakeNode { target, tracking } => state::request_wake(target, tracking),
+        Action::WakeNode { target, idle } => state::request_wake(target, idle),
         Action::None => qprintln!("config: rejected write (status {})", outcome.ack[1]),
     }
     (outcome.ack, outcome.ack_len)
