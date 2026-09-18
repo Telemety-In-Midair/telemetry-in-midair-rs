@@ -3,9 +3,6 @@
 debug
 target
 
-# Local working notes
-NOTES.md
-
 # A radio config for a real board, not the documented example.
 # `wio-config --dry-run --save ../RADIO.CFG` writes one here.
 /RADIO.CFG
