@@ -808,6 +808,15 @@ pub fn apply(stored: &mut Stored, data: &[u8]) -> Outcome {
                 let Some(&target) = value.first() else {
                     return Outcome::reject(id, packet::ACK_BAD_VALUE);
                 };
+                // A call needs the radio up, and only a mode that tracks
+                // has it up. Refused here rather than dropped on the
+                // hardware loop's console, because the app that sent the
+                // write is looking at the ack, not the console. A role that
+                // never transmits is still the loop's refusal to make - the
+                // radio config is not in the settings.
+                if !stored.mode.tracks() {
+                    return Outcome::reject(id, ble::ACK_BAD_STATE);
+                }
                 let flags = value.get(1).copied().unwrap_or(0);
                 let tracking = flags & lora::WAKE_FLAG_TRACKING != 0;
                 return Outcome::new(
@@ -2380,6 +2389,27 @@ mod tests {
             apply(&mut s, &u32_write(ble::CFG_SLEEP_NOW, 99_999)).action,
             Action::SleepNow(ble::ESP_SLEEP_MAX_S)
         );
+    }
+
+    /// A call is a write like any other, echoed back as sent - and refused
+    /// with a bad state on a board whose radio is down, since the app is
+    /// reading the ack and not the console.
+    #[test]
+    fn a_call_is_echoed_when_the_radio_is_up_and_refused_when_it_is_not() {
+        let mut s = Stored { mode: Mode::Listening, ..Stored::new() };
+        let o = apply(&mut s, &[ble::CFG_WAKE, 2, 3, lora::WAKE_FLAG_TRACKING]);
+        assert_eq!(o.action, Action::WakeNode { target: 3, tracking: true });
+        assert_eq!(o.ack[1], packet::ACK_OK);
+        assert_eq!(&o.ack[..o.ack_len], &[ble::CFG_WAKE, packet::ACK_OK, 3, lora::WAKE_FLAG_TRACKING]);
+        assert!(!o.save, "nothing stored");
+        assert_eq!(dispatch(o.action, &s).wake, Some((3, true)));
+
+        let mut idle = Stored { mode: Mode::Idle, ..Stored::new() };
+        let o = apply(&mut idle, &[ble::CFG_WAKE, 1, 3]);
+        assert_eq!(o.action, Action::None);
+        assert_eq!(o.ack[1], ble::ACK_BAD_STATE);
+        let o = apply(&mut s, &[ble::CFG_WAKE, 0]);
+        assert_eq!(o.ack[1], packet::ACK_BAD_VALUE, "no target is no call");
     }
 
     /// A short write is rejected rather than read as some other duration.
